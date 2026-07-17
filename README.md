@@ -4,7 +4,7 @@
 
 > Status: **design stage / defensive publication.** This document stakes out the design before it is built. The novel combination — an engine-agnostic driver contract + desired-state reconciliation + thermal-aware placement, for heterogeneous fleets running *arbitrary, including bespoke,* inference engines — is the part no existing tool covers. Dated and public on purpose.
 
-## The metaphor (it's load-bearing)
+## The metaphor
 
 A railway **roundhouse** uses a **turntable** to rotate heavy locomotives onto a limited set of **stalls**. You can't park every locomotive on a track at once, so the turntable swaps them in and out as needed.
 
