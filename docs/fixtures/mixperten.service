@@ -1,5 +1,8 @@
 [Unit]
-Description=[RETIRED 2026-08-12] Mixperten — Qwen3.6-35B-A3B, Q8-Basis mit IQ2_S/Q2_K gerouteten Experten (R2)
+# FIXTURE NOTE: prose translated from the German original for repo-language
+# consistency. Structure, directives, flags, numbers and line shape are unchanged,
+# so every parser property is preserved. The live unit on boltzmann is the German one.
+Description=[RETIRED 2026-08-12] Mixperten — Qwen3.6-35B-A3B, Q8 base with IQ2_S/Q2_K routed experts (R2)
 # RETIRED: superseded by qwen3.6-coding.service (Qwen3.6-27B-A3B-Coder Q4_K_M).
 # DO NOT ENABLE: this binds port 8085, which qwen3.6-coding.service now owns.
 # Measured: R2 decode 5.823 t/s / Mean KLD 0.1075 / top-1 86.34%, vs the coder at
@@ -11,74 +14,74 @@ After=network-online.target
 Wants=network-online.target
 
 [Service]
-# 2026-08-11: von R1b auf R2 umgestellt. R2 ist die beste GEMESSENE der schmalen
-# Varianten — sie schlaegt R3 auf beiden Achsen (kleiner UND besser) und R1b um
-# 28 % Divergenz fuer 1,25 GiB mehr Platz.
+# 2026-08-11: switched from R1b to R2. R2 is the best MEASURED of the narrow
+# variants — it beats R3 on both axes (smaller AND better) and beats R1b by
+# 28% divergence for 1.25 GiB more space.
 #
-# KLD gegen BF16, wikitext-2 test, 64 Bloecke, Basis-PPL 6,4240 (gemessen auf bosch);
-# Decode als Median aus N=5 kalten Laeufen auf dieser Kiste, Kerne 4-7:
-#   Variante            gate/up   down     Groesse     Mean KLD   same-top-p   Decode
-#   R0 UD-Q3_K_XL       IQ3_XXS   IQ4_XS   16,04 GiB   0,0387     91,65 %      5,914 tok/s
-#   R2  <- diese hier   IQ2_S     Q2_K     12,18 GiB   0,1075     86,34 %      5,823 tok/s
-#   R1b (vorher hier)   IQ2_XXS   Q2_K     10,93 GiB   0,1494     83,63 %      6,170 tok/s
-#   RX Rot-Probe        IQ1_S     IQ1_S     8,35 GiB   0,3700     75,30 %      —
+# KLD against BF16, wikitext-2 test, 64 blocks, base PPL 6.4240 (measured on bosch);
+# decode as the median of N=5 cold runs on this box, cores 4-7:
+#   variant             gate/up   down     size        Mean KLD   same-top-p   decode
+#   R0 UD-Q3_K_XL       IQ3_XXS   IQ4_XS   16.04 GiB   0.0387     91.65 %      5.914 tok/s
+#   R2  <- this one     IQ2_S     Q2_K     12.18 GiB   0.1075     86.34 %      5.823 tok/s
+#   R1b (previously)    IQ2_XXS   Q2_K     10.93 GiB   0.1494     83.63 %      6.170 tok/s
+#   RX red probe        IQ1_S     IQ1_S     8.35 GiB   0.3700     75.30 %      —
 #
-# R2 kauft ALLEIN Platz: 3,9 GiB weniger als R0, bezahlt mit Qualitaet UND 1,5 %
-# Tempo. IQ2_S dequantisiert teurer als IQ2_XXS — deshalb ist R2 auch langsamer
-# als R1b. R2 und R1b dominieren einander nicht; R2 gibt 28 % weniger Divergenz
-# fuer 1,25 GiB und 5,6 % Tempo. Gewaehlt wurde Qualitaet.
-# Rueckweg auf R1b: mixperten.service.bak-r1b-20260811 liegt daneben.
+# R2 buys space ALONE: 3.9 GiB less than R0, paid for with quality AND 1.5%
+# speed. IQ2_S dequantizes more expensively than IQ2_XXS — which is why R2 is also
+# slower than R1b. R2 and R1b do not dominate each other; R2 gives 28% less divergence
+# for 1.25 GiB and 5.6% speed. Quality was chosen.
+# Way back to R1b: mixperten.service.bak-r1b-20260811 sits next to it.
 #
-# ENTSCHEIDUNG markus 2026-08-11, nach vollstaendiger Messung: R2 BLEIBT.
-# Nicht zurueckschalten. Das ist bewusst so gewaehlt, kein uebersehener Rueckstand.
+# DECISION markus 2026-08-11, after complete measurement: R2 STAYS.
+# Do not switch back. This is deliberate, not an overlooked regression.
 #
-# Ehrliche Buchfuehrung dazu: R2 hat die Qualitaetsbedingung des Zieldokuments NICHT
-# bestanden — erlaubt waren KLD <= 0,0581, gemessen sind 0,1075. Sie laeuft ueber die
-# zweite Tuer (Fussabdruck: 12,18 statt 16,04 GiB), nicht weil sie die Pruefung
-# bestanden haette. R0 bleibt qualitativ ueberlegen und liegt als
-# qwen3.6-coding.service unveraendert daneben.
+# Honest bookkeeping on it: R2 did NOT pass the quality condition of the goal
+# document — the allowance was KLD <= 0.0581, measured is 0.1075. It ships through the
+# second door (footprint: 12.18 instead of 16.04 GiB), not because it passed the
+# test. R0 remains qualitatively superior and sits unchanged next to it as
+# qwen3.6-coding.service.
 #
-# HumanEval (164 Aufgaben, greedy, mit Denkblock) konnte den Unterschied NICHT
-# aufloesen: R0 161/164, R2 159/164, McNemar p=0,625. Der Test hat bei 98 % keine
-# Luft mehr. Das ist kein Freispruch fuer R2, aber auch kein Beleg gegen sie.
+# HumanEval (164 tasks, greedy, with thinking block) could NOT resolve the
+# difference: R0 161/164, R2 159/164, McNemar p=0.625. The test has no headroom
+# left at 98%. That is no acquittal for R2, but no evidence against it either.
 #
-# WAS ZU BEOBACHTEN IST: R2 lief in 2 von 164 Faellen in die Laengenbegrenzung, R0
-# in keinem. Auf dieser Kiste (5,8 tok/s) kostet ein Ausreisser bis -n 32768 rund
-# 94 Minuten. Wenn Anfragen gelegentlich ewig haengen, ist das die erste Spur —
-# dann -n senken, nicht das Modell tauschen.
+# WHAT TO WATCH: R2 ran into the length limit in 2 of 164 cases, R0 in
+# none. On this box (5.8 tok/s) an outlier up to -n 32768 costs about
+# 94 minutes. If requests occasionally hang forever, that is the first trace —
+# then lower -n, do not swap the model.
 #
-# Der Hebel ist ffn_gate/up_exps, nicht ffn_down_exps: der Schritt IQ2_XXS->IQ3_XXS
-# kauft allein 0,070 KLD, die anderen Einzelschritte je ~0,040. Wer hier weiter
-# quantisiert, schuetzt gate/up. Grund: Qwen3.6-35B-A3Bs Experten sind nur 512
-# breit (DeepSeek V4: 2048) — schmale Experten tragen weniger Redundanz.
+# The lever is ffn_gate/up_exps, not ffn_down_exps: the step IQ2_XXS->IQ3_XXS
+# buys 0.070 KLD on its own, the other single steps ~0.040 each. Anyone quantizing
+# further here should protect gate/up. Reason: Qwen3.6-35B-A3B's experts are only 512
+# wide (DeepSeek V4: 2048) — narrow experts carry less redundancy.
 #
-# Kontext 262144 = das trainierte Fenster der Modellkarte. Bezahlbar, weil nur 11
-# der 41 Bloecke Aufmerksamkeit tragen; die 30 SSM-Bloecke haben keinen KV-Cache.
+# Context 262144 = the trained window from the model card. Affordable because only 11
+# of the 41 blocks carry attention; the 30 SSM blocks have no KV cache.
 #
-# Sampling: Modellkarte, Eintrag "Thinking mode for precise coding tasks".
-# presence_penalty MUSS hier 0 sein: Code wiederholt notwendigerweise (end, local,
-# then, Bezeichner). min_p 0 ist ausdruecklich empfohlen; llama.cpps Vorgabe waere
-# 0.05 und schneidet die Verteilung dort, wo die Karte sie stehen laesst.
-# -n 32768 = empfohlene Ausgabelaenge; mit Denkblock zahlt max_tokens BEIDES.
+# Sampling: model card, entry "Thinking mode for precise coding tasks".
+# presence_penalty MUST be 0 here: code necessarily repeats (end, local,
+# then, identifiers). min_p 0 is explicitly recommended; llama.cpp's default would be
+# 0.05 and cuts the distribution where the card leaves it standing.
+# -n 32768 = recommended output length; with a thinking block max_tokens pays for BOTH.
 #
-# 2026-08-11, Aufgabe #5 gemessen: `taskset -c 4-7` ersetzt durch llama.cpps eigene
-# Bindung, weil taskset auch die STAPEL-Faeden auf die A76 einsperrt. Getrennt gemessen
-# (Prefill ueber 1399-Token-Prompts, N=3; Decode N=5, jeweils nach Abklingen):
-#   Bindung                       -t  -tb   Prefill            Decode
-#   taskset 4-7 (vorher)           4   4    12,39 tok/s        5,916 (+-3,1 %)
-#   -Cr 4-7 (Kontrolle)            4   4    12,40 tok/s        5,849 (+-2,1 %)
-#   -Cr 4-7 + -Crb 0-7  <- jetzt   4   8    13,68 (+10,4 %)    5,861 (+-0,35 %)
-#   -Cr 4-7 + -Crb 0-7             4   6    12,53 (+1,1 %)     5,900 (+-0,46 %)
+# 2026-08-11, task #5 measured: `taskset -c 4-7` replaced by llama.cpp's own
+# binding, because taskset also locks the BATCH threads onto the A76s. Measured separately
+# (prefill over 1399-token prompts, N=3; decode N=5, each after settling):
+#   binding                       -t  -tb   prefill            decode
+#   taskset 4-7 (previously)       4   4    12.39 tok/s        5.916 (+-3.1 %)
+#   -Cr 4-7 (control)              4   4    12.40 tok/s        5.849 (+-2.1 %)
+#   -Cr 4-7 + -Crb 0-7  <- now     4   8    13.68 (+10.4 %)    5.861 (+-0.35 %)
+#   -Cr 4-7 + -Crb 0-7             4   6    12.53 (+1.1 %)     5.900 (+-0.46 %)
 #
-# Decode kostet es NICHTS: gegen die Kontrolle B liegt C sogar minimal hoeher. Die
-# A-Zahl stammt aus N=3 mit 3,1 % Streuung und ist die unzuverlaessigste der vier.
+# It costs decode NOTHING: against control B, C is even marginally higher. The
+# A number comes from N=3 with 3.1% spread and is the least reliable of the four.
 #
-# Warum nur +10 % und nicht +100 % bei doppelter Kernzahl: llama.cpp teilt den Stapel
-# gleichmaessig auf die Faeden, also bestimmt der LANGSAMSTE das Ende. Waehrend des
-# Prefills fallen die A76 von 97 auf 87 % — sie warten auf die A55. Genau deshalb
-# bringt -tb 6 fast nichts (+1,1 %): man hat die Bremse, aber nicht die Rechenkraft.
-# Decode bleibt bewusst auf -t 4 / A76: dort ist die Kiste bandbreitengebunden,
-# zusaetzliche Kerne bringen nichts und A55-Faeden wuerden nur bremsen.
+# Why only +10% and not +100% at double the core count: llama.cpp splits the batch
+# evenly across the threads, so the SLOWEST one determines the finish. During
+# prefill the A76s drop from 97 to 87% — they are waiting on the A55s. That is exactly why
+# -tb 6 buys almost nothing (+1.1%): you take on the brake without the compute.
+# Decode deliberately stays on -t 4 / A76: there the box is bandwidth-bound,
+# additional cores buy nothing and A55 threads would only slow it down.
 ExecStart=/home/mfritsche/src/llama.cpp-latest/build/bin/llama-server \
   -m /home/mfritsche/models/Qwen3.6-35B-A3B-R2-Q8base-IQ2S.gguf \
   -c 262144 -fa on -ctk q8_0 -ctv q8_0 \

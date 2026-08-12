@@ -1,4 +1,4 @@
-<title>Stellwerk — llama unit renderer &amp; watcher, design</title>
+<title>Roundhouse — llama unit renderer &amp; watcher, design</title>
 <style>
   :root {
     --bg: #f6f7f9;
@@ -242,7 +242,7 @@
 <div class="page">
 <header class="doc">
   <p class="kicker">Design for review · to be handed to an implementing agent</p>
-  <h1>Stellwerk — the llama-systemd-unit renderer &amp; watcher</h1>
+  <h1>Roundhouse — the llama-systemd-unit renderer &amp; watcher</h1>
   <p class="meta">
     <span>target <b>boltzmann</b> (RK3588, 4×A55 + 4×A76, 30.6 GiB)</span>
     <span>units <b>23</b> (3 enabled, 7 .bak, 1 retired)</span>
@@ -252,10 +252,10 @@
 </header>
 
 <section>
-  <p class="tag">[why-stellwerk]</p>
+  <p class="tag">[why-roundhouse]</p>
   <h2>0 · The name, and the five positions</h2>
   <div class="prose">
-  <p>Roundhouse is the shed where the locomotives wait. The thing you asked for is the <em>Stellwerk</em> — the signal box that decides which engine is on the turntable, and whose defining property is <strong>mechanical interlocking</strong>: you physically cannot set two conflicting routes. That is exactly the missing piece — two units both claiming :8085, a retired unit one <code>systemctl enable</code> away from a collision, an edit one <code>-c</code> away from an OOM. Working name; rename at will.</p>
+  <p>A roundhouse turns locomotives onto the stalls that fit; the signal box beside it enforces <em>mechanical interlocking</em> — you physically cannot set two conflicting routes. This document is the interlocking half, and it now carries the Roundhouse name outright. That is exactly the missing piece — two units both claiming :8085, a retired unit one <code>systemctl enable</code> away from a collision, an edit one <code>-c</code> away from an OOM. Named 2026-08-12: folded into Roundhouse.</p>
   <p>Five positions, defended below:</p>
   <ol>
     <li><strong>Systemd unit files stay the single source of truth.</strong> The tool holds no config of its own. Ever.</li>
@@ -275,14 +275,14 @@
   <p><strong>This is NOT:</strong> a process supervisor (systemd is), a request router/proxy (llm-proxy is), a config store (the unit files are), a batching/throughput dashboard (irrelevant at one request at a time), or a model downloader.</p>
 
   <h3>vs. llama-swap and friends</h3>
-  <p>llama-swap's whole premise is "give me a YAML, I am the supervisor." Migrating means transcribing 23 units into YAML and losing the thing that makes them valuable — <code>mixperten.service</code> is ~80 lines of measured decision record wrapped around 9 lines of command. Cockpit has the opposite problem: it speaks systemd fluently and knows nothing about <code>-ctk q8_0</code>. Stellwerk occupies the empty cell: <em>systemd-native, llama-literate</em>. It neither wraps nor replaces llama-swap; it makes it unnecessary <em>for this fleet's shape</em> (deliberate, operator-driven model residency — not request-driven auto-swap). If you ever want request-driven swapping, adopt it then as a separate decision; don't let a dashboard smuggle in a supervisor.</p>
+  <p>llama-swap's whole premise is "give me a YAML, I am the supervisor." Migrating means transcribing 23 units into YAML and losing the thing that makes them valuable — <code>mixperten.service</code> is ~80 lines of measured decision record wrapped around 9 lines of command. Cockpit has the opposite problem: it speaks systemd fluently and knows nothing about <code>-ctk q8_0</code>. Roundhouse occupies the empty cell: <em>systemd-native, llama-literate</em>. It neither wraps nor replaces llama-swap; it makes it unnecessary <em>for this fleet's shape</em> (deliberate, operator-driven model residency — not request-driven auto-swap). If you ever want request-driven swapping, adopt it then as a separate decision; don't let a dashboard smuggle in a supervisor.</p>
 
   <h3>Push vs. Pull (your question 2)</h3>
   <div class="callout">
     <span class="label">Position</span>
-    <p>Split the question by what the config <em>is for</em>. <strong>Process config must be Push</strong>: a serving host has to boot and start its model with nothing but its own disk — pulling ExecStart lines from a Pi cluster at boot is an availability dependency you'd curse exactly once, at the worst time. Files on disk, drift visible in git. Stellwerk is the Push horn, and that's correct. <strong>Routing metadata should be Pull</strong>: a consumer choosing a model already needs the gateway reachable to make the request, so asking <code>/v1/models</code> at request time adds zero new dependency and kills the hand-copies (pi-agents' 53 stale entries) permanently. Push what a host needs to <em>exist</em>; pull what a client needs to <em>choose</em>.</p>
+    <p>Split the question by what the config <em>is for</em>. <strong>Process config must be Push</strong>: a serving host has to boot and start its model with nothing but its own disk — pulling ExecStart lines from a Pi cluster at boot is an availability dependency you'd curse exactly once, at the worst time. Files on disk, drift visible in git. Roundhouse is the Push horn, and that's correct. <strong>Routing metadata should be Pull</strong>: a consumer choosing a model already needs the gateway reachable to make the request, so asking <code>/v1/models</code> at request time adds zero new dependency and kills the hand-copies (pi-agents' 53 stale entries) permanently. Push what a host needs to <em>exist</em>; pull what a client needs to <em>choose</em>.</p>
   </div>
-  <p>One consequence worth stating: Stellwerk is <em>not</em> the generator that renders configs for consumers. It manages the serving side only. The consumer-side fix is your own "smallest step" — enrich <code>/v1/models</code> — and it stays in llm-proxy.</p>
+  <p>One consequence worth stating: Roundhouse is <em>not</em> the generator that renders configs for consumers. It manages the serving side only. The consumer-side fix is your own "smallest step" — enrich <code>/v1/models</code> — and it stays in llm-proxy.</p>
   </div>
 </section>
 
@@ -302,7 +302,7 @@
 
   <h3>Platform — the home screen</h3>
   <p class="prose">Organized by <em>role</em>, not alphabetically: the big slot (one at a time — the layout itself says so by having exactly one seat), the always-on small units, kernel-gated standbys, retired units folded away. All data below is real, from today's recon.</p>
-  <pre class="wf"><code> STELLWERK · boltzmann          kernel 6.12.x (mainline) │ mem ████████░░░░░ 17.2 / 30.6 GiB
+  <pre class="wf"><code> ROUNDHOUSE · boltzmann          kernel 6.12.x (mainline) │ mem ████████░░░░░ 17.2 / 30.6 GiB
  ═══════════════════════════════════════════════════════════════════════════════════════════
  BIG SLOT — one model at a time
  ┌─────────────────────────────────────────────────────────────────────────────────────────┐
@@ -362,7 +362,7 @@
   <p class="tag">[round-trip]</p>
   <h2>3 · The round-trip problem</h2>
   <div class="prose">
-  <p>This is the part every existing tool gets wrong, and the part that decides whether you trust Stellwerk. The recon numbers make the constraint vivid: <code>mixperten.service</code> is 103 lines, of which 9 are the command. The rest is a lab notebook — KLD tables, a McNemar test, a decision record signed "ENTSCHEIDUNG markus 2026-08-11", and a warning about which comment is now decoration. Any mechanism that regenerates the file from a parsed model will eventually normalize, reorder, or drop something. So:</p>
+  <p>This is the part every existing tool gets wrong, and the part that decides whether you trust Roundhouse. The recon numbers make the constraint vivid: <code>mixperten.service</code> is 103 lines, of which 9 are the command. The rest is a lab notebook — KLD tables, a McNemar test, a decision record signed "ENTSCHEIDUNG markus 2026-08-11", and a warning about which comment is now decoration. Any mechanism that regenerates the file from a parsed model will eventually normalize, reorder, or drop something. So:</p>
 
   <h3>Mechanism: parse everything, rewrite nothing, splice bytes</h3>
   <ol>
@@ -370,7 +370,7 @@
     <li><strong>Edits are splices.</strong> Changing <code>-c 65536</code> to <code>-c 131072</code> replaces exactly those bytes. Adding a flag inserts into the line the operator picks in the preview. Removing a flag deletes its tokens and nothing else. Comments, blank lines, ordering, indentation: untouched by construction, because they are never parsed into a model that gets serialized back.</li>
     <li><strong>Readback verification — refuse rather than corrupt.</strong> After splicing (to a temp file): re-parse and assert the argv equals the intended argv; then <code>systemd-analyze verify</code> the unit; then after <code>daemon-reload</code>, compare <code>systemctl --user show -p ExecStart</code> — systemd's <em>own</em> parser — against intent. Any mismatch aborts the write and shows both parses. This is the guard against the tokenizer being subtly wrong about an edge case.</li>
     <li><strong>Atomic write with compare-and-swap.</strong> Hash the file at read time; refuse to write if it changed underneath (you hand-edit these files, and will continue to — that must stay safe).</li>
-    <li><strong>Git replaces <code>.bak</code>.</strong> <code>git init</code> in <code>~/.config/systemd/user/</code>; the seven existing <code>.bak*</code> files become the initial history (dated commits reconstructed from their timestamps, then the files removed). Before any Stellwerk write, uncommitted hand edits are auto-committed as <code>manual edit (imported)</code> — hand edits are first-class, never clobbered, and drift is visible exactly as your Push philosophy wants.</li>
+    <li><strong>Git replaces <code>.bak</code>.</strong> <code>git init</code> in <code>~/.config/systemd/user/</code>; the seven existing <code>.bak*</code> files become the initial history (dated commits reconstructed from their timestamps, then the files removed). Before any Roundhouse write, uncommitted hand edits are auto-committed as <code>manual edit (imported)</code> — hand edits are first-class, never clobbered, and drift is visible exactly as your Push philosophy wants.</li>
   </ol>
 
   <h3>The stale-prose problem, honestly</h3>
@@ -396,7 +396,7 @@
 </code></pre>
 
   <h3>Drop-ins</h3>
-  <p>You have none today (verified). Policy: read effective config via <code>systemctl --user cat</code>; if a drop-in ever overrides a key, that key renders read-only with "override lives in <code>foo.service.d/x.conf</code>" and Stellwerk edits the fragment only. It never <em>creates</em> drop-ins: for user-owned units in <code>~/.config</code>, drop-ins would split one file of truth into two files of truth for zero benefit. That's a fight with <code>systemctl edit</code> deliberately not picked.</p>
+  <p>You have none today (verified). Policy: read effective config via <code>systemctl --user cat</code>; if a drop-in ever overrides a key, that key renders read-only with "override lives in <code>foo.service.d/x.conf</code>" and Roundhouse edits the fragment only. It never <em>creates</em> drop-ins: for user-owned units in <code>~/.config</code>, drop-ins would split one file of truth into two files of truth for zero benefit. That's a fight with <code>systemctl edit</code> deliberately not picked.</p>
 
   <h3>Named failure modes</h3>
   <ul>
@@ -413,7 +413,7 @@
   <p class="tag">[watcher]</p>
   <h2>4 · Live status — what "online" means</h2>
   <div class="prose">
-  <p>"Active" is nearly meaningless here: a unit is <code>active (running)</code> for the full 72 s a 15 GiB model takes to load, and <code>inactive</code> can be the <em>correct, healthy</em> state of a kernel-gated unit. Stellwerk's status is a ladder, and the UI always shows the rung, not a boolean:</p>
+  <p>"Active" is nearly meaningless here: a unit is <code>active (running)</code> for the full 72 s a 15 GiB model takes to load, and <code>inactive</code> can be the <em>correct, healthy</em> state of a kernel-gated unit. Roundhouse's status is a ladder, and the UI always shows the rung, not a boolean:</p>
   </div>
   <div class="tablewrap"><table>
     <tr><th>Rung</th><th>Signal</th><th>Source</th></tr>
@@ -435,7 +435,7 @@
   <h3>Memory fit</h3>
   <p>Memory is the failure mode that matters, and your own data says formulas lie: the 35B Q4_K_M "fits" on paper, then ARM repack residency pushed 30.5/31.6 GiB and prefill halved while decode looked fine. And the KV formula needs per-architecture knowledge anyway (the hybrid Qwen has KV on 11 of 41 blocks only). So:</p>
   <ul>
-    <li><strong>Measured beats modeled.</strong> Stellwerk records cgroup <code>memory.peak</code> per (unit, model-file hash, ctx) into a small sqlite. Predictions come from the last measured peak when one exists — labeled "measured" — and from file-size + KV estimate only as a fallback, always labeled "estimate".</li>
+    <li><strong>Measured beats modeled.</strong> Roundhouse records cgroup <code>memory.peak</code> per (unit, model-file hash, ctx) into a small sqlite. Predictions come from the last measured peak when one exists — labeled "measured" — and from file-size + KV estimate only as a fallback, always labeled "estimate".</li>
     <li><strong>Warn line at 28 GiB projected</strong> (the measured collapse zone starts ~30.5 of 31.6); hard confirm above it. Co-residency is summed: big slot + always-on peaks + a fixed system reserve.</li>
     <li><strong>Prefill-collapse tripwire:</strong> if a unit's journal-observed prompt-processing rate drops well below its own history while RSS is near the ceiling, badge it "memory-pressure suspected" — that exact signature cost you a day once; the UI should name it.</li>
   </ul>
@@ -456,7 +456,7 @@
     <li><strong>The retired trap.</strong> <code>[RETIRED …]</code> in Description is the convention (already your practice). Retired units render folded and grey, keep their full notes (they're the best-documented decisions you have), and their start/enable actions are demoted behind an explicit "this unit is marked RETIRED 2026-08-12 and claims :8085, owned by qwen3.6-coding — start anyway?" Never deleted, never hidden.</li>
     <li><strong>STANDBY is not broken.</strong> Kernel-gated units get their own section, neutral color, and the condition spelled out in words. No red, no "failed", no restart storm — the whole point of the <code>ExecCondition</code> pattern, finally reflected in a UI.</li>
     <li><strong>OOM prevention</strong> = the §4 fit check, enforced at three doors: starting a unit, switching the big slot, and any edit that raises <code>-c</code> / changes model / changes KV quant. Above the warn line the action needs an explicit override; the override is recorded in the commit/journal so the 3-a.m. question "why is the box swapping" has an answer.</li>
-    <li><strong>Co-fit notes stay human.</strong> The "stop the small models first — they do not co-fit" knowledge lives in comments today. v0.1 does <em>not</em> invent a metadata language for it; the summed-peaks check covers the arithmetic. If it earns its keep later, a single opt-in comment directive (<code># stellwerk-slot: big</code>) — in the file, so truth stays in the file — is the ceiling of cleverness allowed here.</li>
+    <li><strong>Co-fit notes stay human.</strong> The "stop the small models first — they do not co-fit" knowledge lives in comments today. v0.1 does <em>not</em> invent a metadata language for it; the summed-peaks check covers the arithmetic. If it earns its keep later, a single opt-in comment directive (<code># roundhouse-slot: big</code>) — in the file, so truth stays in the file — is the ceiling of cleverness allowed here.</li>
   </ul>
 
   <h3>Switch flow — turning the table</h3>
@@ -482,15 +482,15 @@
   <div class="prose">
   <dl class="qa">
     <dt>Q1</dt>
-    <dd><strong>Who owns the truth?</strong> Two truths, two owners, one boundary. llm-proxy on hossenfelder owns <em>catalog truth</em>: what exists, what it costs, what it can do. Stellwerk owns <em>process truth on the serving host</em>: what is actually up, on which port, with which ctx, in which state — because that truth is literally the systemd state it renders. The boundary is a one-way street: Stellwerk <em>publishes</em> process truth (a read-only <code>/status</code> JSON: alias, port, rung, ctx, last-measured t/s), and llm-proxy may consume it to mark its 4 [local] entries live or dead instead of guessing. Stellwerk never pushes routing decisions and never reads the catalog to decide anything. Consumers keep talking to the gateway, not to Stellwerk.</dd>
+    <dd><strong>Who owns the truth?</strong> Two truths, two owners, one boundary. llm-proxy on hossenfelder owns <em>catalog truth</em>: what exists, what it costs, what it can do. Roundhouse owns <em>process truth on the serving host</em>: what is actually up, on which port, with which ctx, in which state — because that truth is literally the systemd state it renders. The boundary is a one-way street: Roundhouse <em>publishes</em> process truth (a read-only <code>/status</code> JSON: alias, port, rung, ctx, last-measured t/s), and llm-proxy may consume it to mark its 4 [local] entries live or dead instead of guessing. Roundhouse never pushes routing decisions and never reads the catalog to decide anything. Consumers keep talking to the gateway, not to Roundhouse.</dd>
     <dt>Q2</dt>
-    <dd><strong>Push or Pull?</strong> Answered in §1: Push for process config (boot must not depend on the network), Pull for selection metadata (a request already implies the gateway is reachable). Stellwerk is the Push horn done right — files in git, drift visible, and the "generator" temptation explicitly rejected because your units are documents, not build artifacts.</dd>
+    <dd><strong>Push or Pull?</strong> Answered in §1: Push for process config (boot must not depend on the network), Pull for selection metadata (a request already implies the gateway is reachable). Roundhouse is the Push horn done right — files in git, drift visible, and the "generator" temptation explicitly rejected because your units are documents, not build artifacts.</dd>
     <dt>Q3</dt>
     <dd><strong>May the measurement loop influence the ladder?</strong> Close the loop <em>through the operator</em>, not around him. bullpen-evals verdicts flow into a recommendation inbox: "rung 2 solved 14/15 tasks that escalated to rung 3 last month — demote the default?" One click applies it; the applied change is a git commit (or an llm-proxy config change) with the evidence linked. What makes self-reconfiguration undebuggable is not the feedback — it's <em>unattributed</em> change. Your own unit files show the standard: every decision in them has a date, a measurement, and a signature. Hold the loop to the same standard and it stays debuggable; let it write silently and in six months no one can say why the ladder looks the way it does. Fully automatic re-rating is a later, separate decision to make after a few months of watching how often you just click "apply".</dd>
   </dl>
   <div class="callout trap">
     <span class="label">Hard rail, structural</span>
-    <p><strong>KEIN Paid-Offloading, nie.</strong> Stellwerk manages local units only, so it structurally cannot offload. If it ever displays catalog context next to a recommendation, [$] entries are inert text — never an action, never a fallback target. Worth writing into the code as an assertion, not just into this document.</p>
+    <p><strong>No paid offloading, ever.</strong> Roundhouse manages local units only, so it structurally cannot offload. If it ever displays catalog context next to a recommendation, [$] entries are inert text — never an action, never a fallback target. Worth writing into the code as an assertion, not just into this document.</p>
   </div>
   </div>
 </section>
@@ -499,7 +499,7 @@
   <p class="tag">[plan]</p>
   <h2>7 · Staged plan — smallest useful thing first</h2>
   <div class="prose">
-  <p><strong>Shape:</strong> one Python file (matching the <code>/opt/llm-proxy.py</code> house style) + one static page, SSE for live updates, sqlite for measured peaks, talking to systemd via the user D-Bus/<code>systemctl --user</code>. Runs as — of course — a systemd user unit, <code>stellwerk.service</code>, on a free port (8090 is unclaimed today; the port board will confirm its own). No node toolchain, no build step, nothing to babysit.</p>
+  <p><strong>Shape:</strong> one Python file (matching the <code>/opt/llm-proxy.py</code> house style) + one static page, SSE for live updates, sqlite for measured peaks, talking to systemd via the user D-Bus/<code>systemctl --user</code>. Runs as — of course — a systemd user unit, <code>roundhouse.service</code>, on a free port (8090 is unclaimed today; the port board will confirm its own). No node toolchain, no build step, nothing to babysit.</p>
   <ul class="versions">
     <li><span class="v">v0.1</span><span><strong>Read-only, one week, already useful.</strong> Scan + parse all units, Platform + Stall views, status ladder, operator's-notes rendering, port board with the :8086 finding visible, kernel-gate STANDBY treatment, memory gauge. Zero write path = zero risk while trust builds. This alone beats every existing tool for this fleet, because nothing else can render <em>these</em> units.</span></li>
     <li><span class="v">v0.2</span><span><strong>Operations.</strong> Start/stop/restart/enable with port+alias interlocks; the Switch flow with the loading ladder; git init + <code>.bak</code> absorption; journal tail in the Stall view.</span></li>
@@ -518,12 +518,12 @@
   <ol>
     <li><strong>Auth:</strong> LAN-only bind like the llama-servers, or tailnet/basic-auth? It can stop and start your models, so "whatever :8085 does" may not be enough.</li>
     <li><strong>Git location:</strong> repo directly in <code>~/.config/systemd/user/</code>, or a mirror repo with the unit dir symlinked into it? Direct is simpler; say if that directory has other plans.</li>
-    <li><strong>Naming:</strong> Stellwerk, or something else in the railway family? The metaphor is load-bearing enough in the UI copy ("turn the table", "standing by") that the name should be settled before implementation.</li>
+    <li><strong>Naming:</strong> Roundhouse, or something else in the railway family? The metaphor is load-bearing enough in the UI copy ("turn the table", "standing by") that the name should be settled before implementation.</li>
   </ol>
   </div>
 </section>
 
 <footer>
-  stellwerk-design · 2026-08-12 · grounded in live recon of boltzmann (~/.config/systemd/user, 23 units) · hand to the implementing agent together with qwen3.6-coding.service and mixperten.service as parser test fixtures
+  roundhouse-design · 2026-08-12 · grounded in live recon of boltzmann (~/.config/systemd/user, 23 units) · hand to the implementing agent together with qwen3.6-coding.service and mixperten.service as parser test fixtures
 </footer>
 </div>

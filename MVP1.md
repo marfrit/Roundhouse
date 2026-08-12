@@ -1,4 +1,4 @@
-# MVP1 — the boltzmann driver + roster (working name: *Stellwerk*)
+# MVP1 — the boltzmann driver + roster
 
 **This is Milestone 1 made concrete on one host.** Per the README: *"Driver + roster
 (read-only): the engine-driver interface plus a thermal roster that senses hot/warm/cold
@@ -7,7 +7,7 @@ across hosts. No actuation yet; this proves the sensing model."*
 MVP1 implements exactly that for **boltzmann** — a read-only renderer and watcher over
 its llama.cpp systemd units. No actuation, no write path.
 
-Full design (8 sections, 4 ASCII wireframes): [`docs/design/stellwerk-design.html`](docs/design/stellwerk-design.html).
+Full design (8 sections, 4 ASCII wireframes): [`docs/design/roundhouse-design.html`](docs/design/roundhouse-design.html).
 It was written before this README existed and is scoped as a standalone tool; read it
 for the mechanisms, not for the architecture. **§Reconciliation below overrides it where
 they disagree.**
@@ -62,7 +62,7 @@ of whether "the params UI is generated, not hardcoded" survives contact with a r
 
 ## Reconciliation with the standalone design
 
-The Stellwerk design takes three positions that must be **re-scoped** now that Roundhouse
+The design document takes three positions that must be **re-scoped** now that Roundhouse
 owns the fleet layer. Where they conflict, this file wins:
 
 | design says | inside Roundhouse |
@@ -149,7 +149,7 @@ feature — it belongs in Milestone 1.
 ## Shape
 
 One Python file (house style of `/opt/llm-proxy.py`) + one static page + **SSE**.
-Talks to systemd via `systemctl --user` / user D-Bus. Runs as `stellwerk.service` on
+Talks to systemd via `systemctl --user` / user D-Bus. Runs as `roundhouse.service` on
 `:8090` (unclaimed today — the port board should confirm its own). **No node toolchain,
 no build step.** Scope: **boltzmann only** — multi-host is Roundhouse's job, not this
 driver's.
@@ -181,7 +181,7 @@ driver's.
 
 ## Hard rail
 
-> **KEIN Paid-Offloading, nie.** No paid offloading, ever.
+> **No paid offloading, ever.**
 
 Structural for this driver: it manages **local units only**, so it cannot offload. Where
 catalog context is ever shown, `[$]` entries are inert text — never an action, never a
@@ -193,5 +193,5 @@ fallback target. Assert it in code, not only in prose.
 
 1. **Auth** — LAN-only bind like the llama-servers, or tailnet/basic-auth? From Milestone 2 it can stop models, so "whatever `:8085` does" may not suffice.
 2. **Unit-dir git** — repo directly in `~/.config/systemd/user/`, or a mirror with the dir symlinked in? (Seven `.bak` files there are doing version control's job today.)
-3. **Naming** — *Stellwerk* for the signal box, or fold it into Roundhouse's vocabulary as "the boltzmann driver"?
+3. ~~**Naming**~~ — resolved 2026-08-12: folded into Roundhouse; no separate name.
 4. **The Milestone 2 question above** — does reconciliation edit unit files, or only start/stop them?
