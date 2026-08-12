@@ -1,0 +1,14 @@
+[Unit]
+Description=Roundhouse — read-only roster server for llama-server fleet
+Documentation=https://docs.boltzmann.local/roundhouse
+After=network.target
+
+[Service]
+Type=simple
+# Operator: adjust the path to point to your mvp1/roundhouse.py and install manually
+ExecStart=/usr/bin/python3 %h/roundhouse/mvp1/roundhouse.py --serve
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target
