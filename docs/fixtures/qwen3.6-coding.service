@@ -1,0 +1,52 @@
+[Unit]
+Description=Qwen3.6-27B-A3B-Coder (Q4_K_M) — one-off coding Q&A. 26.21B, 10/184 experts, 64K ctx.
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+# MODEL SWAPPED 2026-08-12: Qwen3.6-35B-A3B UD-Q3_K_XL -> Qwen3.6-27B-A3B-Coder Q4_K_M.
+# Measured end-to-end on a real bullpen prompt (499 in / 426 out), box quiet, median of 3:
+#     27B coder Q4_K_M   83.1 s   (1.8%% spread)   decode 7.67 t/s   14.94 GiB
+#     35B      Q4_K_M   102.8 s   ( 24%% spread)   decode 7.83 t/s   19.70 GiB
+#     35B      UD-Q3_K_XL (what this unit used to serve)  decode 5.76 t/s   16.04 GiB
+# The 35B Q4_K_M decodes 2%% FASTER and finishes 24%% SLOWER: under ARM-repack residency
+# its prefill collapses 18.4 -> 9.9 t/s (VmRSS ~30.5 GB of 31.6 GB) while decode is
+# untouched. Judged on tg128 alone it wins; judged on a whole request it loses badly.
+# Full analysis: ~/src/neutron/NPU-SPLIT-CAMPAIGN.md sections E11/E13/E14.
+#
+# vs the OLD UD-Q3_K_XL this unit served: +33%% decode (7.67 vs 5.76) AND better quality
+# on the 35B family (Q4_K_M measured Mean KLD 0.0280 vs 0.0387 for UD-Q3_K_XL).
+#
+# MTP stays OFF. Re-measured 2026-08-12 on the MoE: -25%% at n_max=3 (acc 0.644) and
+# -29%% at n_max=1 (acc 0.843). Note n_max=1 has the HIGHER acceptance and the WORSE
+# throughput -- a verify pass costs ~2.6x a plain decode pass because a wider batch on
+# a sparse MoE activates proportionally more experts. A better drafter cannot fix that.
+#
+# --alias DELIBERATELY UNCHANGED (qwen3.6-coding) so no client/agent needs a routing
+# change. NOTE: llm-proxy does NOT run on boltzmann -- it lives on hossenfelder. A
+# stale disabled copy used to sit in ~/npu here and was REMOVED 2026-08-12 because it
+# invited exactly that confusion. Clients reach this model directly on :8085.
+#
+# SAMPLING BELOW IS INHERITED FROM THE 35B MODEL CARD AND IS UNVALIDATED FOR THE CODER.
+# It is not a measured choice for this model -- see the handoff note before trusting it.
+# NOTE: @coder used to send "temperature": 0.2 in the request body, which beat any
+# server default. That literal was removed from bullpen-coder on 2026-08-11, so the
+# values above now actually reach it. If a client ever sends its own temperature
+# again, it wins and this line is decoration -- check the request, not the unit.
+#
+# Shares the big-Qwen slot: stop the small models (llama-server-qwen3-4b-npu :8091,
+# task-3b :8086) first -- they do not co-fit on 30 GB.
+# Model supports 262144 ctx; 65536 kept from the previous unit to change one thing at a
+# time. It is 1.1 GiB smaller than the old model, so there is headroom to raise it.
+ExecStart=/usr/bin/taskset -c 4-7 /home/mfritsche/src/llama.cpp-latest/build/bin/llama-server \
+  -m /home/mfritsche/models/qwen36-27b-a3b-coder-Q4_K_M.gguf \
+  -c 65536 -t 4 -fa on -ctk q8_0 -ctv q8_0 \
+  --jinja --chat-template-kwargs '{"enable_thinking":false}' \
+  --temp 1.0 --top-p 0.95 --top-k 20 --min-p 0.0 --presence-penalty 0.0 \
+    --alias qwen3.6-coding --host 0.0.0.0 --port 8085
+Restart=on-failure
+RestartSec=5
+LimitNOFILE=65536
+
+[Install]
+WantedBy=default.target

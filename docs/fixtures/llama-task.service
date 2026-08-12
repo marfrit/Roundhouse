@@ -1,0 +1,18 @@
+[Unit]
+Description=Llama-3.2-1B-Instruct task model (OWUI title/tag/follow-up gen) on :8086
+After=network-online.target
+
+[Service]
+Type=simple
+# Small general chat model for OWUI housekeeping tasks (NOT the coder). Pinned to
+# the A55 little cores (0-3) so it never contends with Qwen on the A76s (4-7).
+ExecStart=/usr/bin/taskset -c 0-3 /home/mfritsche/src/llama.cpp-latest/build/bin/llama-server \
+  -m /home/mfritsche/models/qwen2.5-3b-instruct-q4_k_m.gguf \
+  -c 16384 -t 4 -fa on \
+  --alias task-qwen2.5-3b --host 0.0.0.0 --port 8086
+LimitNOFILE=65536
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=default.target

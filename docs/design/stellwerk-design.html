@@ -1,0 +1,529 @@
+<title>Stellwerk — llama unit renderer &amp; watcher, design</title>
+<style>
+  :root {
+    --bg: #f6f7f9;
+    --surface: #ffffff;
+    --ink: #1b2129;
+    --muted: #5b6572;
+    --faint: #8b95a3;
+    --line: #d8dee6;
+    --accent: #1d4e89;
+    --accent-ink: #ffffff;
+    --code-bg: #eef1f5;
+    --code-ink: #2a3542;
+    --good: #2f7d4f;
+    --warn: #a06a14;
+    --bad: #b3403a;
+    --standby: #6b7a8d;
+    --trap-bg: #faf3e3;
+    --take-bg: #edf2f8;
+    --found-bg: #f9ecea;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --bg: #12161b;
+      --surface: #1a2027;
+      --ink: #e3e8ee;
+      --muted: #97a2b0;
+      --faint: #6d7885;
+      --line: #2a323c;
+      --accent: #6fa3dc;
+      --accent-ink: #0f1621;
+      --code-bg: #151a20;
+      --code-ink: #c7d1dc;
+      --good: #5fb184;
+      --warn: #d3a04a;
+      --bad: #d4766f;
+      --standby: #7e8ea0;
+      --trap-bg: #241d10;
+      --take-bg: #16202c;
+      --found-bg: #271715;
+    }
+  }
+  :root[data-theme="dark"] {
+    --bg: #12161b;
+    --surface: #1a2027;
+    --ink: #e3e8ee;
+    --muted: #97a2b0;
+    --faint: #6d7885;
+    --line: #2a323c;
+    --accent: #6fa3dc;
+    --accent-ink: #0f1621;
+    --code-bg: #151a20;
+    --code-ink: #c7d1dc;
+    --good: #5fb184;
+    --warn: #d3a04a;
+    --bad: #d4766f;
+    --standby: #7e8ea0;
+    --trap-bg: #241d10;
+    --take-bg: #16202c;
+    --found-bg: #271715;
+  }
+  * { box-sizing: border-box; }
+  body {
+    background: var(--bg);
+    color: var(--ink);
+    font-family: system-ui, "Segoe UI", Roboto, sans-serif;
+    font-size: 16px;
+    line-height: 1.55;
+    margin: 0;
+    padding: 0 1.25rem 6rem;
+  }
+  .page { max-width: 60rem; margin: 0 auto; }
+  .prose { max-width: 46rem; }
+  header.doc {
+    padding: 3rem 0 1.5rem;
+    border-bottom: 2px solid var(--ink);
+    margin-bottom: 2.5rem;
+  }
+  .kicker {
+    font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+    font-size: 0.78rem;
+    letter-spacing: 0.09em;
+    text-transform: uppercase;
+    color: var(--muted);
+    margin: 0 0 0.75rem;
+  }
+  h1 {
+    font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+    font-size: clamp(1.6rem, 4vw, 2.3rem);
+    line-height: 1.15;
+    margin: 0 0 0.75rem;
+    text-wrap: balance;
+    letter-spacing: -0.01em;
+  }
+  .meta {
+    font-family: ui-monospace, Menlo, Consolas, monospace;
+    font-size: 0.8rem;
+    color: var(--muted);
+    display: flex; flex-wrap: wrap; gap: 0.4rem 1.5rem;
+    margin: 0;
+  }
+  .meta b { color: var(--ink); font-weight: 600; }
+  section { margin: 3rem 0; }
+  .tag {
+    font-family: ui-monospace, Menlo, Consolas, monospace;
+    font-size: 0.78rem;
+    letter-spacing: 0.06em;
+    color: var(--accent);
+    margin: 0 0 0.35rem;
+  }
+  h2 {
+    font-family: ui-monospace, Menlo, Consolas, monospace;
+    font-size: 1.25rem;
+    margin: 0 0 1rem;
+    padding-bottom: 0.5rem;
+    border-bottom: 1px solid var(--line);
+    text-wrap: balance;
+  }
+  h3 {
+    font-family: ui-monospace, Menlo, Consolas, monospace;
+    font-size: 0.95rem;
+    margin: 1.8rem 0 0.6rem;
+  }
+  p { margin: 0.8rem 0; max-width: 46rem; }
+  li { margin: 0.35rem 0; max-width: 44rem; }
+  ul, ol { padding-left: 1.4rem; }
+  code {
+    font-family: ui-monospace, Menlo, Consolas, monospace;
+    font-size: 0.86em;
+    background: var(--code-bg);
+    color: var(--code-ink);
+    padding: 0.08em 0.35em;
+    border-radius: 3px;
+  }
+  pre {
+    background: var(--code-bg);
+    color: var(--code-ink);
+    border: 1px solid var(--line);
+    border-radius: 4px;
+    padding: 1rem 1.2rem;
+    overflow-x: auto;
+    font-family: ui-monospace, Menlo, Consolas, monospace;
+    font-size: 0.78rem;
+    line-height: 1.45;
+    margin: 1.2rem 0;
+  }
+  pre code { background: none; padding: 0; font-size: inherit; color: inherit; }
+  .wf {
+    background: var(--surface);
+    color: var(--ink);
+  }
+  .wf .ok { color: var(--good); font-weight: 600; }
+  .wf .wn { color: var(--warn); font-weight: 600; }
+  .wf .bd { color: var(--bad); font-weight: 600; }
+  .wf .sb { color: var(--standby); }
+  .wf .dim { color: var(--faint); }
+  .wf .acc { color: var(--accent); font-weight: 600; }
+  .callout {
+    border-left: 3px solid var(--accent);
+    background: var(--take-bg);
+    padding: 0.8rem 1.1rem;
+    margin: 1.3rem 0;
+    max-width: 46rem;
+    border-radius: 0 4px 4px 0;
+  }
+  .callout p { margin: 0.4rem 0; }
+  .callout .label {
+    font-family: ui-monospace, Menlo, Consolas, monospace;
+    font-size: 0.72rem;
+    letter-spacing: 0.1em;
+    text-transform: uppercase;
+    font-weight: 700;
+    color: var(--accent);
+    display: block;
+    margin-bottom: 0.3rem;
+  }
+  .callout.trap { border-left-color: var(--warn); background: var(--trap-bg); }
+  .callout.trap .label { color: var(--warn); }
+  .callout.found { border-left-color: var(--bad); background: var(--found-bg); }
+  .callout.found .label { color: var(--bad); }
+  table {
+    border-collapse: collapse;
+    margin: 1.2rem 0;
+    font-size: 0.88rem;
+    width: 100%;
+  }
+  .tablewrap { overflow-x: auto; max-width: 100%; }
+  th, td {
+    text-align: left;
+    padding: 0.5rem 0.9rem 0.5rem 0;
+    border-bottom: 1px solid var(--line);
+    vertical-align: top;
+  }
+  th {
+    font-family: ui-monospace, Menlo, Consolas, monospace;
+    font-size: 0.72rem;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    color: var(--muted);
+    font-weight: 600;
+  }
+  td code { white-space: nowrap; }
+  .num { font-variant-numeric: tabular-nums; }
+  .qa {
+    display: grid;
+    grid-template-columns: 3.2rem 1fr;
+    gap: 0.3rem 1rem;
+    max-width: 46rem;
+    margin: 1.2rem 0;
+  }
+  .qa dt {
+    font-family: ui-monospace, Menlo, Consolas, monospace;
+    font-weight: 700;
+    color: var(--accent);
+  }
+  .qa dd { margin: 0 0 0.9rem; }
+  .versions { list-style: none; padding: 0; max-width: 46rem; }
+  .versions li {
+    display: grid;
+    grid-template-columns: 4.2rem 1fr;
+    gap: 1rem;
+    padding: 0.7rem 0;
+    border-bottom: 1px solid var(--line);
+    max-width: none;
+  }
+  .versions .v {
+    font-family: ui-monospace, Menlo, Consolas, monospace;
+    font-weight: 700;
+    color: var(--accent);
+  }
+  footer {
+    margin-top: 4rem;
+    padding-top: 1rem;
+    border-top: 1px solid var(--line);
+    font-family: ui-monospace, Menlo, Consolas, monospace;
+    font-size: 0.75rem;
+    color: var(--faint);
+  }
+  a { color: var(--accent); }
+</style>
+
+<div class="page">
+<header class="doc">
+  <p class="kicker">Design for review · to be handed to an implementing agent</p>
+  <h1>Stellwerk — the llama-systemd-unit renderer &amp; watcher</h1>
+  <p class="meta">
+    <span>target <b>boltzmann</b> (RK3588, 4×A55 + 4×A76, 30.6 GiB)</span>
+    <span>units <b>23</b> (3 enabled, 7 .bak, 1 retired)</span>
+    <span>context <b>Roundhouse</b></span>
+    <span>2026-08-12</span>
+  </p>
+</header>
+
+<section>
+  <p class="tag">[why-stellwerk]</p>
+  <h2>0 · The name, and the five positions</h2>
+  <div class="prose">
+  <p>Roundhouse is the shed where the locomotives wait. The thing you asked for is the <em>Stellwerk</em> — the signal box that decides which engine is on the turntable, and whose defining property is <strong>mechanical interlocking</strong>: you physically cannot set two conflicting routes. That is exactly the missing piece — two units both claiming :8085, a retired unit one <code>systemctl enable</code> away from a collision, an edit one <code>-c</code> away from an OOM. Working name; rename at will.</p>
+  <p>Five positions, defended below:</p>
+  <ol>
+    <li><strong>Systemd unit files stay the single source of truth.</strong> The tool holds no config of its own. Ever.</li>
+    <li><strong>"Renderer" means render <em>to the screen</em>, not <em>from a template</em>.</strong> A generator that emits units from a database would silently make the database the truth and your comments disposable. Rejected.</li>
+    <li><strong>Push for process config, Pull for routing metadata.</strong> That is the answer to your question 2 — it splits cleanly, see §6.</li>
+    <li><strong>The watcher watches; it does not knock.</strong> On a serialized single-user box, health is observed passively. Active probes only at explicit moments (a switch, a button).</li>
+    <li><strong>The measurement loop proposes; the operator disposes.</strong> Answer to your question 3, see §6.</li>
+  </ol>
+  </div>
+</section>
+
+<section>
+  <p class="tag">[position]</p>
+  <h2>1 · Scope, and where it sits</h2>
+  <div class="prose">
+  <p><strong>This IS:</strong> a local web UI on boltzmann that (a) renders every llama-serving systemd user unit with its <em>semantics</em> legible — model, quant, context, KV, pinning, port, gate, sampling, and the operator's notes; (b) watches liveness beyond systemd's notion of "active"; (c) performs guarded operations: start, stop, switch, and surgical parameter edits; (d) keeps history in git instead of <code>.bak</code> files.</p>
+  <p><strong>This is NOT:</strong> a process supervisor (systemd is), a request router/proxy (llm-proxy is), a config store (the unit files are), a batching/throughput dashboard (irrelevant at one request at a time), or a model downloader.</p>
+
+  <h3>vs. llama-swap and friends</h3>
+  <p>llama-swap's whole premise is "give me a YAML, I am the supervisor." Migrating means transcribing 23 units into YAML and losing the thing that makes them valuable — <code>mixperten.service</code> is ~80 lines of measured decision record wrapped around 9 lines of command. Cockpit has the opposite problem: it speaks systemd fluently and knows nothing about <code>-ctk q8_0</code>. Stellwerk occupies the empty cell: <em>systemd-native, llama-literate</em>. It neither wraps nor replaces llama-swap; it makes it unnecessary <em>for this fleet's shape</em> (deliberate, operator-driven model residency — not request-driven auto-swap). If you ever want request-driven swapping, adopt it then as a separate decision; don't let a dashboard smuggle in a supervisor.</p>
+
+  <h3>Push vs. Pull (your question 2)</h3>
+  <div class="callout">
+    <span class="label">Position</span>
+    <p>Split the question by what the config <em>is for</em>. <strong>Process config must be Push</strong>: a serving host has to boot and start its model with nothing but its own disk — pulling ExecStart lines from a Pi cluster at boot is an availability dependency you'd curse exactly once, at the worst time. Files on disk, drift visible in git. Stellwerk is the Push horn, and that's correct. <strong>Routing metadata should be Pull</strong>: a consumer choosing a model already needs the gateway reachable to make the request, so asking <code>/v1/models</code> at request time adds zero new dependency and kills the hand-copies (pi-agents' 53 stale entries) permanently. Push what a host needs to <em>exist</em>; pull what a client needs to <em>choose</em>.</p>
+  </div>
+  <p>One consequence worth stating: Stellwerk is <em>not</em> the generator that renders configs for consumers. It manages the serving side only. The consumer-side fix is your own "smallest step" — enrich <code>/v1/models</code> — and it stays in llm-proxy.</p>
+  </div>
+</section>
+
+<section>
+  <p class="tag">[views]</p>
+  <h2>2 · Information architecture</h2>
+  <div class="prose">
+  <p>Four views. Navigation is flat — this is a tool you glance at, not an app you live in.</p>
+  </div>
+  <div class="tablewrap"><table>
+    <tr><th>View</th><th>Job</th><th>Wireframe</th></tr>
+    <tr><td><strong>Platform</strong> (home)</td><td>One glance: what's on the turntable, what's always-on, what's standing by, memory, port board.</td><td>below</td></tr>
+    <tr><td><strong>Stall</strong> (unit detail)</td><td>One unit, fully legible: parsed semantics + live status + operator's notes rendered as prose + git history + journal tail.</td><td>below</td></tr>
+    <tr><td><strong>Tweak</strong> (edit flow)</td><td>Change parameters with a byte-exact diff preview, preflight checks, stale-prose warning, commit.</td><td>§3</td></tr>
+    <tr><td><strong>Switch</strong> (turn the table)</td><td>Stop A, start B, with interlock, fit check, and the loading ladder made visible.</td><td>§4</td></tr>
+  </table></div>
+
+  <h3>Platform — the home screen</h3>
+  <p class="prose">Organized by <em>role</em>, not alphabetically: the big slot (one at a time — the layout itself says so by having exactly one seat), the always-on small units, kernel-gated standbys, retired units folded away. All data below is real, from today's recon.</p>
+  <pre class="wf"><code> STELLWERK · boltzmann          kernel 6.12.x (mainline) │ mem ████████░░░░░ 17.2 / 30.6 GiB
+ ═══════════════════════════════════════════════════════════════════════════════════════════
+ BIG SLOT — one model at a time
+ ┌─────────────────────────────────────────────────────────────────────────────────────────┐
+ │ <span class="ok">● READY</span>  qwen3.6-coding                                     :8085   alias qwen3.6-coding │
+ │          Qwen3.6-27B-A3B-Coder · Q4_K_M · 14.94 GiB file · ctx 65536 · KV q8/q8 · fa on  │
+ │          pinned A76 (4-7) · peak RSS 17.8 GiB measured · last req 13:41 (7.7 t/s decode) │
+ │                                                       [ switch… ] [ restart ] [ stop ■ ] │
+ └─────────────────────────────────────────────────────────────────────────────────────────┘
+ <span class="dim">in the roundhouse (12): qwen3-30b · gemma-a4b · deepseek-coder · llama-server-cpu-q4km · …</span>
+
+ ALWAYS-ON
+ <span class="ok">● READY</span>  llama-embed   :8082   nomic-embed-text-v1.5 (mneme)          peak 1.1 GiB
+ <span class="ok">● READY</span>  llama-task    :8086   Llama-3.2-1B (OWUI title/tag gen)      peak 1.9 GiB
+
+ STANDBY — kernel-gated, normal on this kernel
+ <span class="sb">◌ waiting</span> llama-server-qwen35-npu    wants 6.1.75-npu-port    :8086  <span class="wn">⚠ shared with llama-task</span>
+ <span class="sb">◌ waiting</span> llama-server-gemma4-npu    wants 6.1.75-npu-port    :8087
+ <span class="sb">◌ waiting</span> llama-server-qwen3-4b-npu  wants 6.1.75-npu-port    :8091
+
+ <span class="dim">RETIRED (1)  mixperten [2026-08-12, claims :8085]                              [ show ]</span>
+ ═══════════════════════════════════════════════════════════════════════════════════════════
+ PORT BOARD   8082 embed ✓ │ 8085 big slot ✓ <span class="dim">(+1 retired claim)</span> │ 8086 <span class="wn">⚠ 2 claims</span> │ 8091 free
+</code></pre>
+
+  <h3>Stall — one unit, fully legible</h3>
+  <p class="prose">The left column answers "what runs, exactly" without reading a shell command. The right column is live. Below the fold: the operator's notes — the comment block <em>rendered</em>, with measurement tables detected (aligned columns → real table) and never, ever rewritten. The core-pinning strip is the kind of "graphic" that earns its pixels: it shows <code>taskset -c 4-7</code> as a picture of the actual silicon.</p>
+  <pre class="wf"><code> ◂ platform    qwen3.6-coding.service              <span class="ok">● READY</span> since 09:14 · uptime 4 h 27 m
+ ─────────────────────────────────────────────────────────────────────────────────────────
+ WHAT RUNS                                          LIVE
+ model     qwen36-27b-a3b-coder-Q4_K_M.gguf         unit      active (running)  enabled
+           14.94 GiB · <span class="ok">file exists ✓</span>                port      :8085 <span class="ok">listening ✓</span>
+ quant     Q4_K_M                                   health    <span class="ok">200 ok</span>
+ ctx       65 536   <span class="dim">(model max 262 144)</span>            busy      idle <span class="dim">(journal-observed)</span>
+ KV        q8_0 / q8_0 · flash-attn on              mem now   17.8 GiB RSS
+ threads   4, pinned A76                            mem peak  17.8 GiB <span class="dim">(cgroup, this boot)</span>
+           [ A55 · · · · ][ A76 <span class="acc">▓ ▓ ▓ ▓</span> ]           journal   ▸ tail −f
+ sampling  temp 1.0 · top-p .95 · top-k 20          requests  13:41  499→426  7.67 t/s
+           min-p 0 · presence 0                               <span class="dim">12:05  1399→88   7.9 t/s</span>
+ alias     qwen3.6-coding      gate  none
+ restart   on-failure / 5 s                         [ tweak parameters ]  [ raw file ]
+ ─────────────────────────────────────────────────────────────────────────────────────────
+ OPERATOR'S NOTES <span class="dim">— rendered from the unit file's comments; the file is never rewritten</span>
+ │ MODEL SWAPPED 2026-08-12: Qwen3.6-35B-A3B UD-Q3_K_XL → 27B-A3B-Coder Q4_K_M.
+ │ Measured end-to-end on a real bullpen prompt (499 in / 426 out), median of 3:
+ │   ┌──────────────────┬─────────┬─────────┬──────────────┬───────────┐
+ │   │ 27B coder Q4_K_M │  83.1 s │  ±1.8 % │ 7.67 t/s dec │ 14.94 GiB │
+ │   │ 35B Q4_K_M       │ 102.8 s │  ±24 %  │ 7.83 t/s dec │ 19.70 GiB │
+ │   └──────────────────┴─────────┴─────────┴──────────────┴───────────┘
+ │ … MTP stays OFF. Re-measured 2026-08-12 on the MoE: −25 % at n_max=3 …
+ ─────────────────────────────────────────────────────────────────────────────────────────
+ HISTORY <span class="dim">(git)</span>  2026-08-12 model swap 35B→27B · 2026-08-12 sampling · 2026-08-11 imported .bak
+</code></pre>
+  </div>
+</section>
+
+<section>
+  <p class="tag">[round-trip]</p>
+  <h2>3 · The round-trip problem</h2>
+  <div class="prose">
+  <p>This is the part every existing tool gets wrong, and the part that decides whether you trust Stellwerk. The recon numbers make the constraint vivid: <code>mixperten.service</code> is 103 lines, of which 9 are the command. The rest is a lab notebook — KLD tables, a McNemar test, a decision record signed "ENTSCHEIDUNG markus 2026-08-11", and a warning about which comment is now decoration. Any mechanism that regenerates the file from a parsed model will eventually normalize, reorder, or drop something. So:</p>
+
+  <h3>Mechanism: parse everything, rewrite nothing, splice bytes</h3>
+  <ol>
+    <li><strong>Concrete-syntax parse.</strong> Read the file as lines. Locate <code>ExecStart=</code> and its backslash continuations; tokenize the command with systemd's exact quoting rules (single/double quotes, <code>\</code> continuations including the no-space form <code>llama-server\</code> in the NPU unit, <code>%%</code> specifiers). Every token keeps its byte range in the original file. Same for plain <code>Key=Value</code> lines.</li>
+    <li><strong>Edits are splices.</strong> Changing <code>-c 65536</code> to <code>-c 131072</code> replaces exactly those bytes. Adding a flag inserts into the line the operator picks in the preview. Removing a flag deletes its tokens and nothing else. Comments, blank lines, ordering, indentation: untouched by construction, because they are never parsed into a model that gets serialized back.</li>
+    <li><strong>Readback verification — refuse rather than corrupt.</strong> After splicing (to a temp file): re-parse and assert the argv equals the intended argv; then <code>systemd-analyze verify</code> the unit; then after <code>daemon-reload</code>, compare <code>systemctl --user show -p ExecStart</code> — systemd's <em>own</em> parser — against intent. Any mismatch aborts the write and shows both parses. This is the guard against the tokenizer being subtly wrong about an edge case.</li>
+    <li><strong>Atomic write with compare-and-swap.</strong> Hash the file at read time; refuse to write if it changed underneath (you hand-edit these files, and will continue to — that must stay safe).</li>
+    <li><strong>Git replaces <code>.bak</code>.</strong> <code>git init</code> in <code>~/.config/systemd/user/</code>; the seven existing <code>.bak*</code> files become the initial history (dated commits reconstructed from their timestamps, then the files removed). Before any Stellwerk write, uncommitted hand edits are auto-committed as <code>manual edit (imported)</code> — hand edits are first-class, never clobbered, and drift is visible exactly as your Push philosophy wants.</li>
+  </ol>
+
+  <h3>The stale-prose problem, honestly</h3>
+  <p>The comments <em>reference</em> the values ("65536 kept from the previous unit to change one thing at a time"). A byte-perfect splice preserves the prose and thereby makes it a liar. No tool can fix that; a good tool makes it impossible to do <em>unknowingly</em>: on every edit, grep the comment block for the flag name and the old literal value; hits appear in the review step and must be either edited or explicitly acknowledged. Never auto-edit prose — a tool that rewrites your measurement notes is a tool you'd rightly uninstall the same day.</p>
+
+  <pre class="wf"><code> TWEAK qwen3.6-coding.service                                        step 2 of 3 — review
+ ─────────────────────────────────────────────────────────────────────────────────────────
+   -c   65 536 → 131 072     KV q8_0 on this arch: <span class="wn">+~2 GiB (estimate — no measured peak</span>
+                             <span class="wn">at this ctx)</span> · projected peak 19.9 / 30.6 GiB <span class="ok">✓ fits</span>
+ ─────────────────────────────────────────────────────────────────────────────────────────
+ DIFF — only these bytes change
+   <span class="bd">−   -c 65536 -t 4 -fa on -ctk q8_0 -ctv q8_0 \</span>
+   <span class="ok">+   -c 131072 -t 4 -fa on -ctk q8_0 -ctv q8_0 \</span>
+
+ <span class="wn">⚠ PROSE MAY NOW BE STALE — 1 comment line mentions the old value:</span>
+   # …supports 262144 ctx; 65536 kept from the previous unit to change one thing at a time
+   [ edit this comment ]   [ acknowledge — leave as is ]
+
+ PREFLIGHT   <span class="ok">✓</span> readback parse = intent     <span class="ok">✓</span> systemd-analyze verify clean
+             <span class="ok">✓</span> port unchanged              <span class="ok">✓</span> projected 19.9 &lt; 28.0 warn line
+ commit: [ ctx 65536→131072 — headroom from the 1.1 GiB smaller model            ]
+                                    [ back ]   [ apply + restart ]   [ apply, restart later ]
+</code></pre>
+
+  <h3>Drop-ins</h3>
+  <p>You have none today (verified). Policy: read effective config via <code>systemctl --user cat</code>; if a drop-in ever overrides a key, that key renders read-only with "override lives in <code>foo.service.d/x.conf</code>" and Stellwerk edits the fragment only. It never <em>creates</em> drop-ins: for user-owned units in <code>~/.config</code>, drop-ins would split one file of truth into two files of truth for zero benefit. That's a fight with <code>systemctl edit</code> deliberately not picked.</p>
+
+  <h3>Named failure modes</h3>
+  <ul>
+    <li><strong>Tokenizer wrong on an edge case</strong> (quoted JSON like <code>'{"enable_thinking":false}'</code>, <code>\</code>-no-space, <code>%%</code>). Caught by readback-vs-intent; outcome is a refusal, not a corruption. Residual risk: refusing too often. Acceptable.</li>
+    <li><strong>Stale prose acknowledged and forgotten.</strong> Mitigation is the ack being recorded in the commit message trailer. Residual risk real; it exists today with hand edits too.</li>
+    <li><strong>Concurrent hand edit.</strong> Caught by compare-and-swap; the UI re-renders and asks again.</li>
+    <li><strong>Git repo confusion</strong> if you ever put that directory under another repo/stow scheme. Detect a pre-existing repo and join it instead of nesting.</li>
+    <li><strong>Semantic edits beyond splicing</strong> (e.g. restructuring a command). Out of scope by design: the escape hatch is the raw-file editor with the same verify + commit pipeline and none of the parameter UI.</li>
+  </ul>
+  </div>
+</section>
+
+<section>
+  <p class="tag">[watcher]</p>
+  <h2>4 · Live status — what "online" means</h2>
+  <div class="prose">
+  <p>"Active" is nearly meaningless here: a unit is <code>active (running)</code> for the full 72 s a 15 GiB model takes to load, and <code>inactive</code> can be the <em>correct, healthy</em> state of a kernel-gated unit. Stellwerk's status is a ladder, and the UI always shows the rung, not a boolean:</p>
+  </div>
+  <div class="tablewrap"><table>
+    <tr><th>Rung</th><th>Signal</th><th>Source</th></tr>
+    <tr><td><strong>OFF</strong></td><td>unit inactive, not gated</td><td><code>systemctl --user show</code></td></tr>
+    <tr><td><strong>STANDBY</strong></td><td>inactive because <code>ExecCondition</code> failed — rendered neutral, with the unmet condition in words: "waiting for kernel 6.1.75-npu-port (running: 6.12.x)"</td><td><code>ExecMainStatus</code>/condition result + parsed condition</td></tr>
+    <tr><td><strong>STARTING</strong></td><td>systemd activating, process spawning</td><td>unit state</td></tr>
+    <tr><td><strong>LOADING</strong></td><td>port bound but <code>/health</code> → 503 "loading model" — the 72-second gap, shown with elapsed vs. last-known load time</td><td><code>ss</code> + one cheap local HTTP GET</td></tr>
+    <tr><td><strong>READY</strong></td><td><code>/health</code> → 200</td><td>HTTP</td></tr>
+    <tr><td><strong>BUSY</strong></td><td>a request is in flight</td><td>journal tail (passive), not probing</td></tr>
+    <tr><td><strong>FAILED</strong></td><td>systemd failed / restart-looping (count shown)</td><td>unit state + <code>NRestarts</code></td></tr>
+    <tr><td><strong>RETIRED</strong></td><td><code>[RETIRED]</code> in Description</td><td>parsed</td></tr>
+  </table></div>
+  <div class="prose">
+  <div class="callout">
+    <span class="label">Principle — the watcher does not knock</span>
+    <p>No periodic completion probes, ever. The workload is serialized; a probe can queue behind a real request (your own notes flag a runaway generation costing 94 minutes at 5.8 t/s), and synthetic tokens would pollute the honest per-request log. <code>/health</code> is a cheap status read, fine on a few-second cadence; BUSY and per-request stats come from tailing the journal, which llama-server already writes. A real completion runs only when you press "smoke test" during a switch. Corollary: <code>tg128</code>-style numbers never appear anywhere in this UI — every displayed t/s is from a real request's wall clock, your own honesty rule.</p>
+  </div>
+
+  <h3>Memory fit</h3>
+  <p>Memory is the failure mode that matters, and your own data says formulas lie: the 35B Q4_K_M "fits" on paper, then ARM repack residency pushed 30.5/31.6 GiB and prefill halved while decode looked fine. And the KV formula needs per-architecture knowledge anyway (the hybrid Qwen has KV on 11 of 41 blocks only). So:</p>
+  <ul>
+    <li><strong>Measured beats modeled.</strong> Stellwerk records cgroup <code>memory.peak</code> per (unit, model-file hash, ctx) into a small sqlite. Predictions come from the last measured peak when one exists — labeled "measured" — and from file-size + KV estimate only as a fallback, always labeled "estimate".</li>
+    <li><strong>Warn line at 28 GiB projected</strong> (the measured collapse zone starts ~30.5 of 31.6); hard confirm above it. Co-residency is summed: big slot + always-on peaks + a fixed system reserve.</li>
+    <li><strong>Prefill-collapse tripwire:</strong> if a unit's journal-observed prompt-processing rate drops well below its own history while RSS is near the ceiling, badge it "memory-pressure suspected" — that exact signature cost you a day once; the UI should name it.</li>
+  </ul>
+  </div>
+</section>
+
+<section>
+  <p class="tag">[interlocking]</p>
+  <h2>5 · Safety rails</h2>
+  <div class="prose">
+  <div class="callout found">
+    <span class="label">Found during this design's recon</span>
+    <p>Port :8086 has two claimants <em>right now</em>: <code>llama-task.service</code> (enabled, active) and <code>llama-server-qwen35-npu.service</code> (kernel-gated, disabled). Harmless today — but enable the NPU unit before the next NPU-kernel boot and both start, one loses, and it happens at boot with nobody watching. This is precisely the class of trap the mixperten <code>DO NOT ENABLE</code> comment guards :8085 against, one port over, without the comment. A dashboard that surfaces this on day one has paid for itself.</p>
+  </div>
+  <ul>
+    <li><strong>Port interlock, gate-aware.</strong> Claims are computed from parsed <code>--port</code> across all units, then evaluated per scenario: <em>active conflict</em> (two running — should be impossible, flagged red), <em>armed conflict</em> (two enabled whose conditions can be simultaneously true — the :8086 case on an NPU kernel — flagged on the port board and at enable time), <em>latent</em> (disabled claimant — a footnote, like mixperten's :8085). Enabling or starting into an armed conflict requires typing past a named warning, never a silent failure at boot.</li>
+    <li><strong>Alias interlock, same machinery.</strong> Clients route by <code>--alias</code>; two live units answering the same alias on different ports is a subtler lie than a port clash.</li>
+    <li><strong>The retired trap.</strong> <code>[RETIRED …]</code> in Description is the convention (already your practice). Retired units render folded and grey, keep their full notes (they're the best-documented decisions you have), and their start/enable actions are demoted behind an explicit "this unit is marked RETIRED 2026-08-12 and claims :8085, owned by qwen3.6-coding — start anyway?" Never deleted, never hidden.</li>
+    <li><strong>STANDBY is not broken.</strong> Kernel-gated units get their own section, neutral color, and the condition spelled out in words. No red, no "failed", no restart storm — the whole point of the <code>ExecCondition</code> pattern, finally reflected in a UI.</li>
+    <li><strong>OOM prevention</strong> = the §4 fit check, enforced at three doors: starting a unit, switching the big slot, and any edit that raises <code>-c</code> / changes model / changes KV quant. Above the warn line the action needs an explicit override; the override is recorded in the commit/journal so the 3-a.m. question "why is the box swapping" has an answer.</li>
+    <li><strong>Co-fit notes stay human.</strong> The "stop the small models first — they do not co-fit" knowledge lives in comments today. v0.1 does <em>not</em> invent a metadata language for it; the summed-peaks check covers the arithmetic. If it earns its keep later, a single opt-in comment directive (<code># stellwerk-slot: big</code>) — in the file, so truth stays in the file — is the ceiling of cleverness allowed here.</li>
+  </ul>
+
+  <h3>Switch flow — turning the table</h3>
+  <pre class="wf"><code> SWITCH big slot   qwen3.6-coding  →  qwen3-30b
+ ─────────────────────────────────────────────────────────────────────────────────────────
+ INTERLOCK   :8085 free after stop <span class="ok">✓</span> · alias overlap none <span class="ok">✓</span>
+             fit: measured peak 21.3 + always-on 3.0 + reserve 1.5 = 25.8 / 30.6 GiB <span class="ok">✓</span>
+ ─────────────────────────────────────────────────────────────────────────────────────────
+  1 <span class="ok">▣ stop qwen3.6-coding</span>        done · 2 s
+  2 <span class="ok">▣ start qwen3-30b</span>            active · 1 s
+  3 <span class="acc">▶ model loading</span>              /health 503 · <span class="acc">48 s elapsed</span> <span class="dim">(last load on this box: 72 s)</span>
+  4 <span class="dim">▷ ready</span>
+  5 <span class="dim">▷ smoke test (optional)</span>      one short real completion, wall-clock timed, logged
+ ─────────────────────────────────────────────────────────────────────────────────────────
+ [ abort — restores qwen3.6-coding ]        enable-on-boot follows the switch: [x] yes
+</code></pre>
+  </div>
+</section>
+
+<section>
+  <p class="tag">[roundhouse]</p>
+  <h2>6 · Roundhouse integration — your three questions</h2>
+  <div class="prose">
+  <dl class="qa">
+    <dt>Q1</dt>
+    <dd><strong>Who owns the truth?</strong> Two truths, two owners, one boundary. llm-proxy on hossenfelder owns <em>catalog truth</em>: what exists, what it costs, what it can do. Stellwerk owns <em>process truth on the serving host</em>: what is actually up, on which port, with which ctx, in which state — because that truth is literally the systemd state it renders. The boundary is a one-way street: Stellwerk <em>publishes</em> process truth (a read-only <code>/status</code> JSON: alias, port, rung, ctx, last-measured t/s), and llm-proxy may consume it to mark its 4 [local] entries live or dead instead of guessing. Stellwerk never pushes routing decisions and never reads the catalog to decide anything. Consumers keep talking to the gateway, not to Stellwerk.</dd>
+    <dt>Q2</dt>
+    <dd><strong>Push or Pull?</strong> Answered in §1: Push for process config (boot must not depend on the network), Pull for selection metadata (a request already implies the gateway is reachable). Stellwerk is the Push horn done right — files in git, drift visible, and the "generator" temptation explicitly rejected because your units are documents, not build artifacts.</dd>
+    <dt>Q3</dt>
+    <dd><strong>May the measurement loop influence the ladder?</strong> Close the loop <em>through the operator</em>, not around him. bullpen-evals verdicts flow into a recommendation inbox: "rung 2 solved 14/15 tasks that escalated to rung 3 last month — demote the default?" One click applies it; the applied change is a git commit (or an llm-proxy config change) with the evidence linked. What makes self-reconfiguration undebuggable is not the feedback — it's <em>unattributed</em> change. Your own unit files show the standard: every decision in them has a date, a measurement, and a signature. Hold the loop to the same standard and it stays debuggable; let it write silently and in six months no one can say why the ladder looks the way it does. Fully automatic re-rating is a later, separate decision to make after a few months of watching how often you just click "apply".</dd>
+  </dl>
+  <div class="callout trap">
+    <span class="label">Hard rail, structural</span>
+    <p><strong>KEIN Paid-Offloading, nie.</strong> Stellwerk manages local units only, so it structurally cannot offload. If it ever displays catalog context next to a recommendation, [$] entries are inert text — never an action, never a fallback target. Worth writing into the code as an assertion, not just into this document.</p>
+  </div>
+  </div>
+</section>
+
+<section>
+  <p class="tag">[plan]</p>
+  <h2>7 · Staged plan — smallest useful thing first</h2>
+  <div class="prose">
+  <p><strong>Shape:</strong> one Python file (matching the <code>/opt/llm-proxy.py</code> house style) + one static page, SSE for live updates, sqlite for measured peaks, talking to systemd via the user D-Bus/<code>systemctl --user</code>. Runs as — of course — a systemd user unit, <code>stellwerk.service</code>, on a free port (8090 is unclaimed today; the port board will confirm its own). No node toolchain, no build step, nothing to babysit.</p>
+  <ul class="versions">
+    <li><span class="v">v0.1</span><span><strong>Read-only, one week, already useful.</strong> Scan + parse all units, Platform + Stall views, status ladder, operator's-notes rendering, port board with the :8086 finding visible, kernel-gate STANDBY treatment, memory gauge. Zero write path = zero risk while trust builds. This alone beats every existing tool for this fleet, because nothing else can render <em>these</em> units.</span></li>
+    <li><span class="v">v0.2</span><span><strong>Operations.</strong> Start/stop/restart/enable with port+alias interlocks; the Switch flow with the loading ladder; git init + <code>.bak</code> absorption; journal tail in the Stall view.</span></li>
+    <li><span class="v">v0.3</span><span><strong>The round-trip.</strong> Parameter tweak with splice, diff preview, readback verification, stale-prose flagging, commit messages. The hard part, shipped only after v0.1/v0.2 have proven the parser against all 23 real files.</span></li>
+    <li><span class="v">v0.4</span><span><strong>Memory intelligence.</strong> Peak-RSS sqlite, measured-vs-estimate fit predictions, prefill-collapse tripwire, per-request t/s history from the journal.</span></li>
+    <li><span class="v">v0.5</span><span><strong>Roundhouse hooks.</strong> <code>/status</code> JSON for llm-proxy; bullpen-evals recommendation inbox. Gated on the <code>/v1/models</code> enrichment landing first — that remains the true smallest Roundhouse step, and it happens in llm-proxy, not here.</span></li>
+  </ul>
+  <p>Fleet scope: v0.1–v0.4 are boltzmann-only on purpose. The design generalizes (a host column, N unit dirs), but multi-host before the round-trip is trustworthy would multiply risk, not value.</p>
+  </div>
+</section>
+
+<section>
+  <p class="tag">[open]</p>
+  <h2>8 · Open questions for you</h2>
+  <div class="prose">
+  <ol>
+    <li><strong>Auth:</strong> LAN-only bind like the llama-servers, or tailnet/basic-auth? It can stop and start your models, so "whatever :8085 does" may not be enough.</li>
+    <li><strong>Git location:</strong> repo directly in <code>~/.config/systemd/user/</code>, or a mirror repo with the unit dir symlinked into it? Direct is simpler; say if that directory has other plans.</li>
+    <li><strong>Naming:</strong> Stellwerk, or something else in the railway family? The metaphor is load-bearing enough in the UI copy ("turn the table", "standing by") that the name should be settled before implementation.</li>
+  </ol>
+  </div>
+</section>
+
+<footer>
+  stellwerk-design · 2026-08-12 · grounded in live recon of boltzmann (~/.config/systemd/user, 23 units) · hand to the implementing agent together with qwen3.6-coding.service and mixperten.service as parser test fixtures
+</footer>
+</div>

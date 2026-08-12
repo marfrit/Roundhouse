@@ -1,0 +1,28 @@
+[Unit]
+Description=rk-llama.cpp NPU backend: Qwen 3.5 9B Q8_0 on RK3588 NPU (port 8086)
+Documentation=file:///home/mfritsche/.claude/projects/-home-mfritsche-src-neutron/memory/project_neutron_npu_port_success_2026-05-26.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+
+# Kernel gate: only run under 6.1.75-npu-port.
+ExecCondition=/bin/sh -c '[ "$(uname -r)" = "6.1.75-npu-port" ]'
+
+LimitNOFILE=65536
+
+WorkingDirectory=/home/mfritsche/npu
+ExecStart=/home/mfritsche/src/rk-llama.cpp/build/bin/llama-server\
+     -m /home/mfritsche/models/Qwen3.5-9B-Q8_0.gguf\
+     --alias qwen3.5-9b-npu\
+     -c 98304 -t 4\
+     --host 0.0.0.0 --port 8086
+
+Restart=on-failure
+RestartSec=5
+
+TimeoutStartSec=180
+
+[Install]
+WantedBy=default.target
