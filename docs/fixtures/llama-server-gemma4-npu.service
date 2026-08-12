@@ -1,0 +1,38 @@
+[Unit]
+Description=rk-llama.cpp NPU backend: Gemma 4 12B IT Q8_0 + MTP drafter on RK3588 NPU (port 8085)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+
+# RKNPU exhausts the default 1024 fds during init and segfaults (errno 24).
+LimitNOFILE=65536
+
+# Pin to the A76 big cluster (cpu4-7). Bench: +13% decode / +19% prefill vs the
+# unpinned scheduler; spreading across all 8 cores (-t 8) regresses on this
+# big.LITTLE SoC because the A55s straggle at the per-token barrier.
+CPUAffinity=4-7
+
+# Multi-token prediction drafter (llama.cpp PR #23398, merged here as b9549).
+# 4-layer / 423 MB head; nextn_predict_layers=4 so n-max above 4 has no head.
+# Bench: 2.118 -> 3.502 tok/s (+65%) at 0.503 acceptance. Verified byte-identical
+# to non-speculative greedy output (speculative decoding is lossless).
+#
+# gemma4 n_ctx_train = 131072. Do not raise without RoPE scaling.
+WorkingDirectory=/home/mfritsche/npu
+ExecStart=/home/mfritsche/src/rk-llama.cpp/build-mtp/bin/llama-server \
+     -m /home/mfritsche/models/gemma-4-12b-it-Q8_0.gguf \
+     -md /home/mfritsche/models/mtp-gemma-4-12b-it-Q8_0.gguf \
+     --spec-type draft-mtp --spec-draft-n-max 4 \
+     --alias gemma-4-12b-q8 \
+     -c 131072 -t 4 \
+     --host 0.0.0.0 --port 8085
+
+Restart=on-failure
+RestartSec=5
+
+TimeoutStartSec=300
+
+[Install]
+WantedBy=default.target

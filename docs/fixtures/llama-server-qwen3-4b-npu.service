@@ -1,0 +1,27 @@
+[Unit]
+Description=rk-llama.cpp NPU backend: Qwen3 4B Q8_0 on RK3588 NPU (port 8091)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+
+# Kernel gate: only run under an NPU-capable kernel (rkopnu present; matches *npu*).
+ExecCondition=/bin/sh -c 'case "$(uname -r)" in *npu*) exit 0;; *) exit 1;; esac'
+
+LimitNOFILE=65536
+
+WorkingDirectory=/home/mfritsche/npu
+ExecStart=/home/mfritsche/src/rk-llama.cpp/build/bin/llama-server\
+     -m /home/mfritsche/models/Qwen3-4B-Instruct-2507-Q8_0.gguf\
+     --alias qwen3-4b-2507-npu\
+     -c 65536 -t 4 --cache-type-k q8_0 --cache-type-v q8_0\
+     --host 0.0.0.0 --port 8091
+
+Restart=on-failure
+RestartSec=5
+
+TimeoutStartSec=180
+
+[Install]
+WantedBy=default.target

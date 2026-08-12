@@ -1,0 +1,29 @@
+[Unit]
+Description=rk-llama.cpp NPU backend: Ornith 1.0 9B Q8_0 on RK3588 NPU (port 8085)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+
+LimitNOFILE=65536
+
+# Pin to the A76 big cluster (cpu4-7). Bench: +13% decode / +19% prefill vs the
+# unpinned scheduler; spreading across all 8 cores (-t 8) regresses on this
+# big.LITTLE SoC because the A55s straggle at the per-token barrier.
+CPUAffinity=4-7
+
+WorkingDirectory=/home/mfritsche/npu
+ExecStart=/home/mfritsche/src/rk-llama.cpp/build/bin/llama-server \
+     -m /home/mfritsche/models/ornith-1.0-9b-Q8_0.gguf \
+     --alias ornith-9b-q8 \
+     -c 262144 -t 4 \
+     --host 0.0.0.0 --port 8085
+
+Restart=on-failure
+RestartSec=5
+
+TimeoutStartSec=180
+
+[Install]
+WantedBy=default.target

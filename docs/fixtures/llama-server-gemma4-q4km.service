@@ -1,0 +1,16 @@
+[Unit]
+Description=llama.cpp CPU: Gemma 4 12B IT Q4_K_M (port 8087) on RK3588
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+LimitNOFILE=65536
+
+WorkingDirectory=/home/mfritsche/npu
+ExecStart=/home/mfritsche/src/llama.cpp/build/bin/llama-server     -m /home/mfritsche/models/gemma-4-12b-it-Q4_K_M.gguf     --alias gemma4-12b-it-q4km     -c 65536 -np 1 -t 8     --mlock     --host 0.0.0.0 --port 8087
+
+TimeoutStartSec=300
+
+[Install]
+WantedBy=default.target

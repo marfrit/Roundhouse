@@ -1,0 +1,19 @@
+[Unit]
+Description=Qwen3-30B-A3B-Instruct-2507 UD-Q4_K_XL llama-server (CPU, MoE 3.3B-active) on :8085
+After=network-online.target
+
+[Service]
+Type=simple
+# A/B winner (2026-07-15): UD-Q4_K_XL fits 30GB RAM (Q8_0 thrashes); CPU-only chosen
+# for kernel-agnostic reliability (NPU only adds ~7% on attention for this MoE and
+# needs the npuclk kernel pinned). A76 cores 4-7; 96k ctx with Q8 KV to fit RAM.
+ExecStart=/usr/bin/taskset -c 4-7 /home/mfritsche/src/llama.cpp-latest/build/bin/llama-server \
+  -m /home/mfritsche/models/Qwen3-30B-A3B-Instruct-2507-UD-Q4_K_XL.gguf \
+  -c 98304 -t 4 -fa on -ctk q8_0 -ctv q8_0 \
+  --alias qwen3-30b-a3b --host 0.0.0.0 --port 8085
+LimitNOFILE=65536
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=default.target

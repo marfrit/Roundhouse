@@ -1,0 +1,20 @@
+[Unit]
+Description=llama.cpp CPU: Qwen3.5 9B Q4_K_M (port 8088) on RK3588
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+LimitNOFILE=65536
+
+WorkingDirectory=/home/mfritsche/npu
+ExecStart=/home/mfritsche/src/llama.cpp/build/bin/llama-server \
+    -m /home/mfritsche/models/Qwen3.5-9B.Q4_K_M.gguf \
+    --alias qwen3.5-9b-q4-km \
+    -c 65536 -np 1 -t 8 \
+    --host 0.0.0.0 --port 8088
+
+TimeoutStartSec=300
+
+[Install]
+WantedBy=default.target

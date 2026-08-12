@@ -1,0 +1,18 @@
+[Unit]
+Description=nomic-embed-text-v1.5 embedding model (mneme) on :8082
+After=network-online.target
+
+[Service]
+Type=simple
+# Small embedding model, little cores only (0-3) -- same rationale as llama-task:
+# never contend with qwen3.6-coding on the A76s (4-7).
+ExecStart=/usr/bin/taskset -c 0-3 /home/mfritsche/src/llama.cpp-latest/build/bin/llama-server \
+  -m /home/mfritsche/models/nomic-embed-text-v1.5.Q8_0.gguf \
+  -c 8192 -b 8192 -ub 8192 -t 4 --embedding \
+  --alias nomic-embed-text --host 0.0.0.0 --port 8082
+LimitNOFILE=65536
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=default.target

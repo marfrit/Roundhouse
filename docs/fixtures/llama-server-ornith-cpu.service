@@ -1,0 +1,35 @@
+[Unit]
+Description=rk-llama.cpp CPU backend: Ornith 1.0 9B Q5_K_M on RK3588 CPU (port 8085)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+
+LimitNOFILE=65536
+
+WorkingDirectory=/home/mfritsche/npu
+ExecStart=/home/mfritsche/src/llama.cpp/build/bin/llama-server \
+     -m /home/mfritsche/models/ornith-1.0-9b-Q8_0.gguf \
+     --alias ornith-9b-q8 \
+     --cpu-strict 1 \
+     --mlock \
+       -c 163840 \
+       -t 7 \
+       --threads-batch 8 \
+       --flash-attn on \
+       --cache-type-k q8_0 \
+       --cache-type-v q8_0 \
+       -b 512 \
+       -ub 512 \
+       --jinja \
+       --parallel 1 \
+     --host 0.0.0.0 --port 8085
+
+Restart=on-failure
+RestartSec=5
+
+TimeoutStartSec=180
+
+[Install]
+WantedBy=default.target

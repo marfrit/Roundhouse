@@ -1,0 +1,16 @@
+[Unit]
+Description=llama.cpp CPU: Pygmalion-Vicuna-1.1-7b Q3_K_M (port 8088) on RK3588
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+LimitNOFILE=65536
+
+WorkingDirectory=/home/mfritsche/npu
+ExecStart=/home/mfritsche/src/llama.cpp/build/bin/llama-server     -m /home/mfritsche/models/Pygmalion-Vicuna-1.1-7b-Q3_K_M.gguf     --alias pygmalion-vicuna-7b     -c 8192 -np 1 -t 8     --mlock     --host 0.0.0.0 --port 8088
+
+TimeoutStartSec=300
+
+[Install]
+WantedBy=default.target

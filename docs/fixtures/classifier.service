@@ -1,0 +1,14 @@
+[Unit]
+Description=Query classifier service wrapping Llama 3.2 1B on port 8090
+After=llama-server-classifier.service
+BindsTo=llama-server-classifier.service
+
+[Service]
+Type=simple
+WorkingDirectory=/home/mfritsche/npu
+ExecStart=/usr/bin/python3 /home/mfritsche/npu/classifier-server.py
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target

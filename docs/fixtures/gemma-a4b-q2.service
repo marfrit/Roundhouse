@@ -1,0 +1,19 @@
+[Unit]
+Description=Gemma-4-26B-A4B UD-Q2_K_XL "Alzheimer's experts" llama-server (CPU, fa) on :8092
+After=network-online.target
+
+[Service]
+Type=simple
+# Downquant-experts experiment: routed experts ~2-bit (UD dynamic keeps attn/router/embed high).
+# Same MoE as gemma-a4b.service but experts crushed for faster decode. NOT QAT (QAT is 4-bit only).
+# Disabled by default; shares the 30GB box with the Q4 unit + deepseek, only one runs at a time.
+ExecStart=/usr/bin/taskset -c 4-7 /home/mfritsche/src/llama.cpp-latest/build/bin/llama-server \
+  -m /home/mfritsche/models/gemma4-a4b/gemma-4-26B-A4B-it-UD-Q2_K_XL.gguf \
+  -c 32768 -t 4 -fa on \
+  --alias gemma-4-26b-a4b-q2 --host 0.0.0.0 --port 8092
+LimitNOFILE=65536
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=default.target

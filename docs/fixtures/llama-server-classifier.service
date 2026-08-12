@@ -1,0 +1,13 @@
+[Unit]
+Description=llama-server Llama 3.2 1B classifier on port 8089
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/llama-server -m /home/mfritsche/models/Llama-3.2-1B-Instruct-Q4_K_M.gguf --alias llama-3.2-1b-classifier -c 8192 -np 1 -t 4 --mlock --host 127.0.0.1 --port 8089
+ExecStop=/bin/kill -s TERM $MAINPID
+Restart=on-failure
+RestartSec=10
+Nice=19
+
+[Install]
+WantedBy=default.target

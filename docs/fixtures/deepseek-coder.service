@@ -1,0 +1,18 @@
+[Unit]
+Description=DeepSeek-Coder-V2-Lite Q8_0 llama-server (CPU, fa+q8 KV, 96k ctx) on :8090
+After=network-online.target
+
+[Service]
+Type=simple
+# NPU can't offload this MoE's experts (rk-llama backend -> ~5%% NPU), so plain CPU
+# build on A76 cores 4-7. q8_0 KV cache keeps 96k ctx inside the 30GB box (~29GB resident).
+ExecStart=/usr/bin/taskset -c 4-7 /home/mfritsche/src/llama.cpp/build/bin/llama-server \
+  -m /home/mfritsche/models/DeepSeek-Coder-V2-Lite-Instruct-Q8_0.gguf \
+  -c 98304 -t 4 -fa on -ctk q8_0 -ctv q8_0 \
+  --alias deepseek-coder-v2-lite --host 0.0.0.0 --port 8090
+LimitNOFILE=65536
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=default.target

@@ -1,0 +1,17 @@
+[Unit]
+Description=llamafile chat server: Llama 3.1 8B Instruct (Q4_K_M)
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/mfritsche/npu
+ExecStart=/bin/sh /home/mfritsche/npu/llamafile --server \
+    -m /home/mfritsche/npu/Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf \
+    --alias llama-3.1-8b-instruct \
+    -c 8192 -t 6 \
+    --host 0.0.0.0 --port 8083
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target

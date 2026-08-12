@@ -1,0 +1,19 @@
+[Unit]
+Description=Gemma-4-26B-A4B QAT Q4_K_XL llama-server (CPU, MoE 4B-active, fa) on :8091
+After=network-online.target
+
+[Service]
+Type=simple
+# MoE: 26B total / 4B active -> fast decode; QAT 4-bit ~= near-BF16 quality.
+# Gemma SWA+GQA keeps KV small. Latest llama.cpp build (gemma4 arch). A76 cores 4-7.
+# Disabled by default: shares the 30GB box with deepseek-coder.service, only one runs.
+ExecStart=/usr/bin/taskset -c 4-7 /home/mfritsche/src/llama.cpp-latest/build/bin/llama-server \
+  -m /home/mfritsche/models/gemma4-a4b/gemma-4-26B-A4B-it-qat-UD-Q4_K_XL.gguf \
+  -c 131072 -t 4 -fa on \
+  --alias gemma-4-26b-a4b --host 0.0.0.0 --port 8091
+LimitNOFILE=65536
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=default.target

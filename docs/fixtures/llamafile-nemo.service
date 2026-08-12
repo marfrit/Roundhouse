@@ -1,0 +1,17 @@
+[Unit]
+Description=llamafile chat server: Mistral Nemo 12B Instruct 2407 (Q4_K_M)
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/mfritsche/npu
+ExecStart=/bin/sh /home/mfritsche/npu/llamafile --server \
+    -m /home/mfritsche/npu/Mistral-Nemo-Instruct-2407-Q4_K_M.gguf \
+    --alias mistral-nemo-12b-instruct \
+    -c 32768 -t 4 \
+    --host 0.0.0.0 --port 8084
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target
