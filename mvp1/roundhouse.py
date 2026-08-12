@@ -21,7 +21,7 @@ import sqlite3
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional, List, Dict, Any
-from datetime import datetime
+from datetime import datetime, timezone
 import socket
 import time
 
@@ -1039,7 +1039,819 @@ def assert_no_paid_offload(dep: Dict) -> None:
 
 
 # ===== SECTION B: WATCHER + MEMSTORE (no threads inside; run_ro is the only subprocess gate) =====
-# implemented by T2
+
+import subprocess
+import threading
+
+READONLY_SYSTEMCTL_VERBS = {"show", "cat", "list-units", "list-unit-files"}
+
+# Journal regex constants per §3.4 (AMENDED per orchestrator)
+# llama-server patterns
+LS_READY = [r"model loaded", r"update_slots: all slots are idle"]
+LS_LISTENING = [r"listening on http"]
+LS_BUSY_START = [r"launch_slot_", r"update_slots: .*new prompt", r"processing task"]
+LS_BUSY_END = [r"slot\s+release:", r"update_slots: all slots are idle"]
+LS_REQ_DONE = [r"request: (GET|POST) [^ ]+ [0-9.]+ 200"]
+
+# llamafile patterns
+LF_READY = [r"ll?ama server listening at", r"all slots are idle", r"model loaded"]
+LF_BUSY_START = [r"slot \d+ is processing", r"processing task"]
+LF_BUSY_END = [r"slot \d+ released", r"all slots are idle"]
+
+
+def run_ro(argv: List[str], timeout=10) -> str:
+    """Run a read-only subprocess (systemctl/journalctl only).
+
+    Args:
+        argv: command and arguments
+        timeout: timeout in seconds (default 10)
+
+    Returns:
+        stdout as string
+
+    Raises:
+        ValueError: if argv[0] is not systemctl/journalctl, or if systemctl
+                    verb is not in READONLY_SYSTEMCTL_VERBS
+    """
+    if argv[0] not in {"systemctl", "journalctl"}:
+        raise ValueError(f"Only systemctl and journalctl allowed; got {argv[0]}")
+
+    if argv[0] == "systemctl":
+        # Extract verb (second argument after systemctl)
+        if len(argv) > 1:
+            verb = argv[1]
+            if verb not in READONLY_SYSTEMCTL_VERBS:
+                raise ValueError(f"systemctl verb '{verb}' not in read-only set {READONLY_SYSTEMCTL_VERBS}")
+
+    try:
+        result = subprocess.run(argv, capture_output=True, text=True, timeout=timeout)
+        return result.stdout
+    except subprocess.TimeoutExpired:
+        raise TimeoutError(f"Command {argv} timed out after {timeout}s")
+
+
+def spawn_ro_stream(argv: List[str]) -> subprocess.Popen:
+    """Spawn a read-only stream subprocess (systemctl/journalctl only).
+
+    Args:
+        argv: command and arguments
+
+    Returns:
+        Popen object for the subprocess
+
+    Raises:
+        ValueError: if argv[0] is not systemctl/journalctl, or if systemctl
+                    verb is not in READONLY_SYSTEMCTL_VERBS
+    """
+    if argv[0] not in {"systemctl", "journalctl"}:
+        raise ValueError(f"Only systemctl and journalctl allowed; got {argv[0]}")
+
+    if argv[0] == "systemctl":
+        # Extract verb (second argument after systemctl)
+        if len(argv) > 1:
+            verb = argv[1]
+            if verb not in READONLY_SYSTEMCTL_VERBS:
+                raise ValueError(f"systemctl verb '{verb}' not in read-only set {READONLY_SYSTEMCTL_VERBS}")
+
+    return subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+
+
+def parse_show_blocks(text: str, unit_order: List[str]) -> Dict[str, Dict[str, str]]:
+    """Parse systemctl --user show output into blocks per unit.
+
+    Args:
+        text: output from systemctl --user show (blocks separated by blank lines)
+        unit_order: expected unit names in order (corresponds to arguments passed to systemctl)
+
+    Returns:
+        dict mapping unit name to dict of {property: value}
+    """
+    blocks = text.strip().split('\n\n')
+    result = {}
+
+    for i, block in enumerate(blocks):
+        if i >= len(unit_order):
+            break
+
+        unit_name = unit_order[i]
+        props = {}
+
+        for line in block.strip().split('\n'):
+            if '=' in line:
+                key, value = line.split('=', 1)
+                props[key] = value
+
+        result[unit_name] = props
+
+    return result
+
+
+@dataclass
+class Watcher:
+    """State machine for tracking llama-server/llamafile units.
+
+    Processes systemctl show output, journal lines, and cgroup samples
+    to maintain per-unit state (rung, badges, timings).
+    """
+    units: Dict[str, UnitFile]
+    running_kernel: str
+    mem_store: Optional['MemStore']
+    now: callable = field(default_factory=lambda: time.time)
+
+    # Per-unit state (internal)
+    _state: Dict[str, Dict] = field(default_factory=dict)
+    _cgroup_cache: Dict[str, Dict] = field(default_factory=dict)
+
+    def __post_init__(self):
+        """Initialize per-unit state."""
+        for unit_name in self.units:
+            self._state[unit_name] = {
+                'active_state': None,
+                'sub_state': None,
+                'result': None,
+                'n_restarts': 0,
+                'exec_main_pid': None,
+                'exec_main_start_ts': None,
+                'exec_main_start_ts_mono': None,
+                'condition_result': None,
+                'control_group': None,
+                'ready': False,
+                'busy': False,
+                'busy_since': None,
+                'last_marker': None,
+                'unit_file_state': None,
+                'sensed_at': self.now()
+            }
+            self._cgroup_cache[unit_name] = {
+                'peak': None,
+                'current': None,
+                'last_peak': None
+            }
+
+    def apply_systemctl_show(self, props: Dict[str, Dict[str, str]]) -> List[Dict]:
+        """Apply systemctl show output.
+
+        Args:
+            props: dict[unit_name, dict[property, value]] from parse_show_blocks
+
+        Returns:
+            list of event dicts (empty if no rung changes)
+        """
+        events = []
+
+        for unit_name, unit_props in props.items():
+            if unit_name not in self._state:
+                continue
+
+            old_ts_mono = self._state[unit_name]['exec_main_start_ts_mono']
+            new_ts_mono = unit_props.get('ExecMainStartTimestampMonotonic', '0')
+
+            # Check for process restart (timestamp changed)
+            if old_ts_mono and old_ts_mono != new_ts_mono:
+                # Process restarted; reset journal state
+                self._state[unit_name]['ready'] = False
+                self._state[unit_name]['busy'] = False
+                self._state[unit_name]['busy_since'] = None
+                self._state[unit_name]['last_marker'] = None
+
+            # Parse timestamp
+            ts_str = unit_props.get('ExecMainStartTimestamp', '')
+            parsed_ts = None
+            if ts_str and ts_str.strip():
+                try:
+                    # Format: "Wed 2026-08-12 13:24:45 CEST"
+                    # Strip weekday and timezone
+                    parts = ts_str.split()
+                    if len(parts) >= 4:
+                        date_time_str = f"{parts[1]} {parts[2]}"  # "2026-08-12 13:24:45"
+                        parsed_ts = time.mktime(time.strptime(date_time_str, "%Y-%m-%d %H:%M:%S"))
+                except Exception:
+                    pass
+
+            # Check if leaving active state
+            old_active = self._state[unit_name]['active_state']
+            new_active = unit_props.get('ActiveState', '')
+            if old_active == 'active' and new_active != 'active':
+                # Leaving active; reset journal state
+                self._state[unit_name]['ready'] = False
+                self._state[unit_name]['busy'] = False
+                self._state[unit_name]['busy_since'] = None
+                self._state[unit_name]['last_marker'] = None
+
+            # Update state
+            self._state[unit_name]['active_state'] = new_active
+            self._state[unit_name]['sub_state'] = unit_props.get('SubState', '')
+            self._state[unit_name]['result'] = unit_props.get('Result', '')
+            self._state[unit_name]['n_restarts'] = int(unit_props.get('NRestarts', '0'))
+            self._state[unit_name]['exec_main_pid'] = unit_props.get('ExecMainPID', '0')
+            self._state[unit_name]['exec_main_start_ts'] = parsed_ts
+            self._state[unit_name]['exec_main_start_ts_mono'] = new_ts_mono
+            self._state[unit_name]['condition_result'] = unit_props.get('ConditionResult', '')
+            self._state[unit_name]['control_group'] = unit_props.get('ControlGroup', '')
+            self._state[unit_name]['unit_file_state'] = unit_props.get('UnitFileState', '')
+            self._state[unit_name]['sensed_at'] = self.now()
+
+            # Compute rung and check for changes
+            old_rung = self._get_rung(unit_name)
+            new_rung = self._compute_rung(unit_name)
+
+            if old_rung != new_rung:
+                events.append(self._make_rung_event(unit_name, new_rung))
+
+        return events
+
+    def apply_journal_line(self, rec: Dict) -> List[Dict]:
+        """Apply a journal record line.
+
+        Args:
+            rec: dict from json.loads of a journal line
+
+        Returns:
+            list of event dicts
+        """
+        events = []
+
+        # Extract unit name from _SYSTEMD_USER_UNIT
+        unit_name = rec.get('_SYSTEMD_USER_UNIT', '')
+        if not unit_name or unit_name not in self._state:
+            return events
+
+        # Extract message
+        message = rec.get('MESSAGE', '')
+        if not message:
+            return events
+
+        unit = self.units.get(unit_name)
+        if not unit or not unit.exec_start:
+            return events
+
+        # Determine engine kind
+        engine_kind = unit.exec_start.engine.get('kind')
+        if engine_kind == 'llama-server':
+            ready_patterns = LS_READY
+            busy_start_patterns = LS_BUSY_START
+            busy_end_patterns = LS_BUSY_END
+            req_done_patterns = LS_REQ_DONE
+        elif engine_kind == 'llamafile':
+            ready_patterns = LF_READY
+            busy_start_patterns = LF_BUSY_START
+            busy_end_patterns = LF_BUSY_END
+            req_done_patterns = []
+        else:
+            return events
+
+        # Apply transition logic per §3.4
+        old_rung = self._get_rung(unit_name)
+
+        # Rule 1: BUSY_END match
+        busy_end_match = any(re.search(p, message) for p in busy_end_patterns)
+        if busy_end_match:
+            self._state[unit_name]['busy'] = False
+            # Also a READY marker?
+            ready_match = any(re.search(p, message) for p in ready_patterns)
+            if ready_match:
+                self._state[unit_name]['ready'] = True
+            self._state[unit_name]['last_marker'] = message
+        # Rule 2: READY match
+        elif any(re.search(p, message) for p in ready_patterns):
+            self._state[unit_name]['ready'] = True
+            self._state[unit_name]['busy'] = False
+            self._state[unit_name]['last_marker'] = message
+        # Rule 3: BUSY_START match
+        elif any(re.search(p, message) for p in busy_start_patterns):
+            self._state[unit_name]['busy'] = True
+            self._state[unit_name]['ready'] = True
+            self._state[unit_name]['busy_since'] = self.now()
+            self._state[unit_name]['last_marker'] = message
+        # Rule 4: REQ_DONE match
+        elif req_done_patterns and any(re.search(p, message) for p in req_done_patterns):
+            self._state[unit_name]['ready'] = True
+            self._state[unit_name]['busy'] = False
+            self._state[unit_name]['last_marker'] = message
+        # Rule 5: no match - no state change
+        else:
+            return events
+
+        self._state[unit_name]['sensed_at'] = self.now()
+
+        # Check for rung change
+        new_rung = self._compute_rung(unit_name)
+        if old_rung != new_rung:
+            events.append(self._make_rung_event(unit_name, new_rung))
+
+        return events
+
+    def apply_cgroup_sample(self, unit_name: str, peak: Optional[int], current: Optional[int]) -> List[Dict]:
+        """Apply a cgroup memory sample.
+
+        Args:
+            unit_name: name of the unit
+            peak: peak memory in bytes or None
+            current: current memory in bytes or None
+
+        Returns:
+            list of event dicts
+        """
+        if unit_name not in self._cgroup_cache:
+            return []
+
+        # Cache the sample
+        if peak is not None:
+            self._cgroup_cache[unit_name]['peak'] = peak
+            self._cgroup_cache[unit_name]['last_peak'] = peak
+        if current is not None:
+            self._cgroup_cache[unit_name]['current'] = current
+
+        # Emit mem event for ready transitions
+        old_rung = self._get_rung(unit_name)
+        new_rung = self._compute_rung(unit_name)
+
+        events = []
+        if old_rung != 'READY' and new_rung == 'READY':
+            # Ready transition; record to sqlite if available
+            if peak is not None and self.mem_store and unit_name in self.units:
+                unit = self.units[unit_name]
+                if unit.exec_start:
+                    profile = extract_param_profile(unit.exec_start.engine_argv)
+                    model_path = profile.get('model_path')
+                    ctx = profile.get('ctx')
+                    ctk = profile.get('cache_type_k')
+                    ctv = profile.get('cache_type_v')
+
+                    if model_path:
+                        file_id = self._compute_file_id(model_path)
+                        load_seconds = None
+                        if self._state[unit_name]['exec_main_start_ts']:
+                            load_seconds = self.now() - self._state[unit_name]['exec_main_start_ts']
+
+                        self.mem_store.record(
+                            unit=unit_name,
+                            model_path=model_path,
+                            file_id=file_id,
+                            ctx=ctx,
+                            ctk=ctk,
+                            ctv=ctv,
+                            phase='ready',
+                            peak_bytes=peak,
+                            load_seconds=load_seconds
+                        )
+
+                        events.append({
+                            'unit': unit_name,
+                            'peak_bytes': peak,
+                            'phase': 'ready',
+                            'source': 'measured'
+                        })
+
+        return events
+
+    def snapshot(self) -> Dict:
+        """Return a complete snapshot of the current state.
+
+        Returns:
+            dict shaped per spec §4.4(a)
+        """
+        # Get memory info
+        mem_total = None
+        mem_available = None
+        try:
+            with open('/proc/meminfo', 'r') as f:
+                for line in f:
+                    if line.startswith('MemTotal:'):
+                        mem_total = int(line.split()[1]) * 1024
+                    elif line.startswith('MemAvailable:'):
+                        mem_available = int(line.split()[1]) * 1024
+        except Exception:
+            pass
+
+        # Build units list
+        units_list = []
+        for unit_name, unit in self.units.items():
+            rung = self._compute_rung(unit_name)
+
+            if unit.exec_start:
+                profile = extract_param_profile(unit.exec_start.engine_argv)
+            else:
+                profile = {}
+
+            mem_info = self._compute_memory(unit_name, profile)
+
+            port = profile.get('port', 8080)
+            port_source = profile.get('port_source', 'default')
+            alias = profile.get('alias', unit_name)
+            quant = quant_hint(profile.get('model_path', ''))
+
+            unit_dict = {
+                'unit': unit_name,
+                'description': unit.description or '',
+                'retired': unit.retired,
+                'rung': rung,
+                'roster': self._rung_to_roster(rung),
+                'since': self._state[unit_name].get('exec_main_start_ts') or self.now(),
+                'detail': self._compute_detail(unit_name, rung),
+                'badges': self._compute_badges(unit_name, rung),
+                'stale': False,
+                'sensed_at': self._state[unit_name]['sensed_at'],
+                'enabled': self._state[unit_name].get('unit_file_state') == 'enabled',
+                'active_state': self._state[unit_name]['active_state'],
+                'sub_state': self._state[unit_name]['sub_state'],
+                'n_restarts': self._state[unit_name]['n_restarts'],
+                'port': port,
+                'port_source': port_source,
+                'alias': alias,
+                'gate': unit.gate,
+                'model_file': os.path.basename(profile.get('model_path', '')),
+                'quant_hint': quant,
+                'ctx': profile.get('ctx'),
+                'mem': mem_info,
+                'port_conflict': None  # TODO: compute port conflicts
+            }
+
+            units_list.append(unit_dict)
+
+        return {
+            'host': os.uname()[1],  # hostname
+            'kernel': os.uname()[2],  # kernel release
+            'now': self.now(),
+            'mem': {
+                'total_bytes': mem_total,
+                'available_bytes': mem_available
+            },
+            'sources': {
+                'journal': 'ok',
+                'systemctl': 'ok'
+            },
+            'self_port': 8090,
+            'units': units_list
+        }
+
+    def _get_rung(self, unit_name: str) -> Optional[str]:
+        """Get the current rung for a unit (or None if never computed)."""
+        state = self._state.get(unit_name, {})
+        return state.get('_rung')
+
+    def _compute_rung(self, unit_name: str) -> str:
+        """Compute the rung for a unit according to the 8-rung table (§3.3)."""
+        unit = self.units.get(unit_name)
+        if not unit:
+            return 'OFF'
+
+        state = self._state[unit_name]
+        active_state = state.get('active_state', '')
+        sub_state = state.get('sub_state', '')
+
+        # Rule 1: RETIRED
+        if unit.retired:
+            state['_rung'] = 'RETIRED'
+            return 'RETIRED'
+
+        # Rule 2: FAILED
+        if active_state == 'failed':
+            state['_rung'] = 'FAILED'
+            return 'FAILED'
+
+        if active_state == 'activating' and sub_state == 'auto-restart':
+            state['_rung'] = 'FAILED'
+            return 'FAILED'
+
+        # Rule 3: STARTING
+        if active_state == 'activating':
+            state['_rung'] = 'STARTING'
+            return 'STARTING'
+
+        # Rule 4: BUSY
+        if active_state == 'active' and state.get('busy'):
+            state['_rung'] = 'BUSY'
+            return 'BUSY'
+
+        # Rule 5: READY
+        if active_state == 'active' and state.get('ready'):
+            state['_rung'] = 'READY'
+            return 'READY'
+
+        # Rule 6: LOADING
+        if active_state == 'active' and not state.get('ready'):
+            state['_rung'] = 'LOADING'
+            return 'LOADING'
+
+        # Rule 7: STANDBY
+        if active_state in ('inactive', 'dead'):
+            if unit.gate:
+                gate = unit.gate
+                if gate['kind'] == 'kernel':
+                    if gate.get('wants') != self.running_kernel:
+                        state['_rung'] = 'STANDBY'
+                        return 'STANDBY'
+                elif gate['kind'] == 'opaque':
+                    if state.get('condition_result') == 'no':
+                        state['_rung'] = 'STANDBY'
+                        return 'STANDBY'
+
+        # Rule 8: OFF
+        state['_rung'] = 'OFF'
+        return 'OFF'
+
+    def _rung_to_roster(self, rung: str) -> str:
+        """Map rung to roster state."""
+        if rung in ('READY', 'BUSY'):
+            return 'hot'
+        elif rung in ('STARTING', 'LOADING'):
+            return 'loading'
+        elif rung in ('OFF', 'STANDBY'):
+            return 'configured'
+        elif rung == 'FAILED':
+            return 'load-failed'
+        elif rung == 'RETIRED':
+            return None
+        return 'configured'
+
+    def _make_rung_event(self, unit_name: str, rung: str) -> Dict:
+        """Create a rung event dict."""
+        state = self._state[unit_name]
+        state['_rung'] = rung
+
+        return {
+            'unit': unit_name,
+            'rung': rung,
+            'roster': self._rung_to_roster(rung),
+            'since': state.get('exec_main_start_ts') or self.now(),
+            'detail': self._compute_detail(unit_name, rung),
+            'badges': self._compute_badges(unit_name, rung),
+            'stale': False
+        }
+
+    def _compute_detail(self, unit_name: str, rung: str) -> str:
+        """Compute the detail text for a rung."""
+        state = self._state[unit_name]
+
+        if rung == 'FAILED':
+            n_restarts = state.get('n_restarts', 0)
+            sub_state = state.get('sub_state', '')
+            if 'auto-restart' in sub_state:
+                return f"restart-looping, NRestarts={n_restarts}"
+        elif rung == 'LOADING':
+            ts = state.get('exec_main_start_ts')
+            if ts:
+                elapsed = int(self.now() - ts)
+                detail = f"elapsed {elapsed}s"
+                # TODO: add last load time from sqlite
+                return detail
+        elif rung == 'BUSY':
+            busy_since = state.get('busy_since')
+            if busy_since:
+                elapsed = int(self.now() - busy_since)
+                return f"since {elapsed}s"
+
+        return ''
+
+    def _compute_badges(self, unit_name: str, rung: str) -> List[str]:
+        """Compute badges for a unit."""
+        badges = []
+        state = self._state[unit_name]
+
+        if rung == 'BUSY':
+            busy_since = state.get('busy_since')
+            if busy_since:
+                elapsed = self.now() - busy_since
+                if elapsed > 30 * 60:  # 30 minutes
+                    badges.append('long_running')
+
+        return badges
+
+    def _compute_memory(self, unit_name: str, profile: Dict) -> Dict:
+        """Compute memory info for a unit."""
+        if self.mem_store and profile.get('model_path'):
+            file_id = self._compute_file_id(profile['model_path'])
+            ctx = profile.get('ctx')
+            mem = self.mem_store.lookup(unit_name, file_id, ctx)
+            if mem:
+                return mem
+
+        # Fallback: estimate
+        return estimate_memory(
+            {'artifact': {'path': profile.get('model_path')}},
+            self.mem_store
+        )
+
+    def _compute_file_id(self, model_path: str) -> str:
+        """Compute file_id (sz<size>:mt<mtime>) for a model file."""
+        try:
+            st = os.stat(model_path)
+            return f"sz{st.st_size}:mt{int(st.st_mtime)}"
+        except Exception:
+            return ""
+
+
+@dataclass
+class MemStore:
+    """SQLite-backed memory peak storage.
+
+    Stores (ready, exit) measurements indexed by unit + model + context.
+    If db_path is None, all operations are no-ops (inert mode).
+    """
+    db_path: Optional[str] = None
+    _conn: Optional[sqlite3.Connection] = field(default=None, init=False)
+    _lock: threading.Lock = field(default_factory=threading.Lock, init=False)
+
+    def __post_init__(self):
+        """Initialize database connection."""
+        if self.db_path:
+            self._init_db()
+
+    def _init_db(self):
+        """Initialize the sqlite database and schema."""
+        if not self.db_path:
+            return
+
+        # Create directory if needed
+        os.makedirs(os.path.dirname(self.db_path) or '.', exist_ok=True)
+
+        try:
+            self._conn = sqlite3.connect(self.db_path, check_same_thread=False)
+            self._conn.execute('''
+                CREATE TABLE IF NOT EXISTS mem_peak (
+                    unit TEXT NOT NULL,
+                    model_path TEXT NOT NULL,
+                    model_file_id TEXT NOT NULL,
+                    ctx INTEGER,
+                    ctk TEXT,
+                    ctv TEXT,
+                    phase TEXT NOT NULL CHECK (phase IN ('ready', 'exit')),
+                    peak_bytes INTEGER NOT NULL,
+                    load_seconds REAL,
+                    boot_id TEXT NOT NULL,
+                    sampled_at TEXT NOT NULL,
+                    PRIMARY KEY (unit, model_file_id, ctx, boot_id, phase)
+                )
+            ''')
+            self._conn.commit()
+        except Exception as e:
+            print(f"Error initializing MemStore: {e}", file=sys.stderr)
+            self._conn = None
+
+    def record(self, *, unit: str, model_path: str, file_id: str, ctx: Optional[int],
+               ctk: Optional[str], ctv: Optional[str], phase: str, peak_bytes: int,
+               load_seconds: Optional[float] = None):
+        """Record a memory peak measurement.
+
+        Args:
+            unit: unit name
+            model_path: path to model file
+            file_id: file ID (sz<size>:mt<mtime>)
+            ctx: context size (may be None)
+            ctk: KV cache type K
+            ctv: KV cache type V
+            phase: 'ready' or 'exit'
+            peak_bytes: peak memory in bytes
+            load_seconds: load time in seconds (for ready phase)
+        """
+        if not self._conn:
+            return
+
+        with self._lock:
+            try:
+                # Get boot_id
+                boot_id = self._get_boot_id()
+
+                # ISO 8601 timestamp
+                now_ts = datetime.now(timezone.utc).isoformat().replace('+00:00', 'Z')
+
+                self._conn.execute('''
+                    INSERT OR REPLACE INTO mem_peak
+                    (unit, model_path, model_file_id, ctx, ctk, ctv, phase, peak_bytes,
+                     load_seconds, boot_id, sampled_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ''', (unit, model_path, file_id, ctx, ctk, ctv, phase, peak_bytes,
+                      load_seconds, boot_id, now_ts))
+
+                self._conn.commit()
+            except Exception as e:
+                print(f"Error recording to MemStore: {e}", file=sys.stderr)
+
+    def lookup(self, unit: str, file_id: str, ctx: Optional[int]) -> Optional[Dict]:
+        """Look up memory info for a unit/model/context.
+
+        Args:
+            unit: unit name
+            file_id: file ID
+            ctx: context size (may be None)
+
+        Returns:
+            dict with keys: peak_bytes, load_seconds, source, label
+            or None if not found
+        """
+        if not self._conn:
+            return None
+
+        with self._lock:
+            try:
+                cursor = self._conn.execute('''
+                    SELECT peak_bytes, load_seconds, phase
+                    FROM mem_peak
+                    WHERE unit = ? AND model_file_id = ? AND ctx = ?
+                    ORDER BY phase DESC, sampled_at DESC
+                    LIMIT 1
+                ''', (unit, file_id, ctx))
+
+                row = cursor.fetchone()
+                if row:
+                    peak_bytes, load_seconds, phase = row
+                    return {
+                        'bytes': peak_bytes,
+                        'load_seconds': load_seconds,
+                        'source': 'measured',
+                        'label': 'measured peak, this (unit, model, ctx)'
+                    }
+            except Exception as e:
+                print(f"Error looking up MemStore: {e}", file=sys.stderr)
+
+        return None
+
+    def history(self, unit: str) -> List[Dict]:
+        """Get memory history for a unit.
+
+        Args:
+            unit: unit name
+
+        Returns:
+            list of measurement dicts
+        """
+        if not self._conn:
+            return []
+
+        with self._lock:
+            try:
+                cursor = self._conn.execute('''
+                    SELECT ctx, peak_bytes, sampled_at, phase, load_seconds
+                    FROM mem_peak
+                    WHERE unit = ?
+                    ORDER BY sampled_at DESC
+                ''', (unit,))
+
+                rows = cursor.fetchall()
+                return [
+                    {
+                        'ctx': row[0],
+                        'peak_bytes': row[1],
+                        'sampled_at': row[2],
+                        'phase': row[3],
+                        'load_seconds': row[4],
+                        'source': 'measured'
+                    }
+                    for row in rows
+                ]
+            except Exception as e:
+                print(f"Error querying MemStore history: {e}", file=sys.stderr)
+
+        return []
+
+    def _get_boot_id(self) -> str:
+        """Get the system boot ID."""
+        try:
+            with open('/proc/sys/kernel/random/boot_id', 'r') as f:
+                return f.read().strip()
+        except Exception:
+            return 'unknown'
+
+
+def estimate_memory(dep: Dict, store: Optional[MemStore]) -> Dict:
+    """Estimate memory usage for a deployment.
+
+    Args:
+        dep: deployment dict with artifact.path
+        store: MemStore (may be None)
+
+    Returns:
+        dict with keys: bytes, source, label
+    """
+    model_path = dep.get('artifact', {}).get('path')
+
+    # Try sqlite lookup
+    if store and model_path:
+        file_id = f"sz{os.stat(model_path).st_size}:mt{int(os.stat(model_path).st_mtime)}"
+        mem = store.lookup(dep.get('unit', ''), file_id, None)
+        if mem:
+            return mem
+
+    # Check if model file exists
+    if model_path and os.path.isfile(model_path):
+        try:
+            size = os.path.getsize(model_path)
+            estimated = int(size * 1.10 + 1.5 * 2**30)
+            return {
+                'bytes': estimated,
+                'source': 'estimate',
+                'label': 'estimate (file size + 10% + 1.5 GiB overhead; no measured peak, no KV model)'
+            }
+        except Exception:
+            pass
+
+    # Model not found
+    return {
+        'bytes': None,
+        'source': 'unknown',
+        'label': 'model file not found'
+    }
 
 
 # ===== SECTION C: SERVER + SSE + STATIC =====
