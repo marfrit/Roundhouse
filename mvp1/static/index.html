@@ -1,0 +1,769 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Roundhouse</title>
+    <style>
+        :root {
+            --bg: #0d1117;
+            --fg: #c9d1d9;
+            --neutral: #6e7681;
+            --red: #f85149;
+            --amber: #d29922;
+            --green: #3fb950;
+            --border: #30363d;
+        }
+
+        @media (prefers-color-scheme: dark) {
+            :root:not([data-theme="light"]) {
+                --bg: #0d1117;
+                --fg: #c9d1d9;
+                --neutral: #6e7681;
+                --red: #f85149;
+                --amber: #d29922;
+                --green: #3fb950;
+                --border: #30363d;
+            }
+        }
+
+        @media (prefers-color-scheme: light) {
+            :root:not([data-theme="dark"]) {
+                --bg: #ffffff;
+                --fg: #24292e;
+                --neutral: #6a737d;
+                --red: #cb2431;
+                --amber: #bf8700;
+                --green: #28a745;
+                --border: #e1e4e8;
+            }
+        }
+
+        body {
+            background-color: var(--bg);
+            color: var(--fg);
+            font-family: 'Courier New', monospace;
+            margin: 0;
+            padding: 16px;
+            line-height: 1.5;
+        }
+
+        .header {
+            margin-bottom: 2em;
+            border-bottom: 1px solid var(--border);
+            padding-bottom: 1em;
+        }
+
+        .header-line {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 0.5em;
+        }
+
+        .header-title {
+            font-weight: bold;
+        }
+
+        .mem-gauge {
+            display: flex;
+            align-items: center;
+            gap: 0.5em;
+        }
+
+        .gauge-bar {
+            display: inline-flex;
+            width: 100px;
+            height: 1em;
+            background: var(--border);
+            border: 1px solid var(--border);
+            overflow: hidden;
+        }
+
+        .gauge-fill {
+            background: var(--green);
+            height: 100%;
+        }
+
+        .degraded-banner {
+            display: none;
+            background: var(--amber);
+            color: var(--bg);
+            padding: 0.5em;
+            margin-bottom: 1em;
+            border-radius: 3px;
+        }
+
+        .degraded-banner.active {
+            display: block;
+        }
+
+        .section {
+            margin-bottom: 2em;
+        }
+
+        .section-heading {
+            font-weight: bold;
+            margin-bottom: 0.5em;
+            color: var(--fg);
+        }
+
+        .unit-row {
+            padding: 0.25em 0;
+            cursor: pointer;
+            border: 1px solid transparent;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+
+        .unit-row:hover {
+            background-color: var(--border);
+        }
+
+        .unit-row-left {
+            flex: 1;
+            display: flex;
+            gap: 1em;
+            align-items: center;
+        }
+
+        .rung-glyph {
+            display: inline-block;
+            width: 1em;
+            text-align: center;
+        }
+
+        .rung-glyph.loading {
+            animation: pulse 1s infinite;
+        }
+
+        @keyframes pulse {
+            0%, 100% { opacity: 1; }
+            50% { opacity: 0.5; }
+        }
+
+        .unit-name {
+            font-weight: bold;
+        }
+
+        .unit-details {
+            color: var(--neutral);
+            font-size: 0.9em;
+        }
+
+        .badge {
+            display: inline-block;
+            font-size: 0.8em;
+            margin-left: 0.25em;
+            padding: 0 0.25em;
+            border-radius: 2px;
+        }
+
+        .badge.conflict {
+            background: var(--amber);
+            color: var(--bg);
+        }
+
+        .section.standby .unit-row {
+            color: var(--neutral);
+        }
+
+        .section.failed .unit-row {
+            color: var(--red);
+        }
+
+        .section.retired .unit-row {
+            color: var(--neutral);
+        }
+
+        .port-board {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 1em;
+            margin: 1em 0;
+            padding: 0.5em;
+            background: var(--border);
+            border-radius: 3px;
+        }
+
+        .port-cell {
+            padding: 0.25em 0.5em;
+            border: 1px solid var(--border);
+            border-radius: 2px;
+        }
+
+        .port-cell.active {
+            background: var(--red);
+            color: var(--bg);
+            font-weight: bold;
+        }
+
+        .port-cell.armed {
+            background: var(--amber);
+            color: var(--bg);
+            font-weight: bold;
+        }
+
+        .port-cell.latent {
+            background: transparent;
+            color: var(--neutral);
+        }
+
+        .port-cell.self {
+            background: var(--green);
+            color: var(--bg);
+        }
+
+        .detail-pane {
+            display: none;
+            margin-top: 2em;
+            padding: 1em;
+            background: var(--border);
+            border-left: 2px solid var(--amber);
+        }
+
+        .detail-pane.active {
+            display: block;
+        }
+
+        .detail-table {
+            width: 100%;
+            border-collapse: collapse;
+            margin-bottom: 1em;
+        }
+
+        .detail-table th {
+            text-align: left;
+            padding: 0.5em;
+            border-bottom: 1px solid var(--border);
+            color: var(--neutral);
+            font-weight: normal;
+        }
+
+        .detail-table td {
+            padding: 0.5em;
+            border-bottom: 1px solid var(--border);
+        }
+
+        .operator-notes {
+            white-space: pre;
+            overflow-x: auto;
+            background: var(--bg);
+            padding: 0.5em;
+            border-radius: 2px;
+            margin-top: 0.5em;
+        }
+
+        .off-section-toggle {
+            cursor: pointer;
+            user-select: none;
+        }
+
+        .off-section-list {
+            display: none;
+            margin-left: 1em;
+        }
+
+        .off-section-list.expanded {
+            display: block;
+        }
+
+        .hidden {
+            display: none;
+        }
+
+        .error-state {
+            color: var(--red);
+        }
+
+        .conflict-active {
+            color: var(--red);
+            font-weight: bold;
+        }
+
+        .conflict-armed {
+            color: var(--amber);
+            font-weight: bold;
+        }
+    </style>
+</head>
+<body>
+    <div class="header">
+        <div class="header-line">
+            <span class="header-title">ROUNDHOUSE · <span id="hostname">?</span> · kernel <span id="kernel">?</span></span>
+            <div class="mem-gauge">
+                mem
+                <div class="gauge-bar">
+                    <div class="gauge-fill" id="mem-fill"></div>
+                </div>
+                <span id="mem-text">? / ?</span>
+            </div>
+        </div>
+        <div class="degraded-banner" id="degraded-banner"></div>
+    </div>
+
+    <div class="section" id="active-section">
+        <div class="section-heading">ACTIVE</div>
+        <div id="active-list"></div>
+    </div>
+
+    <div class="section standby" id="standby-section" style="display: none;">
+        <div class="section-heading">STANDBY — kernel-gated, normal on this kernel</div>
+        <div id="standby-list"></div>
+    </div>
+
+    <div class="section" id="off-section">
+        <div class="section-heading off-section-toggle">
+            OFF (<span id="off-count">0</span>) [<span id="off-toggle">show</span>]
+        </div>
+        <div class="off-section-list" id="off-list"></div>
+    </div>
+
+    <div class="section" id="failed-section" style="display: none;">
+        <div class="section-heading">FAILED</div>
+        <div id="failed-list"></div>
+    </div>
+
+    <div class="section retired" id="retired-section" style="display: none;">
+        <div class="section-heading">
+            RETIRED (<span id="retired-count">0</span>)
+            [<span id="retired-toggle" class="off-section-toggle">show</span>]
+        </div>
+        <div class="off-section-list" id="retired-list"></div>
+    </div>
+
+    <div class="port-board">
+        <span style="font-weight: bold; width: 100%; margin-bottom: 0.5em;">PORT BOARD</span>
+        <div id="port-board-cells"></div>
+    </div>
+
+    <div class="detail-pane" id="detail-pane">
+        <button onclick="closeDetail()" style="float: right; background: var(--border); border: none; color: var(--fg); cursor: pointer; padding: 0.25em 0.5em;">Close</button>
+        <div id="detail-content"></div>
+    </div>
+
+    <script>
+        let state = {
+            host: '?',
+            kernel: '?',
+            now: Date.now() / 1000,
+            mem: { total_bytes: 0, available_bytes: 0 },
+            sources: { journal: 'ok', systemctl: 'ok' },
+            units: [],
+            ports: {}
+        };
+
+        const eventSource = new EventSource('/api/events');
+
+        eventSource.addEventListener('snapshot', (e) => {
+            const data = JSON.parse(e.data);
+            state = data;
+            render();
+            hideDegradedBanner();
+        });
+
+        eventSource.addEventListener('rung', (e) => {
+            const data = JSON.parse(e.data);
+            const unit = state.units.find(u => u.unit === data.unit);
+            if (unit) {
+                Object.assign(unit, data);
+                render();
+            }
+        });
+
+        eventSource.addEventListener('ports', (e) => {
+            const data = JSON.parse(e.data);
+            state.ports = data;
+            renderPortBoard();
+        });
+
+        eventSource.addEventListener('mem', (e) => {
+            const data = JSON.parse(e.data);
+            const unit = state.units.find(u => u.unit === data.unit);
+            if (unit) {
+                unit.mem = { bytes: data.peak_bytes, source: data.source, label: data.label };
+                render();
+            }
+        });
+
+        eventSource.onerror = () => {
+            showDegradedBanner('sensing degraded (connection lost)');
+        };
+
+        function render() {
+            renderHeader();
+            renderUnits();
+            renderPortBoard();
+        }
+
+        function renderHeader() {
+            document.getElementById('hostname').textContent = state.host || '?';
+            document.getElementById('kernel').textContent = state.kernel || '?';
+
+            const total = state.mem.total_bytes || 1;
+            const used = (state.mem.total_bytes || 0) - (state.mem.available_bytes || 0);
+            const pct = (used / total) * 100;
+            document.getElementById('mem-fill').style.width = pct + '%';
+
+            const total_gb = (total / 1e9).toFixed(1);
+            const avail_gb = ((state.mem.available_bytes || 0) / 1e9).toFixed(1);
+            document.getElementById('mem-text').textContent = `${avail_gb} / ${total_gb} GiB`;
+        }
+
+        function renderUnits() {
+            const active = [];
+            const standby = [];
+            const off = [];
+            const failed = [];
+            const retired = [];
+
+            for (const unit of state.units) {
+                if (unit.retired) {
+                    retired.push(unit);
+                } else if (['STARTING', 'LOADING', 'READY', 'BUSY'].includes(unit.rung)) {
+                    active.push(unit);
+                } else if (unit.rung === 'STANDBY') {
+                    standby.push(unit);
+                } else if (unit.rung === 'FAILED') {
+                    failed.push(unit);
+                } else {
+                    off.push(unit);
+                }
+            }
+
+            renderUnitList('active-list', active, 'active');
+            renderUnitList('standby-list', standby, 'standby');
+            renderUnitList('off-list', off, 'off');
+            renderUnitList('failed-list', failed, 'failed');
+            renderUnitList('retired-list', retired, 'retired');
+
+            document.getElementById('active-section').style.display = active.length > 0 ? 'block' : 'none';
+            document.getElementById('standby-section').style.display = standby.length > 0 ? 'block' : 'none';
+            document.getElementById('off-count').textContent = off.length;
+            document.getElementById('off-section').style.display = off.length > 0 ? 'block' : 'none';
+            document.getElementById('failed-section').style.display = failed.length > 0 ? 'block' : 'none';
+            document.getElementById('retired-count').textContent = retired.length;
+            document.getElementById('retired-section').style.display = retired.length > 0 ? 'block' : 'none';
+        }
+
+        function renderUnitList(elementId, units, category) {
+            const element = document.getElementById(elementId);
+            element.replaceChildren();
+
+            for (const unit of units) {
+                const row = document.createElement('div');
+                row.className = 'unit-row';
+                if (category === 'failed') {
+                    row.classList.add('conflict-active');
+                } else if (unit.port_conflict && unit.port_conflict.class === 'armed') {
+                    row.classList.add('conflict-armed');
+                }
+                row.onclick = () => fetchUnitDetail(unit.unit);
+
+                const leftDiv = document.createElement('div');
+                leftDiv.className = 'unit-row-left';
+
+                const glyph = document.createElement('span');
+                glyph.className = 'rung-glyph';
+                if (unit.rung === 'LOADING' || unit.rung === 'STARTING') {
+                    glyph.classList.add('loading');
+                    glyph.textContent = '◐';
+                } else if (unit.rung === 'READY') {
+                    glyph.textContent = '●';
+                } else if (unit.rung === 'BUSY') {
+                    glyph.textContent = '◉';
+                } else if (unit.rung === 'STANDBY') {
+                    glyph.textContent = '◌';
+                } else {
+                    glyph.textContent = '◌';
+                }
+                leftDiv.appendChild(glyph);
+
+                const nameSpan = document.createElement('span');
+                nameSpan.className = 'unit-name';
+                nameSpan.textContent = unit.rung + ' ' + unit.alias;
+                leftDiv.appendChild(nameSpan);
+
+                const detailSpan = document.createElement('span');
+                detailSpan.className = 'unit-details';
+                let detail = '';
+                if (unit.port) {
+                    detail += ':' + unit.port + ' ';
+                }
+                if (unit.alias) {
+                    detail += 'alias ' + unit.alias + ' ';
+                }
+                if (unit.quant_hint) {
+                    detail += unit.quant_hint + ' ';
+                }
+                if (unit.ctx) {
+                    detail += '· ctx ' + unit.ctx + ' ';
+                }
+                if (unit.mem && unit.mem.bytes) {
+                    const gb = (unit.mem.bytes / 1e9).toFixed(1);
+                    detail += '· peak ' + gb + ' GiB (' + (unit.mem.source || 'unknown') + ')';
+                }
+                detailSpan.textContent = detail;
+                leftDiv.appendChild(detailSpan);
+
+                if (unit.port_conflict && unit.port_conflict.class === 'armed') {
+                    const badge = document.createElement('span');
+                    badge.className = 'badge conflict';
+                    badge.textContent = '⚠ shared :' + unit.port;
+                    leftDiv.appendChild(badge);
+                }
+
+                row.appendChild(leftDiv);
+
+                if (category === 'failed' && unit.n_restarts !== undefined) {
+                    const restarts = document.createElement('span');
+                    restarts.className = 'unit-details';
+                    restarts.textContent = 'NRestarts=' + unit.n_restarts;
+                    row.appendChild(restarts);
+                }
+
+                element.appendChild(row);
+            }
+        }
+
+        function renderPortBoard() {
+            const container = document.getElementById('port-board-cells');
+            container.replaceChildren();
+
+            const ports = [];
+
+            // Collect all ports from units
+            const portMap = {};
+            for (const unit of state.units) {
+                if (unit.port) {
+                    if (!portMap[unit.port]) {
+                        portMap[unit.port] = [];
+                    }
+                    portMap[unit.port].push({
+                        unit: unit.unit,
+                        enabled: unit.enabled,
+                        rung: unit.rung,
+                        retired: unit.retired,
+                        gate: unit.gate
+                    });
+                }
+            }
+
+            // Add 8090 for self
+            portMap[8090] = [];
+
+            // Render ports
+            for (const port of Object.keys(portMap).sort((a, b) => parseInt(a) - parseInt(b))) {
+                const portNum = parseInt(port);
+                const claims = portMap[port];
+
+                const cell = document.createElement('div');
+                cell.className = 'port-cell';
+
+                if (portNum === 8090) {
+                    cell.classList.add('self');
+                    cell.textContent = '8090 roundhouse (self) ✓';
+                } else if (claims.length === 0) {
+                    cell.classList.add('latent');
+                    cell.textContent = port + ' ◌';
+                } else if (claims.length === 1) {
+                    cell.textContent = port + ' ✓';
+                } else {
+                    // Determine class
+                    const activeRungs = ['STARTING', 'LOADING', 'READY', 'BUSY'];
+                    const activeCount = claims.filter(c => activeRungs.includes(c.rung)).length;
+
+                    if (activeCount >= 2) {
+                        cell.classList.add('active');
+                        cell.textContent = port + ' ✗ (' + claims.length + ' claims)';
+                    } else {
+                        const enabledOrGated = claims.filter(c => c.enabled || (c.gate && !c.enabled)).length;
+                        if (enabledOrGated >= 2) {
+                            cell.classList.add('armed');
+                            cell.textContent = port + ' ⚠ (' + claims.length + ' claims)';
+                        } else {
+                            cell.classList.add('latent');
+                            cell.textContent = port + ' ◌ (' + claims.length + ' claims)';
+                        }
+                    }
+                }
+
+                container.appendChild(cell);
+            }
+        }
+
+        function fetchUnitDetail(unitName) {
+            fetch('/api/units/' + encodeURIComponent(unitName))
+                .then(r => r.json())
+                .then(data => showDetail(data))
+                .catch(e => console.error('Error fetching unit detail:', e));
+        }
+
+        function showDetail(unit) {
+            const pane = document.getElementById('detail-pane');
+            const content = document.getElementById('detail-content');
+            content.replaceChildren();  // Clear
+
+            // Title
+            const title = document.createElement('h3');
+            title.textContent = unit.unit;
+            content.appendChild(title);
+
+            // WHAT RUNS table
+            const whatRunsHeading = document.createElement('h4');
+            whatRunsHeading.textContent = 'WHAT RUNS';
+            content.appendChild(whatRunsHeading);
+
+            const table1 = document.createElement('table');
+            table1.className = 'detail-table';
+            const tbody1 = document.createElement('tbody');
+
+            let row = document.createElement('tr');
+            let th = document.createElement('th');
+            th.textContent = 'Model file';
+            row.appendChild(th);
+            let td = document.createElement('td');
+            td.textContent = (unit.model_file || '?') + ' ' + (unit.mem && unit.mem.bytes ? '✓' : '✗');
+            row.appendChild(td);
+            tbody1.appendChild(row);
+
+            if (unit.mem && unit.mem.bytes) {
+                row = document.createElement('tr');
+                th = document.createElement('th');
+                th.textContent = 'Size';
+                row.appendChild(th);
+                td = document.createElement('td');
+                td.textContent = (unit.mem.bytes / 1e9).toFixed(1) + ' GiB';
+                row.appendChild(td);
+                tbody1.appendChild(row);
+            }
+
+            row = document.createElement('tr');
+            th = document.createElement('th');
+            th.textContent = 'Quant';
+            row.appendChild(th);
+            td = document.createElement('td');
+            td.textContent = unit.quant_hint || '?';
+            row.appendChild(td);
+            tbody1.appendChild(row);
+
+            row = document.createElement('tr');
+            th = document.createElement('th');
+            th.textContent = 'Context';
+            row.appendChild(th);
+            td = document.createElement('td');
+            td.textContent = unit.ctx || '?';
+            row.appendChild(td);
+            tbody1.appendChild(row);
+
+            if (unit.alias) {
+                row = document.createElement('tr');
+                th = document.createElement('th');
+                th.textContent = 'Alias';
+                row.appendChild(th);
+                td = document.createElement('td');
+                td.textContent = unit.alias;
+                row.appendChild(td);
+                tbody1.appendChild(row);
+            }
+
+            if (unit.port) {
+                row = document.createElement('tr');
+                th = document.createElement('th');
+                th.textContent = 'Port';
+                row.appendChild(th);
+                td = document.createElement('td');
+                td.textContent = unit.port + ' (' + (unit.port_source || '?') + ')';
+                row.appendChild(td);
+                tbody1.appendChild(row);
+            }
+
+            if (unit.gate) {
+                row = document.createElement('tr');
+                th = document.createElement('th');
+                th.textContent = 'Gate';
+                row.appendChild(th);
+                td = document.createElement('td');
+                td.textContent = (unit.gate.kind || '?') + ': ' + (unit.gate.wants || '?');
+                row.appendChild(td);
+                tbody1.appendChild(row);
+            }
+
+            table1.appendChild(tbody1);
+            content.appendChild(table1);
+
+            // OTHER DIRECTIVES table
+            if (unit.other_directives && unit.other_directives.length > 0) {
+                const otherHeading = document.createElement('h4');
+                otherHeading.textContent = 'OTHER DIRECTIVES';
+                content.appendChild(otherHeading);
+
+                const table2 = document.createElement('table');
+                table2.className = 'detail-table';
+                const tbody2 = document.createElement('tbody');
+
+                for (const dir of unit.other_directives) {
+                    row = document.createElement('tr');
+                    th = document.createElement('th');
+                    th.textContent = dir.key;
+                    row.appendChild(th);
+                    td = document.createElement('td');
+                    td.textContent = dir.value || '';
+                    row.appendChild(td);
+                    tbody2.appendChild(row);
+                }
+
+                table2.appendChild(tbody2);
+                content.appendChild(table2);
+            }
+
+            // OPERATOR'S NOTES - Use textContent ONLY
+            if (unit.comments && unit.comments.length > 0) {
+                const notesHeading = document.createElement('h4');
+                notesHeading.textContent = "OPERATOR'S NOTES — rendered verbatim; the file is never rewritten";
+                content.appendChild(notesHeading);
+
+                const notesDiv = document.createElement('div');
+                notesDiv.className = 'operator-notes';
+                const noteText = unit.comments.map(c => c.text).join('\n');
+                notesDiv.textContent = noteText;  // verbatim, safe for XSS
+                content.appendChild(notesDiv);
+            }
+
+            pane.classList.add('active');
+        }
+
+        function closeDetail() {
+            document.getElementById('detail-pane').classList.remove('active');
+        }
+
+        function showDegradedBanner(msg) {
+            const banner = document.getElementById('degraded-banner');
+            banner.textContent = msg;
+            banner.classList.add('active');
+        }
+
+        function hideDegradedBanner() {
+            document.getElementById('degraded-banner').classList.remove('active');
+        }
+
+        // Toggle OFF and RETIRED sections
+        document.getElementById('off-section-toggle').addEventListener('click', () => {
+            const list = document.getElementById('off-list');
+            const toggle = document.getElementById('off-toggle');
+            list.classList.toggle('expanded');
+            toggle.textContent = list.classList.contains('expanded') ? 'hide' : 'show';
+        });
+
+        document.getElementById('retired-toggle').addEventListener('click', () => {
+            const list = document.getElementById('retired-list');
+            list.classList.toggle('expanded');
+            document.getElementById('retired-toggle').textContent = list.classList.contains('expanded') ? 'hide' : 'show';
+        });
+
+        // Initial render
+        render();
+    </script>
+</body>
+</html>

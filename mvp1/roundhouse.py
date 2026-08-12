@@ -24,6 +24,12 @@ from typing import Optional, List, Dict, Any
 from datetime import datetime
 import socket
 import time
+import threading
+import queue
+import http.server
+import urllib.parse
+import subprocess
+import signal
 
 # Hard rail: never implemented
 PAID_OFFLOAD = None
@@ -1043,7 +1049,327 @@ def assert_no_paid_offload(dep: Dict) -> None:
 
 
 # ===== SECTION C: SERVER + SSE + STATIC =====
-# implemented by T3
+
+class EventBus:
+    """Publish-subscribe event bus for SSE clients."""
+
+    def __init__(self):
+        self.subscribers = []
+        self.event_counter = 0
+
+    def subscribe(self) -> queue.Queue:
+        """Subscribe to events; returns a queue.Queue(maxsize=256)."""
+        q = queue.Queue(maxsize=256)
+        self.subscribers.append(q)
+        return q
+
+    def unsubscribe(self, q: queue.Queue):
+        """Unsubscribe a queue."""
+        if q in self.subscribers:
+            self.subscribers.remove(q)
+
+    def publish(self, event: str, data: dict):
+        """Publish an event to all subscribers; drop client if queue is full."""
+        self.event_counter += 1
+        msg = (event, data, self.event_counter)
+
+        dead = []
+        for q in self.subscribers:
+            try:
+                q.put_nowait(msg)
+            except queue.Full:
+                dead.append(q)
+
+        for q in dead:
+            self.unsubscribe(q)
+
+
+class RoundhouseRequestHandler(http.server.BaseHTTPRequestHandler):
+    """HTTP request handler for Roundhouse server."""
+
+    def do_GET(self):
+        """Handle GET requests; return 405 for anything else."""
+        path = self.path
+
+        # Parse URL path and query
+        parsed = urllib.parse.urlparse(path)
+        route = parsed.path
+
+        if route == '/':
+            self.serve_static()
+        elif route == '/api/units':
+            self.serve_units()
+        elif route.startswith('/api/units/'):
+            unit_name = urllib.parse.unquote(route[len('/api/units/'):])
+            self.serve_unit_detail(unit_name)
+        elif route == '/api/ports':
+            self.serve_ports()
+        elif route == '/api/deployments':
+            self.serve_deployments()
+        elif route == '/api/mem':
+            self.serve_mem()
+        elif route == '/api/events':
+            self.serve_events()
+        else:
+            self.error_404()
+
+    def do_POST(self):
+        self.error_405()
+
+    def do_PUT(self):
+        self.error_405()
+
+    def do_DELETE(self):
+        self.error_405()
+
+    def do_HEAD(self):
+        self.error_405()
+
+    def error_405(self):
+        """Return 405 Method Not Allowed."""
+        self.send_response(405)
+        self.send_header('Content-Type', 'text/plain')
+        self.end_headers()
+        self.wfile.write(b'405 Method Not Allowed')
+
+    def error_404(self):
+        """Return 404 Not Found."""
+        self.send_response(404)
+        self.send_header('Content-Type', 'text/plain')
+        self.end_headers()
+        self.wfile.write(b'404 Not Found')
+
+    def serve_static(self):
+        """Serve static/index.html."""
+        html_path = Path(__file__).parent / 'static' / 'index.html'
+        try:
+            with open(html_path, 'r') as f:
+                content = f.read()
+            self.send_response(200)
+            self.send_header('Content-Type', 'text/html; charset=utf-8')
+            self.end_headers()
+            self.wfile.write(content.encode('utf-8'))
+        except FileNotFoundError:
+            self.error_404()
+
+    def serve_units(self):
+        """Serve /api/units (snapshot)."""
+        snapshot = self.server.watcher.snapshot()
+        self.send_json(snapshot)
+
+    def serve_unit_detail(self, unit_name):
+        """Serve /api/units/<name> detail."""
+        snapshot = self.server.watcher.snapshot()
+
+        # Find unit in snapshot
+        for unit in snapshot.get('units', []):
+            if unit['unit'] == unit_name:
+                # Fetch full detail (in real impl, this would include extra fields)
+                self.send_json(unit)
+                return
+
+        self.error_404()
+
+    def serve_ports(self):
+        """Serve /api/ports (port board)."""
+        snapshot = self.server.watcher.snapshot()
+        units = snapshot.get('units', [])
+
+        port_claims = {}
+        for unit in units:
+            port = unit.get('port')
+            if port:
+                if port not in port_claims:
+                    port_claims[port] = []
+                port_claims[port].append({
+                    'unit': unit['unit'],
+                    'enabled': unit.get('enabled', False),
+                    'rung': unit.get('rung', 'OFF'),
+                    'retired': unit.get('retired', False),
+                    'gate': unit.get('gate')
+                })
+
+        # Add self port
+        port_claims[self.server.port] = []
+
+        # Build port board response
+        ports = []
+        for port in sorted(port_claims.keys()):
+            claims = port_claims[port]
+            if port == self.server.port:
+                # Self
+                ports.append({
+                    'port': port,
+                    'claims': [],
+                    'class': None,
+                    'note': 'roundhouse (self)'
+                })
+            elif len(claims) == 0:
+                # No claims (shouldn't happen)
+                pass
+            elif len(claims) == 1:
+                # Single claim
+                claim = claims[0]
+                ports.append({
+                    'port': port,
+                    'claims': [claim],
+                    'class': None,
+                    'note': None
+                })
+            else:
+                # Multiple claims - determine class
+                active_rungs = {'STARTING', 'LOADING', 'READY', 'BUSY'}
+                active_count = sum(1 for c in claims if c['rung'] in active_rungs)
+
+                if active_count >= 2:
+                    port_class = 'active'
+                else:
+                    # Check if armed: >=2 claims that are enabled OR whose only blocker is unsatisfied gate
+                    enabled_or_gated = sum(1 for c in claims if c['enabled'] or (c['gate'] and not c['enabled']))
+                    if enabled_or_gated >= 2:
+                        port_class = 'armed'
+                        note = 'harmless only while BOTH the disable and the kernel gate hold'
+                    else:
+                        port_class = 'latent'
+                        note = None
+
+                ports.append({
+                    'port': port,
+                    'claims': claims,
+                    'class': port_class if active_count < 2 else 'active',
+                    'note': note if active_count < 2 else None
+                })
+
+        response = {
+            'ports': ports,
+            'self': {'port': self.server.port, 'claims_by_units': []}
+        }
+        self.send_json(response)
+
+    def serve_deployments(self):
+        """Serve /api/deployments."""
+        snapshot = self.server.watcher.snapshot()
+        units = snapshot.get('units', [])
+
+        deployments = []
+        for unit in units:
+            if not unit.get('retired', False):
+                dep = {
+                    'deployment_id': f"{snapshot.get('host', '?')}/{unit['unit']}",
+                    'unit': unit['unit'],
+                    'artifact': {
+                        'model': None,
+                        'path': unit.get('model_path'),
+                        'filename': unit.get('model_file'),
+                        'format': 'gguf',
+                        'quant_hint': unit.get('quant_hint'),
+                        'sha256': None,
+                        'file_id': None
+                    },
+                    'host_artifact': {
+                        'host': snapshot.get('host', '?'),
+                        'path': unit.get('model_path'),
+                        'exists': False,
+                        'size_bytes': None,
+                        'mtime': None
+                    },
+                    'engine': unit.get('engine', {}),
+                    'param_profile': unit.get('param_profile', {}),
+                    'load_strategy': {
+                        'kind': 'on-boot' if unit.get('enabled') else 'manual',
+                        'enabled': unit.get('enabled', False),
+                        'gate': unit.get('gate')
+                    },
+                    'roster': {
+                        'rung': unit.get('rung', 'OFF'),
+                        'state': unit.get('roster', None),
+                        'since': unit.get('since')
+                    },
+                    'memory': unit.get('mem', {'bytes': None, 'source': 'unknown'}),
+                    'retired': False
+                }
+                deployments.append(dep)
+
+        response = {
+            'host': snapshot.get('host', '?'),
+            'deployments': deployments
+        }
+        self.send_json(response)
+
+    def serve_mem(self):
+        """Serve /api/mem (memory history)."""
+        # Simplified: return empty list for now
+        self.send_json({'rows': []})
+
+    def serve_events(self):
+        """Serve /api/events (Server-Sent Events)."""
+        self.send_response(200)
+        self.send_header('Content-Type', 'text/event-stream; charset=utf-8')
+        self.send_header('Cache-Control', 'no-cache')
+        self.send_header('Connection', 'keep-alive')
+        self.send_header('X-Accel-Buffering', 'no')
+        self.end_headers()
+
+        # Send retry
+        self.wfile.write(b'retry: 3000\n')
+        self.wfile.flush()
+
+        # Subscribe to events
+        event_queue = self.server.event_bus.subscribe()
+
+        try:
+            # Send initial snapshot
+            snapshot = self.server.watcher.snapshot()
+            self.send_sse_event(0, 'snapshot', snapshot)
+
+            # Heartbeat timer
+            last_heartbeat = time.time()
+
+            while True:
+                try:
+                    # Wait for event with timeout (for heartbeat)
+                    event, data, event_id = event_queue.get(timeout=5)
+                    self.send_sse_event(event_id, event, data)
+                    last_heartbeat = time.time()
+                except queue.Empty:
+                    # Send heartbeat
+                    now = time.time()
+                    if now - last_heartbeat > 15:
+                        self.wfile.write(b': ping\n\n')
+                        self.wfile.flush()
+                        last_heartbeat = now
+        except Exception:
+            pass
+        finally:
+            self.server.event_bus.unsubscribe(event_queue)
+
+    def send_sse_event(self, event_id: int, event: str, data: dict):
+        """Send a single SSE event."""
+        self.wfile.write(f'id: {event_id}\n'.encode('utf-8'))
+        self.wfile.write(f'event: {event}\n'.encode('utf-8'))
+        self.wfile.write(f'data: {json.dumps(data)}\n\n'.encode('utf-8'))
+        self.wfile.flush()
+
+    def send_json(self, data: dict):
+        """Send JSON response."""
+        self.send_response(200)
+        self.send_header('Content-Type', 'application/json; charset=utf-8')
+        self.end_headers()
+        self.wfile.write(json.dumps(data).encode('utf-8'))
+
+    def log_message(self, format, *args):
+        """Suppress log messages."""
+        pass
+
+
+class ThreadingHTTPServer(http.server.ThreadingHTTPServer):
+    """HTTP server with references to watcher, event_bus, and port."""
+
+    def __init__(self, host_port, handler_class, watcher, event_bus, port):
+        self.watcher = watcher
+        self.event_bus = event_bus
+        self.port = port
+        super().__init__(host_port, handler_class)
 
 
 # ===== SECTION D: MAIN / CLI =====
@@ -1150,8 +1476,132 @@ def cmd_scan(args):
 
 def cmd_serve(args):
     """Run the server."""
-    print("server not yet implemented (T3)")
-    sys.exit(2)
+    unit_dir = args.unit_dir
+    port = args.port
+    use_db = not args.no_db
+    db_path = args.db
+
+    # Select units
+    unit_paths = select_units(unit_dir)
+    if not unit_paths:
+        print("Warning: no units selected", file=sys.stderr)
+
+    # Parse units
+    units = {}
+    for fpath in unit_paths:
+        try:
+            with open(fpath, 'rb') as f:
+                raw = f.read()
+            unit = parse_unit(fpath, raw)
+            units[unit.name] = unit
+        except Exception as e:
+            print(f"Error parsing {fpath}: {e}", file=sys.stderr)
+            return 1
+
+    # Create watcher stub or real implementation
+    try:
+        # Try to use real Watcher if available (from Section B)
+        running_kernel = os.uname().release
+        watcher = Watcher(units, running_kernel, None)
+    except NameError:
+        # Fallback to stub
+        watcher = _StubWatcher(units)
+
+    # Create event bus
+    event_bus = EventBus()
+
+    # Start HTTP server
+    try:
+        server = ThreadingHTTPServer(
+            ('0.0.0.0', port),
+            RoundhouseRequestHandler,
+            watcher,
+            event_bus,
+            port
+        )
+        print(f"Roundhouse listening on http://0.0.0.0:{port}")
+
+        # Handle shutdown signals
+        def signal_handler(sig, frame):
+            print("\nShutting down...")
+            server.shutdown()
+            sys.exit(0)
+
+        signal.signal(signal.SIGTERM, signal_handler)
+        signal.signal(signal.SIGINT, signal_handler)
+
+        # Serve forever
+        server.serve_forever()
+    except Exception as e:
+        print(f"Error starting server: {e}", file=sys.stderr)
+        return 1
+
+    return 0
+
+
+class _StubWatcher:
+    """Stub Watcher for testing when Section B is not available."""
+
+    def __init__(self, units: dict):
+        self.units = units
+        self.host = os.uname().nodename
+        self.kernel = os.uname().release
+        self.now = time.time()
+        self.mem_total = 32840000000  # 32 GiB stub
+        self.mem_available = 14000000000  # 14 GiB stub
+
+    def snapshot(self) -> dict:
+        """Return a stub snapshot."""
+        units_list = []
+        for name, unit in self.units.items():
+            param_profile = {}
+            if unit.exec_start:
+                param_profile = extract_param_profile(unit.exec_start.engine_argv)
+
+            units_list.append({
+                'unit': name,
+                'description': unit.description or '',
+                'retired': unit.retired,
+                'rung': 'OFF',
+                'roster': None,
+                'since': self.now,
+                'detail': '',
+                'badges': [],
+                'stale': False,
+                'sensed_at': self.now,
+                'enabled': True,
+                'active_state': 'inactive',
+                'sub_state': 'dead',
+                'n_restarts': 0,
+                'port': param_profile.get('port', 8080),
+                'port_source': param_profile.get('port_source', 'default'),
+                'alias': param_profile.get('alias', name),
+                'gate': unit.gate,
+                'model_file': param_profile.get('model_path', ''),
+                'model_path': param_profile.get('model_path', ''),
+                'quant_hint': None,
+                'ctx': param_profile.get('ctx'),
+                'engine': unit.exec_start.engine if unit.exec_start else {},
+                'param_profile': param_profile,
+                'mem': {'bytes': None, 'source': 'unknown', 'label': 'unknown'},
+                'port_conflict': None
+            })
+
+        return {
+            'host': self.host,
+            'kernel': self.kernel,
+            'now': self.now,
+            'mem': {
+                'total_bytes': self.mem_total,
+                'available_bytes': self.mem_available
+            },
+            'sources': {
+                'journal': 'ok',
+                'systemctl': 'ok'
+            },
+            'self_port': 8090,
+            'units': units_list
+        }
 
 
 if __name__ == '__main__':
