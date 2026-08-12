@@ -42,7 +42,7 @@ def parse_unit(path: str) -> dict:
                 section_text = source_bytes[section_start:section_end].decode('utf-8')
                 parsed_section = _parse_section(section_text, section_start)
                 parsed_section['name'] = current_section
-                _anreichern(parsed_section, source_bytes, section_start, section_end)
+                _enrich(parsed_section, source_bytes, section_start, section_end)
                 sections.append(parsed_section)
             
             # Start new section
@@ -56,7 +56,7 @@ def parse_unit(path: str) -> dict:
         section_text = source_bytes[section_start:].decode('utf-8')
         parsed_section = _parse_section(section_text, section_start)
         parsed_section['name'] = current_section
-        _anreichern(parsed_section, source_bytes, section_start, len(source_bytes))
+        _enrich(parsed_section, source_bytes, section_start, len(source_bytes))
         sections.append(parsed_section)
     
     return {
@@ -132,17 +132,17 @@ def _parse_section(section_text: str, base_offset: int) -> dict:
         'unknown': unknown
     }
 
-def _entquoten(wert: str) -> str:
-    """Aeussere, zusammengehoerige Anfuehrungszeichen abstreifen.
+def _unquote(value: str) -> str:
+    """Strip matching outer quotes.
 
-    Der Wert kommt aus dem zusammengefuegten ExecStart, in dem
-    --chat-template-kwargs '{"enable_thinking":false}' noch seine einfachen
-    Anfuehrungszeichen traegt. Der Test verlangt den INHALT -- dieselbe Regel wie
-    beim Token, nur eine Ebene weiter.
+    The value comes from the assembled ExecStart, where
+    --chat-template-kwargs '{"enable_thinking":false}' still has its single
+    quotes. The test requires the CONTENT -- same rule as for tokens,
+    just one level further.
     """
-    if len(wert) >= 2 and wert[0] == wert[-1] and wert[0] in ("'", '"'):
-        return wert[1:-1]
-    return wert
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in ("'", '"'):
+        return value[1:-1]
+    return value
 
 
 def _extract_execstart_params(execstart_value: str) -> dict:
@@ -162,10 +162,10 @@ def _extract_execstart_params(execstart_value: str) -> dict:
             if '=' in part:
                 # Handle --param=value format
                 key, value = part.split('=', 1)
-                params[key] = _entquoten(value)
+                params[key] = _unquote(value)
             elif i + 1 < len(parts) and not parts[i + 1].startswith('-'):
                 # Handle -param value format
-                params[part] = _entquoten(parts[i + 1])
+                params[part] = _unquote(parts[i + 1])
                 i += 1
             else:
                 # Handle flag format (no value)
@@ -176,104 +176,103 @@ def _extract_execstart_params(execstart_value: str) -> dict:
 
 
 # ---------------------------------------------------------------------------
-# Byteweiser Zerleger. ALLE Positionen sind Offsets in `data` -- niemals in eine
-# Scheibe. Der erste Versuch mischte beides und lief deshalb rueckwaerts.
+# Byte-level parser. ALL positions are offsets in `data` -- never slices.
+# The first attempt mixed both and ran backwards.
 # ---------------------------------------------------------------------------
 
 _WS = (b" ", b"\t")
 
 
-def _zeilenende(data: bytes, i: int, grenze: int) -> int:
+def _line_end(data: bytes, i: int, limit: int) -> int:
     e = data.find(b"\n", i)
-    return grenze if e == -1 or e > grenze else e
+    return limit if e == -1 or e > limit else e
 
 
-def _logical_value(data: bytes, start: int, grenze: int):
-    """Wert ab `start` (absolut), ueber Fortsetzungszeilen hinweg.
+def _logical_value(data: bytes, start: int, limit: int):
+    """Value from `start` (absolute), across continuation lines.
 
-    Liefert (stuecke, ende_absolut). `stuecke` sind (offset, bytes)-Paare, jedes
-    ein zusammenhaengender Bereich der DATEI -- damit Tokengrenzen auf die Datei
-    zeigen und nicht auf eine zusammengesetzte Kopie. Ein Backslash unmittelbar
-    vor dem Umbruch setzt fort und gehoert zu keinem Token.
+    Returns (pieces, end_absolute). `pieces` are (offset, bytes) pairs, each
+    a contiguous range in the FILE -- so token boundaries point to the file
+    not to an assembled copy. A backslash immediately before a newline
+    continues and belongs to no token.
     """
-    stuecke, i = [], start
-    while i <= grenze:
-        e = _zeilenende(data, i, grenze)
-        zeile = data[i:e]
-        if zeile.endswith(b"\\"):
-            stuecke.append((i, zeile[:-1]))
+    pieces, i = [], start
+    while i <= limit:
+        e = _line_end(data, i, limit)
+        line = data[i:e]
+        if line.endswith(b"\\"):
+            pieces.append((i, line[:-1]))
             i = e + 1
             continue
-        stuecke.append((i, zeile))
-        return stuecke, e
-    return stuecke, grenze
+        pieces.append((i, line))
+        return pieces, e
+    return pieces, limit
 
 
-def _scan_tokens(data: bytes, stuecke):
-    """Shell-artige Token. Ein Lauf in ' oder \" ist EIN Token; die Anfuehrungs-
-    zeichen gehoeren weder zum Text noch zum Bereich -- die Grenzen zeigen auf den
-    INHALT, wie test_quotes_single_token_json es verlangt."""
+def _scan_tokens(data: bytes, pieces):
+    """Shell-like tokens. A run in ' or " is ONE token; the quotes belong
+    neither to text nor to the range -- the boundaries point to the
+    CONTENT, as test_quotes_single_token_json requires."""
     tokens = []
-    for basis, roh in stuecke:
-        i, n = 0, len(roh)
+    for base, raw in pieces:
+        i, n = 0, len(raw)
         while i < n:
-            c = roh[i:i + 1]
+            c = raw[i:i + 1]
             if c in _WS:
                 i += 1
                 continue
             if c in (b"'", b'"'):
-                ende = roh.find(c, i + 1)
-                if ende == -1:
-                    tokens.append({"text": roh[i:n].decode("utf-8", "replace"),
-                                   "start_byte": basis + i, "end_byte": basis + n})
+                end = raw.find(c, i + 1)
+                if end == -1:
+                    tokens.append({"text": raw[i:n].decode("utf-8", "replace"),
+                                   "start_byte": base + i, "end_byte": base + n})
                     break
-                tokens.append({"text": roh[i + 1:ende].decode("utf-8", "replace"),
-                               "start_byte": basis + i + 1, "end_byte": basis + ende})
-                i = ende + 1
+                tokens.append({"text": raw[i + 1:end].decode("utf-8", "replace"),
+                               "start_byte": base + i + 1, "end_byte": base + end})
+                i = end + 1
                 continue
             j = i
-            while j < n and roh[j:j + 1] not in _WS:
+            while j < n and raw[j:j + 1] not in _WS:
                 j += 1
-            tokens.append({"text": roh[i:j].decode("utf-8", "replace"),
-                           "start_byte": basis + i, "end_byte": basis + j})
+            tokens.append({"text": raw[i:j].decode("utf-8", "replace"),
+                           "start_byte": base + i, "end_byte": base + j})
             i = j
     return tokens
 
 
 def _tokenize_section(data: bytes, sec_start: int, sec_end: int):
-    """(tokens, werte) eines Abschnitts. `werte` bildet Direktivnamen auf den
-    LOGISCHEN Wert ab, Fortsetzungen bereits angehaengt."""
-    tokens, werte = [], {}
+    """(tokens, values) of a section. `values` maps directive names to
+    the LOGICAL value, with continuations already attached."""
+    tokens, values = [], {}
     i = sec_start
     while i < sec_end:
-        e = _zeilenende(data, i, sec_end)
-        zeile = data[i:e]
-        kern = zeile.strip()
-        if not kern or kern[:1] in (b"#", b";") or (kern[:1] == b"[" and kern[-1:] == b"]"):
+        e = _line_end(data, i, sec_end)
+        line = data[i:e]
+        core = line.strip()
+        if not core or core[:1] in (b"#", b";") or (core[:1] == b"[" and core[-1:] == b"]"):
             i = e + 1
             continue
-        rel = zeile.find(b"=")
+        rel = line.find(b"=")
         if rel == -1:
             i = e + 1
             continue
-        gleich = i + rel                       # ABSOLUT -- hier lag der Fehler
-        name = data[i:gleich].strip().decode("utf-8", "replace")
-        stuecke, ende = _logical_value(data, gleich + 1, sec_end)
-        tokens.extend(_scan_tokens(data, stuecke))
-        werte[name] = b" ".join(s for _, s in stuecke).decode("utf-8", "replace")
-        i = max(ende + 1, i + 1)               # niemals rueckwaerts
-    return tokens, werte
+        equals = i + rel                       # ABSOLUTE -- here was the error
+        name = data[i:equals].strip().decode("utf-8", "replace")
+        pieces, end = _logical_value(data, equals + 1, sec_end)
+        tokens.extend(_scan_tokens(data, pieces))
+        values[name] = b" ".join(s for _, s in pieces).decode("utf-8", "replace")
+        i = max(end + 1, i + 1)               # never backwards
+    return tokens, values
 
 
-def _anreichern(abschnitt: dict, data: bytes, start: int, ende: int) -> None:
-    """Token einhaengen und Parameter aus dem LOGISCHEN ExecStart ziehen.
+def _enrich(section: dict, data: bytes, start: int, end: int) -> None:
+    """Attach tokens and extract parameters from the logical ExecStart.
 
-    Bisher bekam die Parameterauswertung nur die erste Zeile. `-c 65536` steht
-    hinter einer Fortsetzung, `taskset -c 4-7` in derselben Zeile davor -- also
-    gewann die CPU-Bindung. Das ist der gemeinsame Grund, an dem fuenf Modelle
-    haengengeblieben sind.
+    Previously, parameter extraction only received the first line. `-c 65536` comes
+    after a continuation, `taskset -c 4-7` on the same line before -- thus gaining
+    the CPU binding. This is the common reason five models were stuck.
     """
-    tokens, werte = _tokenize_section(data, start, ende)
-    abschnitt["tokens"] = tokens
-    if "ExecStart" in werte:
-        abschnitt.setdefault("params", {}).update(_extract_execstart_params(werte["ExecStart"]))
+    tokens, values = _tokenize_section(data, start, end)
+    section["tokens"] = tokens
+    if "ExecStart" in values:
+        section.setdefault("params", {}).update(_extract_execstart_params(values["ExecStart"]))

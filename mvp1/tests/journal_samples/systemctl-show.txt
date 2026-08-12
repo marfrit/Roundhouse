@@ -1,0 +1,32 @@
+ActiveState=active
+SubState=running
+UnitFileState=enabled
+ConditionResult=yes
+Result=success
+NRestarts=0
+ExecMainStartTimestamp=Wed 2026-08-12 13:24:45 CEST
+ExecMainStartTimestampMonotonic=12071758952
+ExecMainPID=101084
+ControlGroup=/user.slice/user-1000.slice/user@1000.service/app.slice/qwen3.6-coding.service
+
+ActiveState=active
+SubState=running
+UnitFileState=enabled
+ConditionResult=yes
+Result=success
+NRestarts=0
+ExecMainStartTimestamp=Wed 2026-08-12 12:56:23 CEST
+ExecMainStartTimestampMonotonic=10370420999
+ExecMainPID=97420
+ControlGroup=/user.slice/user-1000.slice/user@1000.service/app.slice/llama-task.service
+
+ActiveState=inactive
+SubState=dead
+UnitFileState=disabled
+ConditionResult=no
+Result=success
+NRestarts=0
+ExecMainStartTimestamp=
+ExecMainStartTimestampMonotonic=0
+ExecMainPID=0
+ControlGroup=

@@ -1,0 +1,20 @@
+[Unit]
+Description=Synthetic test fixture for unknown directives and edge cases
+; This is a semicolon comment
+Documentation=https://example.com
+
+[Service]
+# Standard comment
+Type=simple
+MemoryHigh=1G
+Environment="A=b c"
+ExecStart=/home/user/src/llama.cpp-latest/build/bin/llama-server \
+  -m /home/user/models/test.gguf \
+  --alias test-model --port 9999 \
+  --chat-template-kwargs '{"incomplete": value without closing quote and %h specifier
+FrobnicateWidget=yes
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target
