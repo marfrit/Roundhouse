@@ -1083,11 +1083,14 @@ def run_ro(argv: List[str], timeout=10) -> str:
         raise ValueError(f"Only systemctl and journalctl allowed; got {argv[0]}")
 
     if argv[0] == "systemctl":
-        # Extract verb (second argument after systemctl)
-        if len(argv) > 1:
-            verb = argv[1]
-            if verb not in READONLY_SYSTEMCTL_VERBS:
-                raise ValueError(f"systemctl verb '{verb}' not in read-only set {READONLY_SYSTEMCTL_VERBS}")
+        # Extract verb (first non-flag argument after systemctl)
+        verb = None
+        for arg in argv[1:]:
+            if not arg.startswith('-'):
+                verb = arg
+                break
+        if verb and verb not in READONLY_SYSTEMCTL_VERBS:
+            raise ValueError(f"systemctl verb '{verb}' not in read-only set {READONLY_SYSTEMCTL_VERBS}")
 
     try:
         result = subprocess.run(argv, capture_output=True, text=True, timeout=timeout)
@@ -1113,11 +1116,14 @@ def spawn_ro_stream(argv: List[str]) -> subprocess.Popen:
         raise ValueError(f"Only systemctl and journalctl allowed; got {argv[0]}")
 
     if argv[0] == "systemctl":
-        # Extract verb (second argument after systemctl)
-        if len(argv) > 1:
-            verb = argv[1]
-            if verb not in READONLY_SYSTEMCTL_VERBS:
-                raise ValueError(f"systemctl verb '{verb}' not in read-only set {READONLY_SYSTEMCTL_VERBS}")
+        # Extract verb (first non-flag argument after systemctl)
+        verb = None
+        for arg in argv[1:]:
+            if not arg.startswith('-'):
+                verb = arg
+                break
+        if verb and verb not in READONLY_SYSTEMCTL_VERBS:
+            raise ValueError(f"systemctl verb '{verb}' not in read-only set {READONLY_SYSTEMCTL_VERBS}")
 
     return subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
 
@@ -1167,6 +1173,10 @@ class Watcher:
     # Per-unit state (internal)
     _state: Dict[str, Dict] = field(default_factory=dict)
     _cgroup_cache: Dict[str, Dict] = field(default_factory=dict)
+    # Set by cmd_serve: the port this Roundhouse instance is bound to, and the
+    # live health of the two sensing sources ("ok" or "down since <epoch>").
+    self_port: int = 8090
+    sources: Dict[str, str] = field(default_factory=lambda: {'journal': 'ok', 'systemctl': 'ok'})
 
     def __post_init__(self):
         """Initialize per-unit state."""
@@ -1483,11 +1493,8 @@ class Watcher:
                 'total_bytes': mem_total,
                 'available_bytes': mem_available
             },
-            'sources': {
-                'journal': 'ok',
-                'systemctl': 'ok'
-            },
-            'self_port': 8090,
+            'sources': dict(self.sources),
+            'self_port': self.self_port,
             'units': units_list
         }
 
@@ -1834,10 +1841,13 @@ def estimate_memory(dep: Dict, store: Optional[MemStore]) -> Dict:
 
     # Try sqlite lookup
     if store and model_path:
-        file_id = f"sz{os.stat(model_path).st_size}:mt{int(os.stat(model_path).st_mtime)}"
-        mem = store.lookup(dep.get('unit', ''), file_id, None)
-        if mem:
-            return mem
+        try:
+            file_id = f"sz{os.stat(model_path).st_size}:mt{int(os.stat(model_path).st_mtime)}"
+            mem = store.lookup(dep.get('unit', ''), file_id, None)
+            if mem:
+                return mem
+        except Exception:
+            pass
 
     # Check if model file exists
     if model_path and os.path.isfile(model_path):
@@ -2287,11 +2297,22 @@ def cmd_scan(args):
 
 
 def cmd_serve(args):
-    """Run the server."""
+    """Run the server with polling threads and event streaming."""
+    import time
+    from datetime import timezone
+
     unit_dir = args.unit_dir
     port = args.port
     use_db = not args.no_db
     db_path = args.db
+
+    # Determine MemStore path
+    if use_db:
+        if not db_path:
+            xdg_state = os.environ.get('XDG_STATE_HOME', os.path.expanduser('~/.local/state'))
+            db_path = os.path.join(xdg_state, 'roundhouse', 'roundhouse.sqlite')
+    else:
+        db_path = None
 
     # Select units
     unit_paths = select_units(unit_dir)
@@ -2310,17 +2331,249 @@ def cmd_serve(args):
             print(f"Error parsing {fpath}: {e}", file=sys.stderr)
             return 1
 
-    # Create watcher stub or real implementation
-    try:
-        # Try to use real Watcher if available (from Section B)
-        running_kernel = os.uname().release
-        watcher = Watcher(units, running_kernel, None)
-    except NameError:
-        # Fallback to stub
-        watcher = _StubWatcher(units)
+    selected_unit_names = sorted(units.keys())
+
+    # Create MemStore
+    mem_store = MemStore(db_path) if use_db else MemStore(None)
+
+    # Create Watcher
+    running_kernel = os.uname().release
+    watcher = Watcher(units, running_kernel, mem_store)
+    watcher.self_port = port
 
     # Create event bus
     event_bus = EventBus()
+
+    # Shared lock for all apply_* calls
+    watcher_lock = threading.Lock()
+
+    # Shutdown event
+    shutdown_event = threading.Event()
+
+    # Track journal source state
+    journal_state = {'down_since': None, 'proc': None}
+    systemctl_state = {'down_since': None}
+    backoff_journal = 1
+
+    def poll_systemctl():
+        """Poll systemctl every 3 seconds."""
+        nonlocal backoff_journal
+
+        while not shutdown_event.is_set():
+            try:
+                # Run systemctl show
+                properties = [
+                    'ActiveState', 'SubState', 'UnitFileState', 'Result', 'NRestarts',
+                    'ExecMainPID', 'ExecMainStartTimestamp', 'ExecMainStartTimestampMonotonic',
+                    'ConditionResult', 'ControlGroup'
+                ]
+                prop_args = ','.join(properties)
+
+                try:
+                    output = run_ro([
+                        'systemctl', '--user', 'show', '-p', prop_args, '--'
+                    ] + selected_unit_names)
+                    props = parse_show_blocks(output, selected_unit_names)
+                    systemctl_state['down_since'] = None
+                    with watcher_lock:
+                        watcher.sources['systemctl'] = 'ok'
+                except Exception as e:
+                    # Mark systemctl down; units render stale
+                    if systemctl_state['down_since'] is None:
+                        systemctl_state['down_since'] = time.time()
+                    with watcher_lock:
+                        watcher.sources['systemctl'] = 'down since %d' % systemctl_state['down_since']
+                    props = {}
+
+                # Apply to watcher
+                with watcher_lock:
+                    events = watcher.apply_systemctl_show(props)
+                    for event in events:
+                        event_bus.publish('rung', event)
+
+                    # Read cgroup memory samples for active units
+                    for unit_name in selected_unit_names:
+                        state = watcher._state.get(unit_name, {})
+                        control_group = state.get('control_group')
+                        if control_group:
+                            peak = None
+                            current = None
+                            try:
+                                peak_path = f"/sys/fs/cgroup{control_group}/memory.peak"
+                                with open(peak_path, 'r') as f:
+                                    peak = int(f.read().strip())
+                            except Exception:
+                                pass
+                            try:
+                                current_path = f"/sys/fs/cgroup{control_group}/memory.current"
+                                with open(current_path, 'r') as f:
+                                    current = int(f.read().strip())
+                            except Exception:
+                                pass
+
+                            if peak is not None or current is not None:
+                                events = watcher.apply_cgroup_sample(unit_name, peak, current)
+                                for event in events:
+                                    event_bus.publish('mem', event)
+
+                    # Rebuild port board and emit if changed
+                    # (simplified: emit every cycle)
+                    event_bus.publish('ports', _build_port_board(watcher.snapshot()))
+
+                # Sleep 3 seconds
+                shutdown_event.wait(3)
+            except Exception as e:
+                print(f"Error in poll_systemctl: {e}", file=sys.stderr)
+                shutdown_event.wait(1)
+
+    def journal_tail():
+        """Tail journal and apply events; respawn with backoff on error."""
+        nonlocal backoff_journal, journal_state
+        backoff = 1
+
+        while not shutdown_event.is_set():
+            try:
+                # Spawn journalctl tail
+                proc = spawn_ro_stream([
+                    'journalctl', '--user', '-f', '-o', 'json', '-n', '0', '--no-pager'
+                ])
+                journal_state['proc'] = proc
+                journal_state['down_since'] = None
+                with watcher_lock:
+                    watcher.sources['journal'] = 'ok'
+                backoff = 1
+
+                # Read lines
+                while not shutdown_event.is_set():
+                    line = proc.stdout.readline()
+                    if not line:
+                        # Stream ended
+                        break
+
+                    try:
+                        rec = json.loads(line)
+                    except Exception:
+                        continue
+
+                    # Filter to selected units
+                    unit_name = rec.get('_SYSTEMD_USER_UNIT')
+                    if unit_name not in selected_unit_names:
+                        continue
+
+                    # Apply to watcher
+                    with watcher_lock:
+                        events = watcher.apply_journal_line(rec)
+                        for event in events:
+                            event_bus.publish('rung', event)
+
+                # Process exited
+                proc.terminate()
+                journal_state['proc'] = None
+
+            except Exception as e:
+                print(f"Journal tail error: {e}", file=sys.stderr)
+                if journal_state['proc']:
+                    journal_state['proc'].terminate()
+                    journal_state['proc'] = None
+
+            # Mark down and backoff
+            if journal_state['down_since'] is None:
+                journal_state['down_since'] = time.time()
+            with watcher_lock:
+                watcher.sources['journal'] = 'down since %d' % journal_state['down_since']
+
+            if shutdown_event.is_set():
+                break
+
+            sleep_time = min(backoff, 30)
+            shutdown_event.wait(sleep_time)
+            backoff = min(backoff * 2, 30)
+
+    def backfill_journal():
+        """Backfill journal at startup for currently active units."""
+        try:
+            with watcher_lock:
+                # Get current snapshot
+                snap = watcher.snapshot()
+                active_rungs = {'STARTING', 'LOADING', 'READY', 'BUSY', 'STANDBY'}
+                active_units = [u['unit'] for u in snap.get('units', []) if u.get('rung') in active_rungs]
+
+                for unit_name in active_units:
+                    unit = units.get(unit_name)
+                    if not unit or not unit.exec_start:
+                        continue
+
+                    state = watcher._state.get(unit_name, {})
+                    exec_ts = state.get('exec_main_start_ts')
+                    if not exec_ts:
+                        continue
+
+                    # Get last 300 lines
+                    try:
+                        output = run_ro([
+                            'journalctl', '--user', '-u', unit_name, '-o', 'json', '-n', '300', '--no-pager'
+                        ])
+
+                        for line in output.strip().split('\n'):
+                            if not line:
+                                continue
+                            try:
+                                rec = json.loads(line)
+                            except Exception:
+                                continue
+
+                            # Filter by timestamp if available
+                            rt = rec.get('__REALTIME_TIMESTAMP')
+                            if rt:
+                                try:
+                                    rt_us = int(rt)
+                                    exec_ts_us = int(exec_ts * 1e6)
+                                    if rt_us < exec_ts_us:
+                                        continue
+                                except Exception:
+                                    pass
+
+                            # Apply
+                            watcher.apply_journal_line(rec)
+                    except Exception:
+                        pass
+        except Exception as e:
+            print(f"Backfill error: {e}", file=sys.stderr)
+
+    # Do initial systemctl poll synchronously
+    try:
+        properties = [
+            'ActiveState', 'SubState', 'UnitFileState', 'Result', 'NRestarts',
+            'ExecMainPID', 'ExecMainStartTimestamp', 'ExecMainStartTimestampMonotonic',
+            'ConditionResult', 'ControlGroup'
+        ]
+        prop_args = ','.join(properties)
+
+        try:
+            output = run_ro([
+                'systemctl', '--user', 'show', '-p', prop_args, '--'
+            ] + selected_unit_names)
+            props = parse_show_blocks(output, selected_unit_names)
+        except Exception as e:
+            print(f"Warning: initial systemctl poll failed: {e}", file=sys.stderr)
+            props = {}
+
+        with watcher_lock:
+            watcher.apply_systemctl_show(props)
+    except Exception as e:
+        print(f"Error in initial poll: {e}", file=sys.stderr)
+
+    # Start threads
+    poll_thread = threading.Thread(target=poll_systemctl, daemon=True)
+    poll_thread.start()
+
+    # Start journal thread (with backfill first)
+    def journal_with_backfill():
+        backfill_journal()
+        journal_tail()
+
+    journal_thread = threading.Thread(target=journal_with_backfill, daemon=True)
+    journal_thread.start()
 
     # Start HTTP server
     try:
@@ -2336,6 +2589,12 @@ def cmd_serve(args):
         # Handle shutdown signals
         def signal_handler(sig, frame):
             print("\nShutting down...")
+            shutdown_event.set()
+            if journal_state['proc']:
+                try:
+                    journal_state['proc'].terminate()
+                except Exception:
+                    pass
             server.shutdown()
             sys.exit(0)
 
@@ -2346,74 +2605,76 @@ def cmd_serve(args):
         server.serve_forever()
     except Exception as e:
         print(f"Error starting server: {e}", file=sys.stderr)
+        shutdown_event.set()
         return 1
 
     return 0
 
 
-class _StubWatcher:
-    """Stub Watcher for testing when Section B is not available."""
-
-    def __init__(self, units: dict):
-        self.units = units
-        self.host = os.uname().nodename
-        self.kernel = os.uname().release
-        self.now = time.time()
-        self.mem_total = 32840000000  # 32 GiB stub
-        self.mem_available = 14000000000  # 14 GiB stub
-
-    def snapshot(self) -> dict:
-        """Return a stub snapshot."""
-        units_list = []
-        for name, unit in self.units.items():
-            param_profile = {}
-            if unit.exec_start:
-                param_profile = extract_param_profile(unit.exec_start.engine_argv)
-
-            units_list.append({
-                'unit': name,
-                'description': unit.description or '',
-                'retired': unit.retired,
-                'rung': 'OFF',
-                'roster': None,
-                'since': self.now,
-                'detail': '',
-                'badges': [],
-                'stale': False,
-                'sensed_at': self.now,
-                'enabled': True,
-                'active_state': 'inactive',
-                'sub_state': 'dead',
-                'n_restarts': 0,
-                'port': param_profile.get('port', 8080),
-                'port_source': param_profile.get('port_source', 'default'),
-                'alias': param_profile.get('alias', name),
-                'gate': unit.gate,
-                'model_file': param_profile.get('model_path', ''),
-                'model_path': param_profile.get('model_path', ''),
-                'quant_hint': None,
-                'ctx': param_profile.get('ctx'),
-                'engine': unit.exec_start.engine if unit.exec_start else {},
-                'param_profile': param_profile,
-                'mem': {'bytes': None, 'source': 'unknown', 'label': 'unknown'},
-                'port_conflict': None
+def _build_port_board(snapshot: Dict) -> Dict:
+    """Build port board from snapshot."""
+    ports = {}
+    for unit in snapshot.get('units', []):
+        port = unit.get('port')
+        if port:
+            if port not in ports:
+                ports[port] = []
+            ports[port].append({
+                'unit': unit['unit'],
+                'enabled': unit.get('enabled', False),
+                'rung': unit.get('rung', 'OFF'),
+                'retired': unit.get('retired', False),
+                'gate': unit.get('gate')
             })
 
-        return {
-            'host': self.host,
-            'kernel': self.kernel,
-            'now': self.now,
-            'mem': {
-                'total_bytes': self.mem_total,
-                'available_bytes': self.mem_available
-            },
-            'sources': {
-                'journal': 'ok',
-                'systemctl': 'ok'
-            },
-            'self_port': 8090,
-            'units': units_list
-        }
+    ports[8090] = []
+
+    port_list = []
+    for port in sorted(ports.keys()):
+        claims = ports[port]
+        if port == 8090:
+            port_list.append({
+                'port': port,
+                'claims': [],
+                'class': None,
+                'note': 'roundhouse (self)'
+            })
+        elif len(claims) == 0:
+            pass
+        elif len(claims) == 1:
+            port_list.append({
+                'port': port,
+                'claims': [claims[0]],
+                'class': None,
+                'note': None
+            })
+        else:
+            active_rungs = {'STARTING', 'LOADING', 'READY', 'BUSY'}
+            active_count = sum(1 for c in claims if c['rung'] in active_rungs)
+
+            if active_count >= 2:
+                port_class = 'active'
+                note = None
+            else:
+                enabled_or_gated = sum(1 for c in claims if c['enabled'] or (c['gate'] and not c['enabled']))
+                if enabled_or_gated >= 2:
+                    port_class = 'armed'
+                    note = 'harmless only while BOTH the disable and the kernel gate hold'
+                else:
+                    port_class = 'latent'
+                    note = None
+
+            port_list.append({
+                'port': port,
+                'claims': claims,
+                'class': port_class,
+                'note': note
+            })
+
+    return {
+        'ports': port_list,
+        'self': {'port': 8090, 'claims_by_units': []}
+    }
 
 
 if __name__ == '__main__':
