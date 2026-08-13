@@ -336,6 +336,20 @@
             display: none;
         }
 
+        #toast {
+            position: fixed;
+            bottom: 2em;
+            left: 50%;
+            transform: translateX(-50%);
+            max-width: 90%;
+            padding: 0.75em 1em;
+            background-color: var(--bg);
+            color: var(--fg);
+            border: 2px solid var(--amber);
+            border-radius: 3px;
+            z-index: 10000;
+        }
+
         .rollout-stepper {
             display: none;
             margin-bottom: 1em;
@@ -727,7 +741,7 @@
                 overflow-x: hidden;
             }
 
-            .unit-row, button, .off-section-toggle, .stop-tick-row {
+            .unit-row, button, .off-section-toggle, .stop-tick-row, #token, .enable-toggle {
                 min-height: 44px;
                 align-items: center;
             }
@@ -737,6 +751,11 @@
             }
 
             .stop-tick-row input[type="checkbox"] {
+                width: 24px;
+                height: 24px;
+            }
+
+            .enable-toggle input[type="checkbox"] {
                 width: 24px;
                 height: 24px;
             }
@@ -826,6 +845,8 @@
             <div id="port-board-cells"></div>
         </div>
     </div>
+
+    <div id="toast" style="display: none;"></div>
 
     <div class="detail-pane" id="detail-pane">
         <button onclick="closeDetail()" style="float: right; background: var(--border); border: none; color: var(--fg); cursor: pointer; padding: 0.25em 0.5em; border: 1px solid var(--border);">Close</button>
@@ -953,6 +974,16 @@
             const data = JSON.parse(e.data);
             if (data.rollout_id) {
                 refreshOperation(data.rollout_id);
+            }
+        });
+
+        eventSource.addEventListener('enablement', (e) => {
+            const d = JSON.parse(e.data);
+            const u = state.units.find(x => x.unit === d.unit);
+            if (u) {
+                u.enabled = d.enabled;
+                u.strategy_note = d.strategy_note;
+                renderUnits();
             }
         });
 
@@ -1087,6 +1118,9 @@
                     const gb = (unit.mem.bytes / 1e9).toFixed(1);
                     detail += '· peak ' + gb + ' GiB (' + (unit.mem.source || 'unknown') + ')';
                 }
+                if (unit.strategy_note) {
+                    detail += ' · ' + unit.strategy_note;
+                }
                 detailSpan.textContent = detail;
                 leftDiv.appendChild(detailSpan);
 
@@ -1098,6 +1132,69 @@
                 }
 
                 row.appendChild(leftDiv);
+
+                // Enable-toggle checkbox for non-retired units
+                if (category !== 'retired') {
+                    const label = document.createElement('label');
+                    label.className = 'enable-toggle';
+                    label.onclick = (e) => e.stopPropagation();
+                    const checkbox = document.createElement('input');
+                    checkbox.type = 'checkbox';
+                    checkbox.checked = unit.enabled;
+                    checkbox.disabled = (state.mode !== 'actuate') || (unit._inFlight === true);
+                    label.appendChild(checkbox);
+                    const bootText = document.createElement('span');
+                    bootText.textContent = 'boot';
+                    label.appendChild(bootText);
+
+                    checkbox.onchange = () => {
+                        // Disable the checkbox while in flight
+                        checkbox.disabled = true;
+                        const enabled = checkbox.checked;
+                        fetch('/api/units/' + encodeURIComponent(unit.unit) + '/enablement', {
+                            method: 'POST',
+                            headers: makeAuthHeaders(),
+                            body: JSON.stringify({enabled: enabled})
+                        })
+                        .then(r => {
+                            if (r.status === 200) {
+                                return r.json().then(data => {
+                                    unit.enabled = data.enabled;
+                                    unit.strategy_note = data.strategy_note;
+                                    renderUnits();
+                                });
+                            } else if (r.status === 422) {
+                                return r.json().then(data => {
+                                    checkbox.checked = unit.enabled;
+                                    checkbox.disabled = (state.mode !== 'actuate');
+                                    let msg = data.error || 'enable refused';
+                                    if (data.detail) msg += ': ' + data.detail;
+                                    showToast(msg);
+                                });
+                            } else if (r.status === 401) {
+                                checkbox.checked = unit.enabled;
+                                checkbox.disabled = (state.mode !== 'actuate');
+                                showTokenError();
+                            } else if (r.status === 500) {
+                                return r.json().then(data => {
+                                    checkbox.checked = unit.enabled;
+                                    checkbox.disabled = (state.mode !== 'actuate');
+                                    showToast(data.detail || 'enablement error');
+                                });
+                            } else {
+                                checkbox.checked = unit.enabled;
+                                checkbox.disabled = (state.mode !== 'actuate');
+                            }
+                        })
+                        .catch(e => {
+                            checkbox.checked = unit.enabled;
+                            checkbox.disabled = (state.mode !== 'actuate');
+                            console.error('Enablement error:', e);
+                        });
+                    };
+
+                    row.appendChild(label);
+                }
 
                 if (category === 'failed' && unit.n_restarts !== undefined) {
                     const restarts = document.createElement('span');
@@ -1148,8 +1245,17 @@
                 cell.className = 'port-cell';
 
                 const isSelf = portNum === selfPort;
-                const selfTag = isSelf ? ' roundhouse (self)' : '';
-                if (isSelf) cell.classList.add('self');
+                let selfTag = '';
+                if (isSelf) {
+                    cell.classList.add('self');
+                    selfTag = ' roundhouse (self)';
+                    if (state.self_unit) {
+                        const bootStatus = state.self_unit.unit_file_state ?
+                            (state.self_unit.enabled ? 'enabled' : 'manual') :
+                            'not installed';
+                        selfTag += ' · boot: ' + bootStatus;
+                    }
+                }
 
                 if (claims.length === 0) {
                     cell.textContent = port + selfTag + ' ✓';
@@ -1335,8 +1441,28 @@
                 tbody1.appendChild(row);
             }
 
+            if (!unit.retired) {
+                row = document.createElement('tr');
+                th = document.createElement('th');
+                th.textContent = 'Load strategy';
+                row.appendChild(th);
+                td = document.createElement('td');
+                td.textContent = unit.enabled ? 'on-boot (enabled)' : 'manual (disabled)';
+                row.appendChild(td);
+                tbody1.appendChild(row);
+            }
+
             table1.appendChild(tbody1);
             content.appendChild(table1);
+
+            if (!unit.retired && unit.strategy_note) {
+                const noteDiv = document.createElement('div');
+                noteDiv.style.color = 'var(--neutral)';
+                noteDiv.style.fontSize = '0.9em';
+                noteDiv.style.marginTop = '0.5em';
+                noteDiv.textContent = unit.strategy_note;
+                content.appendChild(noteDiv);
+            }
 
             // OTHER DIRECTIVES table
             if (unit.other_directives && unit.other_directives.length > 0) {
@@ -1433,6 +1559,15 @@
             const msg = document.getElementById('token-error-msg');
             msg.textContent = 'token rejected';
             msg.style.display = 'inline';
+        }
+
+        function showToast(message) {
+            const toast = document.getElementById('toast');
+            toast.textContent = message;
+            toast.style.display = 'block';
+            setTimeout(() => {
+                toast.style.display = 'none';
+            }, 6000);
         }
 
         function showEditForm(unit) {
@@ -1777,11 +1912,32 @@
                 } else if (rollout.phase === 'done' && phases.indexOf(phase) < phases.indexOf('done')) {
                     chip.classList.add('done');
                     iconSpan.textContent = '✓';
-                } else if (rollout.phase === 'failed' && phases.indexOf(phase) <= phases.indexOf('done')) {
-                    chip.classList.add('failed');
-                    iconSpan.textContent = '✗';
+                } else if (rollout.phase === 'failed') {
+                    const failurePhase = (rollout.failure && rollout.failure.phase) ? rollout.failure.phase : null;
+                    if (failurePhase) {
+                        // Use the specific failure phase
+                        const failureIdx = phases.indexOf(failurePhase);
+                        const phaseIdx = phases.indexOf(phase);
+                        if (phaseIdx < failureIdx) {
+                            chip.classList.add('done');
+                            iconSpan.textContent = '✓';
+                        } else if (phaseIdx === failureIdx) {
+                            chip.classList.add('failed');
+                            iconSpan.textContent = '✗';
+                        } else {
+                            iconSpan.textContent = '·';
+                        }
+                    } else {
+                        // Old record without failure.phase: all failed
+                        chip.classList.add('failed');
+                        iconSpan.textContent = '✗';
+                    }
                 } else if (rollout.phase === 'rolled_back' || rollout.phase === 'restored') {
                     chip.classList.add(rollout.phase);
+                    iconSpan.textContent = '✓';
+                } else if (phases.indexOf(phase) < phases.indexOf(currentPhase)) {
+                    // Mid-flight: chips before currentPhase get done+checkmark
+                    chip.classList.add('done');
                     iconSpan.textContent = '✓';
                 } else {
                     iconSpan.textContent = '·';
@@ -1915,9 +2071,9 @@
             const freed = (fit.freed_bytes || 0) / 1e9;
             const headroom = (fit.headroom_bytes || 0) / 1e9;
             const budget = (fit.budget_bytes || 0) / 1e9;
-            fitText.textContent = 'estimate ' + estimate.toFixed(1) + ' GB (' + fit.estimate_source + ') + headroom ' + headroom.toFixed(1) + ' GB vs ' +
-                'available ' + available.toFixed(1) + ' GB + freed ' + freed.toFixed(1) + ' GB = ' +
-                budget.toFixed(1) + ' GB budget ' + (fit.ok ? '✓' : '✗');
+            fitText.textContent = 'estimate ' + estimate.toFixed(1) + ' GiB (' + fit.estimate_source + ') + headroom ' + headroom.toFixed(1) + ' GiB vs ' +
+                'available ' + available.toFixed(1) + ' GiB + freed ' + freed.toFixed(1) + ' GiB = ' +
+                budget.toFixed(1) + ' GiB budget ' + (fit.ok ? '✓' : '✗');
             fitLine.appendChild(fitText);
 
             if (!fit.ok && suggested.length > 0) {

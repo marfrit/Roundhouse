@@ -138,11 +138,21 @@ for root, dirs, files in os.walk(CHOME + '/.config'):
         shutil.chown(os.path.join(root, n), CUSER, CUSER)
 PYEOF
 
+echo "-- enabling user lingering (required for user units at boot)"
+incus exec "$CONTAINER" -- loginctl enable-linger "$CUSER"
+
 echo "-- checking for git in container"
 if ! incus exec "$CONTAINER" -- su -l "$CUSER" -c 'git --version' >/dev/null 2>&1; then
     echo "Error: git not found in container. Install with: incus exec $CONTAINER -- apt-get install -y git" >&2
     exit 1
 fi
+
+echo "-- generating roundhouse.service in the container"
+incus exec "$CONTAINER" -- install -m 0644 -o "$CUSER" -g "$CUSER" \
+    "$DEST/mvp1/roundhouse.service" "$CHOME/.config/systemd/user/roundhouse.service"
+incus exec "$CONTAINER" -- sed -i "s|^ExecStart=.*|ExecStart=/usr/bin/python3 $DEST/mvp1/roundhouse.py --serve --actuate --port 8090|" \
+    "$CHOME/.config/systemd/user/roundhouse.service"
+incus exec "$CONTAINER" -- chown "$CUSER:$CUSER" "$CHOME/.config/systemd/user/roundhouse.service"
 
 echo "-- reloading and arming the :8086 pair"
 incus exec "$CONTAINER" -- su -l "$CUSER" -c 'systemctl --user daemon-reload'
@@ -158,19 +168,19 @@ incus exec "$CONTAINER" -- su -l "$CUSER" -c 'systemctl --user list-unit-files -
 echo
 echo "Setup complete."
 echo
-echo "FOR MVP2 DRILLS (if --actuate is to be used):"
+echo "FOR MVP4 DRILLS (with --actuate enabled by default):"
 echo "1. Initialize the git repo in the container (execute as $CUSER in the container unit dir):"
-echo "   incus exec $CONTAINER -- su -l $CUSER -c 'cd ~/.config/systemd/user && git init && printf \"%s\\n\" \"*.bak*\" \"*.roundhouse-tmp\" > .gitignore && git add .gitignore qwen3.6-coding.service llama-server-qwen35-npu.service llama-task.service llama-server-gemma4-q4km.service mixperten.service && git commit -m \"roundhouse baseline: 5 managed units\"'"
+echo "   incus exec $CONTAINER -- su -l $CUSER -c 'cd ~/.config/systemd/user && git init && printf \"%s\\n\" \"*.bak*\" \"*.roundhouse-tmp\" > .gitignore && git add .gitignore qwen3.6-coding.service llama-server-qwen35-npu.service llama-task.service llama-server-gemma4-q4km.service mixperten.service roundhouse.service && git commit -m \"roundhouse baseline: 5 managed units + self\"'"
 echo
-echo "2. Start Roundhouse with --actuate:"
+echo "2. Start roundhouse.service and daemon-reload:"
 echo "   incus exec $CONTAINER -- su -l $CUSER -c \\"
-echo "     'nohup python3 $DEST/mvp1/roundhouse.py --serve --actuate --port 8090 >/tmp/roundhouse.log 2>&1 &'"
+echo "     'systemctl --user daemon-reload && systemctl --user enable --now roundhouse.service'"
 echo
 echo "3. Find the token:"
 echo "   incus exec $CONTAINER -- su -l $CUSER -c 'cat ~/.config/roundhouse/token'"
 echo
-echo "FOR MVP1 READ-ONLY:"
-echo "  incus exec $CONTAINER -- su -l $CUSER -c \\"
-echo "    'nohup python3 $DEST/mvp1/roundhouse.py --serve --port 8090 >/tmp/roundhouse.log 2>&1 &'"
+echo "FOR READ-ONLY (without --actuate):"
+echo "  Edit ~/.config/systemd/user/roundhouse.service (remove --actuate from ExecStart)"
+echo "  incus exec $CONTAINER -- su -l $CUSER -c 'systemctl --user daemon-reload && systemctl --user restart roundhouse.service'"
 echo
 echo "Then, from the host: curl http://127.0.0.1:8090/api/units"
