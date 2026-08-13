@@ -581,7 +581,7 @@ class TestWriteGuards(unittest.TestCase):
     SOURCE = Path(__file__).resolve().parents[1] / 'roundhouse.py'
     WRITE_VERBS = {'start', 'stop', 'daemon-reload', 'enable', 'disable', 'restart', 'reload',
                    'kill', 'reset-failed', 'set-property', 'edit'}
-    ROLLOUT_CALLSITES = {'_stop_unit', '_start_unit', '_daemon_reload'}
+    ROLLOUT_CALLSITES = {'_stop_unit', '_start_unit', '_daemon_reload', '_set_enablement'}
 
     def test_default_mode_cannot_actuate(self):
         """run_actuate and run_git raise ActuationError when ACTUATE_ARMED is False."""
@@ -894,7 +894,7 @@ class TestWriteGuards(unittest.TestCase):
         expected_routes = {
             "/api/units/<name>/edit", "/api/units/<name>/rollout",
             "/api/rollouts/<id>/rollback", "/api/rollouts/<id>/dismiss",
-            "/api/switch/preview", "/api/switch",
+            "/api/switch/preview", "/api/switch", "/api/units/<name>/enablement",
         }
         self.assertEqual(set(roundhouse.FROZEN_POST_ROUTES), expected_routes)
 

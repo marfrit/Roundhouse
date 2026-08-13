@@ -496,7 +496,7 @@ class TestWatcher(unittest.TestCase):
         snap = watcher.snapshot()
 
         # Check top-level keys
-        required_keys = {'host', 'kernel', 'now', 'mem', 'sources', 'self_port', 'units'}
+        required_keys = {'host', 'kernel', 'now', 'mem', 'sources', 'self_port', 'self_unit', 'units'}
         self.assertEqual(set(snap.keys()), required_keys)
 
         # Check mem dict
@@ -507,6 +507,12 @@ class TestWatcher(unittest.TestCase):
         self.assertIn('journal', snap['sources'])
         self.assertIn('systemctl', snap['sources'])
 
+        # Check self_unit
+        self.assertIsInstance(snap['self_unit'], dict)
+        self.assertIn('unit', snap['self_unit'])
+        self.assertIn('unit_file_state', snap['self_unit'])
+        self.assertIn('enabled', snap['self_unit'])
+
         # Check units list
         self.assertIsInstance(snap['units'], list)
         if snap['units']:
@@ -515,7 +521,7 @@ class TestWatcher(unittest.TestCase):
                 'unit', 'description', 'retired', 'rung', 'roster', 'since', 'start_ts_mono',
                 'detail', 'badges', 'stale', 'sensed_at', 'enabled', 'active_state',
                 'sub_state', 'n_restarts', 'port', 'port_source', 'alias', 'gate',
-                'model_file', 'quant_hint', 'ctx', 'mem', 'port_conflict'
+                'model_file', 'quant_hint', 'ctx', 'mem', 'port_conflict', 'strategy_note'
             }
             self.assertEqual(set(unit_dict.keys()), required_unit_keys)
 

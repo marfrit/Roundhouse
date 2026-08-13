@@ -789,6 +789,9 @@ class TestRoutesAuth(unittest.TestCase):
 
         # Create a stub watcher
         cls.watcher = MagicMock(spec=roundhouse.Watcher)
+        # The real Watcher carries a non-reentrant lock as a dataclass field
+        # (default_factory), which spec= cannot see - locked_snapshot() needs it.
+        cls.watcher.lock = threading.Lock()
         cls.watcher.snapshot.return_value = {
             'host': 'test', 'kernel': '6.1', 'now': time.time(),
             'mem': {}, 'units': [], 'sources': {}
@@ -1608,6 +1611,9 @@ class TestStalenessRoute(unittest.TestCase):
     def setUpClass(cls):
         cls.temp_dir = tempfile.mkdtemp()
         cls.watcher = MagicMock(spec=roundhouse.Watcher)
+        # The real Watcher carries a non-reentrant lock as a dataclass field
+        # (default_factory), which spec= cannot see - locked_snapshot() needs it.
+        cls.watcher.lock = threading.Lock()
         cls.watcher.snapshot.return_value = {'host': 't', 'kernel': '6.1', 'now': 0.0,
                                              'mem': {}, 'units': [], 'sources': {}}
         cls.watcher.units = {}
@@ -2259,10 +2265,12 @@ class _ScriptedFleet:
 
     # --- roster -------------------------------------------------------------------
     def snapshot(self):
+        # Like the real Watcher.snapshot(), this is LOCK-FREE: callers hold the
+        # lock (engine sites) or go through locked_snapshot(). Taking self.lock
+        # here deadlocked locked_snapshot() on the non-reentrant lock (MVP4).
         now = time.time()
-        with self.lock:
-            units = [dict(row, unit=name, sensed_at=now)
-                     for name, row in self.rows.items()]
+        units = [dict(row, unit=name, sensed_at=now)
+                 for name, row in self.rows.items()]
         return {'host': 'test', 'kernel': self.kernel, 'now': now,
                 'mem': {}, 'sources': {}, 'self_port': 8090, 'units': units}
 
@@ -2807,6 +2815,9 @@ class TestSwitchSlot(unittest.TestCase):
 
         # Create a stub watcher with units
         cls.watcher = MagicMock(spec=roundhouse.Watcher)
+        # The real Watcher carries a non-reentrant lock as a dataclass field
+        # (default_factory), which spec= cannot see - locked_snapshot() needs it.
+        cls.watcher.lock = threading.Lock()
         cls.watcher.units = {'qwen3.6-coding.service': qwen_unit, 'llama-server-gemma4.service': gemma_unit}
         cls.watcher.mem_store = None
         cls.watcher._cgroup_cache = {}
@@ -3038,6 +3049,9 @@ class TestSwitchRoutes(unittest.TestCase):
 
         # Create a stub watcher
         cls.watcher = MagicMock(spec=roundhouse.Watcher)
+        # The real Watcher carries a non-reentrant lock as a dataclass field
+        # (default_factory), which spec= cannot see - locked_snapshot() needs it.
+        cls.watcher.lock = threading.Lock()
         cls.watcher.units = {'qwen3.6-coding.service': qwen_unit, 'llama-server-gemma4.service': gemma_unit}
         cls.watcher.mem_store = None
         cls.watcher._cgroup_cache = {}

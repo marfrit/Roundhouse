@@ -1171,6 +1171,26 @@ def parse_show_blocks(text: str, unit_order: List[str]) -> Dict[str, Dict[str, s
     return result
 
 
+def strategy_note(enabled: bool, rung: str, retired: bool) -> Optional[str]:
+    """Compute the drift note for a unit per G6.
+
+    Args:
+        enabled: UnitFileState == 'enabled'
+        rung: current rung from snapshot
+        retired: unit is retired
+
+    Returns:
+        str note, or None if no note applies
+    """
+    if retired:
+        return None
+    if enabled and rung in ('OFF', 'STANDBY', 'FAILED'):
+        return "returns at boot"
+    if not enabled and rung in ACTIVE_RUNGS:
+        return "manual — will not survive reboot"
+    return None
+
+
 def classify_port_claims(claims: List[Dict]) -> tuple:
     """Classify a port's claim list per §4.4(c). Returns (class, note).
 
@@ -1193,6 +1213,16 @@ def classify_port_claims(claims: List[Dict]) -> tuple:
     return ('latent', None)
 
 
+def locked_snapshot(watcher: 'Watcher') -> Dict:
+    """Take a snapshot under the watcher's lock.
+
+    The only sanctioned way to take a snapshot from an unlocked context; NEVER call
+    while holding the lock (non-reentrant — deadlock).
+    """
+    with watcher.lock:
+        return watcher.snapshot()
+
+
 @dataclass
 class Watcher:
     """State machine for tracking llama-server/llamafile units.
@@ -1212,6 +1242,8 @@ class Watcher:
     # live health of the two sensing sources ("ok" or "down since <epoch>").
     self_port: int = 8090
     sources: Dict[str, str] = field(default_factory=lambda: {'journal': 'ok', 'systemctl': 'ok'})
+    lock: threading.Lock = field(default_factory=threading.Lock)
+    self_unit_file_state: str = ''
 
     def __post_init__(self):
         """Initialize per-unit state."""
@@ -1253,6 +1285,11 @@ class Watcher:
             list of event dicts (empty if no rung changes)
         """
         events = []
+
+        # Pop roundhouse.service props into self_unit_file_state (G8)
+        if 'roundhouse.service' in props:
+            self_props = props.pop('roundhouse.service')
+            self.self_unit_file_state = self_props.get('UnitFileState', '')
 
         for unit_name, unit_props in props.items():
             if unit_name not in self._state:
@@ -1331,6 +1368,20 @@ class Watcher:
                 events.append(self._make_rung_event(unit_name, new_rung))
 
         return events
+
+    def apply_unit_file_state(self, unit_name: str, value: str) -> None:
+        """Set the unit_file_state for a unit without updating sensed_at.
+
+        This method updates ONLY _state[unit]['unit_file_state'] — it MUST NOT stamp
+        sensed_at, as that would launder a stale ActiveState sample as fresh past
+        _confirm_off's freshness gate.
+
+        Args:
+            unit_name: name of the unit
+            value: new UnitFileState value (e.g., 'enabled', 'disabled')
+        """
+        if unit_name in self._state:
+            self._state[unit_name]['unit_file_state'] = value
 
     def apply_journal_line(self, rec: Dict) -> List[Dict]:
         """Apply a journal record line.
@@ -1551,6 +1602,7 @@ class Watcher:
             alias = profile.get('alias', unit_name)
             quant = quant_hint(profile.get('model_path', ''))
 
+            enabled = self._state[unit_name].get('unit_file_state') == 'enabled'
             unit_dict = {
                 'unit': unit_name,
                 'description': unit.description or '',
@@ -1563,7 +1615,7 @@ class Watcher:
                 'badges': self._compute_badges(unit_name, rung),
                 'stale': self._sources_degraded(),
                 'sensed_at': self._state[unit_name]['sensed_at'],
-                'enabled': self._state[unit_name].get('unit_file_state') == 'enabled',
+                'enabled': enabled,
                 'active_state': self._state[unit_name]['active_state'],
                 'sub_state': self._state[unit_name]['sub_state'],
                 'n_restarts': self._state[unit_name]['n_restarts'],
@@ -1575,7 +1627,8 @@ class Watcher:
                 'quant_hint': quant,
                 'ctx': profile.get('ctx'),
                 'mem': mem_info,
-                'port_conflict': None  # filled in below, once every claim is known
+                'port_conflict': None,  # filled in below, once every claim is known
+                'strategy_note': strategy_note(enabled, rung, unit.retired)
             }
 
             units_list.append(unit_dict)
@@ -1606,6 +1659,11 @@ class Watcher:
             },
             'sources': dict(self.sources),
             'self_port': self.self_port,
+            'self_unit': {
+                'unit': 'roundhouse.service',
+                'unit_file_state': self.self_unit_file_state,
+                'enabled': self.self_unit_file_state == 'enabled'
+            },
             'units': units_list
         }
 
@@ -2607,7 +2665,7 @@ class RoundhouseRequestHandler(http.server.BaseHTTPRequestHandler):
             return
 
         # Verify confirm hash matches (F3)
-        fingerprint = fleet_fingerprint(watcher.snapshot())
+        fingerprint = fleet_fingerprint(locked_snapshot(watcher))
         computed_confirm = compute_switch_confirm(target, stops, fingerprint)
         if confirm != computed_confirm:
             self.send_response(409)
@@ -2945,6 +3003,7 @@ def rollout_public_record(rollout: dict) -> dict:
 # Module globals
 ACTUATE_ARMED = False
 ACTUATE_SYSTEMCTL_VERBS = {"stop", "start", "daemon-reload"}
+ENABLEMENT_VERBS = {"enable", "disable"}
 GIT_VERBS = {"version", "rev-parse", "status", "ls-files", "log", "show",
              "diff", "add", "commit", "revert"}
 GIT_MUTATING_VERBS = {"add", "commit", "revert"}
@@ -2953,7 +3012,7 @@ GIT_FORBIDDEN_TOKENS = {"push", "pull", "fetch", "remote", "clone", "init",
 FROZEN_POST_ROUTES = (
     "/api/units/<name>/edit", "/api/units/<name>/rollout",
     "/api/rollouts/<id>/rollback", "/api/rollouts/<id>/dismiss",
-    "/api/switch/preview", "/api/switch",
+    "/api/switch/preview", "/api/switch", "/api/units/<name>/enablement"
 )
 TOKEN_PATH = os.path.expanduser("~/.config/roundhouse/token")
 TOKEN = None
@@ -2990,10 +3049,13 @@ def run_actuate(argv: List[str], units: Dict[str, 'UnitFile'], timeout: float = 
     if not ACTUATE_ARMED:
         raise ActuationError("actuation not armed (--actuate not passed)")
 
-    # Check exact shape
+    # Check exact shape per G2 per-verb table
     if argv == ["systemctl", "--user", "daemon-reload"]:
-        pass  # Valid standalone command
-    elif len(argv) == 5 and argv[0] == "systemctl" and argv[1] == "--user" and argv[2] in ACTUATE_SYSTEMCTL_VERBS and argv[3] == "--":
+        pass  # Valid standalone command (len 3 only)
+    elif len(argv) == 5 and argv[0] == "systemctl" and argv[1] == "--user" and argv[3] == "--":
+        # len 5: stop|start|enable|disable with unit; daemon-reload rejects here
+        if argv[2] not in (ACTUATE_SYSTEMCTL_VERBS | ENABLEMENT_VERBS) or argv[2] == "daemon-reload":
+            raise ActuationError(f"run_actuate: invalid verb {argv[2]}")
         unit = argv[4]
         if unit not in units:
             raise ActuationError(f"{unit} not in selected units")
@@ -3802,7 +3864,7 @@ def preflight_port(unit: UnitFile, edits: List[Edit], watcher: 'Watcher', self_p
 
     # Build list of other claimants
     claimants = []
-    snapshot = watcher.snapshot()
+    snapshot = locked_snapshot(watcher)
 
     for u in snapshot.get('units', []):
         if u['unit'] == unit.name:
@@ -3887,7 +3949,7 @@ def preflight_memory(unit: UnitFile, edits: List[Edit], watcher: 'Watcher',
     # reading it unconditionally credited the budget with memory nobody is holding.
     freed_bytes = 0
     freed_source = 'none (unit not active)'
-    snapshot = watcher.snapshot()
+    snapshot = locked_snapshot(watcher)
     unit_row = None
     for u in snapshot.get('units', []):
         if u['unit'] == unit.name:
@@ -4225,7 +4287,7 @@ class RolloutEngine:
             if rollout:
                 rollout['phase'] = 'failed'
                 rollout['detail'] = text
-                rollout['failure'] = {'reason': reason, 'detail': text}
+                rollout['failure'] = {'reason': reason, 'detail': text, 'phase': phase}
                 if restored:
                     rollout['restored'] = True
                 kind = rollout.get('kind', 'rollout')
@@ -4254,13 +4316,18 @@ class RolloutEngine:
         """Stop a unit."""
         run_actuate(["systemctl", "--user", "stop", "--", unit_name], self.units, timeout=timeout)
 
-    def _start_unit(self, unit_name: str):
+    def _start_unit(self, unit_name: str, timeout: float = START_TIMEOUT_SEC):
         """Start a unit."""
-        run_actuate(["systemctl", "--user", "start", "--", unit_name], self.units)
+        run_actuate(["systemctl", "--user", "start", "--", unit_name], self.units, timeout=timeout)
 
     def _daemon_reload(self):
         """Reload systemd daemon."""
         run_actuate(["systemctl", "--user", "daemon-reload"], self.units)
+
+    def _set_enablement(self, unit_name: str, enable: bool) -> None:
+        """Enable or disable a unit."""
+        verb = "enable" if enable else "disable"
+        run_actuate(["systemctl", "--user", verb, "--", unit_name], self.units)
 
     def _watch_unit(self, rollout_id: str, unit_name: str, rollback_mode: bool = False,
                     prior_start_ts: Optional[float] = None):
@@ -4276,7 +4343,7 @@ class RolloutEngine:
         `rolled_back` / `rollback_failed`, never `done` / a second rollback offer.
         """
         start = time.time()
-        timeout = 900
+        timeout = WATCH_TIMEOUT_SEC
 
         while time.time() - start < timeout:
             rung = None
@@ -4963,7 +5030,7 @@ def switch_preflight(target: str, stops: List[str], watcher: 'Watcher', units: D
     notices = []
 
     # One snapshot for everything (§3.3 one-snapshot rule)
-    snapshot = watcher.snapshot()
+    snapshot = locked_snapshot(watcher)
     cgroup_cache = getattr(watcher, '_cgroup_cache', None) or {}
     mem_store = getattr(watcher, 'mem_store', None)
 
@@ -5296,6 +5363,121 @@ def suggest_stops(target: str, stops: List[str], stop_candidates: List[Dict],
     return suggested
 
 
+# ===== SECTION E PART 4: ENABLEMENT (boot strategy; enable/disable only; slotless; no file writes, no git, no daemon-reload) =====
+
+def enablement_preflight(unit_name: str, enable: bool, snapshot: Dict, units: Dict[str, 'UnitFile'],
+                         self_port: int) -> Dict:
+    """Preflight check for enablement toggle per G3.
+
+    Args:
+        unit_name: name of the unit to enable/disable
+        enable: True to enable, False to disable
+        snapshot: locked snapshot from watcher
+        units: selected units dict
+        self_port: Roundhouse's own port
+
+    Returns:
+        dict shaped {
+            "ok": bool,
+            "checks": [...],
+            "port": int,
+            "claimants": [...]  # only if ok=False and enable=True
+        }
+    """
+    # Find target unit row in snapshot
+    target_row = None
+    for u in snapshot.get('units', []):
+        if u['unit'] == unit_name:
+            target_row = u
+            break
+
+    if not target_row:
+        return {
+            "ok": False,
+            "checks": [{"ok": False, "check": "retired", "detail": f"unit {unit_name} not found"}]
+        }
+
+    # Check 1: RETIRED (both directions)
+    if target_row.get('retired'):
+        return {
+            "ok": False,
+            "checks": [{"ok": False, "check": "retired",
+                       "detail": f"unit is [RETIRED] — structurally excluded from every actuation path"}]
+        }
+
+    # Check 2: Disable always passes
+    if not enable:
+        return {
+            "ok": True,
+            "checks": [{"ok": True, "check": "retired"}]
+        }
+
+    # Check 3: Enable collision preflight (rung-blind, defaults count, gates don't exempt)
+    target_port = target_row.get('port')
+    claimants = []
+
+    # Collect claimants: other rows, not retired, enabled true, same port
+    for u in snapshot.get('units', []):
+        if u['unit'] == unit_name:
+            continue  # Skip self
+        if u.get('retired'):
+            continue  # Skip retired
+        if not u.get('enabled'):
+            continue  # Skip disabled
+        if u.get('port') != target_port:
+            continue  # Skip different port
+
+        # This is a claimant
+        claimant = {
+            'unit': u['unit'],
+            'alias': u.get('alias', u['unit']),
+            'port': u.get('port'),
+            'rung': u.get('rung', 'OFF'),
+            'enabled': True,
+            'gate': u.get('gate')
+        }
+        claimants.append(claimant)
+
+    # Check self_port pseudo-claimant
+    if target_port == self_port:
+        claimants.append({
+            'unit': 'roundhouse (self)',
+            'alias': 'roundhouse (self)',
+            'port': self_port,
+            'rung': None,
+            'enabled': True,
+            'gate': None
+        })
+
+    if claimants:
+        # Format detail string per G3
+        claimant_strs = []
+        for c in claimants:
+            if c['unit'] == 'roundhouse (self)':
+                claimant_strs.append('roundhouse (self)')
+            else:
+                gate_suffix = ', kernel-gated' if c.get('gate') else ''
+                claimant_strs.append(f"{c['unit']} (enabled, {c['rung']}{gate_suffix})")
+
+        detail = f"port {target_port} is already a boot claim of: {', '.join(claimant_strs)}"
+        if target_port == self_port:
+            detail = f"port {target_port} is roundhouse's own port"
+
+        return {
+            "ok": False,
+            "checks": [{"ok": False, "check": "retired", "detail": detail}],
+            "port": target_port,
+            "claimants": claimants
+        }
+
+    return {
+        "ok": True,
+        "checks": [{"ok": True, "check": "retired"}],
+        "port": target_port,
+        "claimants": []
+    }
+
+
 # ===== SECTION D: MAIN / CLI =====
 
 
@@ -5457,7 +5639,7 @@ def cmd_serve(args):
     event_bus = EventBus()
 
     # Shared lock for all apply_* calls
-    watcher_lock = threading.Lock()
+    watcher_lock = watcher.lock
 
     # Shutdown event
     shutdown_event = threading.Event()
@@ -5483,10 +5665,11 @@ def cmd_serve(args):
                 prop_args = ','.join(properties)
 
                 try:
+                    unit_order = selected_unit_names + ['roundhouse.service']
                     output = run_ro([
                         'systemctl', '--user', 'show', '-p', prop_args, '--'
-                    ] + selected_unit_names)
-                    props = parse_show_blocks(output, selected_unit_names)
+                    ] + unit_order)
+                    props = parse_show_blocks(output, unit_order)
                     systemctl_state['down_since'] = None
                     with watcher_lock:
                         watcher.sources['systemctl'] = 'ok'
