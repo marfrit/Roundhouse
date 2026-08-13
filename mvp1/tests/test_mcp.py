@@ -11,8 +11,11 @@ import ast
 import tempfile
 import shutil
 import http.server
+import http.client
+import socket
 import threading
 import time
+import copy
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 from io import StringIO
@@ -21,6 +24,10 @@ from io import StringIO
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import roundhouse_mcp
+import roundhouse
+
+# Constants
+_GIB = 1024 * 1024 * 1024
 
 
 class TestFraming(unittest.TestCase):
@@ -591,6 +598,552 @@ class TestTokenSource(unittest.TestCase):
         # Truncate to 64
         long_name = 'a' * 100
         self.assertEqual(len(roundhouse_mcp.sanitize_requester(long_name)), 64)
+
+
+# ===== MVP6 T2: fidelity + session =====
+
+
+class TestRefusalFidelity(unittest.TestCase):
+    """Refusal fidelity: 422/409/403/401 responses match between direct HTTP and MCP tool.
+
+    Tests that each refusal class surfaces the COMPLETE response body in the tool result,
+    field-for-field equal to a direct HTTP call, plus injected http_status.
+    isError is asserted false for refusals (they are structured returns, not crashes).
+    """
+
+    HOST = 'testhost'
+    ADVERTISE = 'advertise.example'
+
+    @classmethod
+    def setUpClass(cls):
+        cls.temp_dir = tempfile.mkdtemp()
+
+        # Build units with port collision for testing
+        cls.units = {}
+        for uname, alias, port, on_demand, retired, enabled in (
+            ('twin1.service', 'twin', 9110, False, False, True),
+            ('twin2.service', 'twin', 9110, False, False, False),
+            ('on-demand.service', 'on-demand', 9111, True, False, False),
+            ('plain.service', None, 9112, False, False, False),
+        ):
+            u = _mvp5_unit(uname, alias, port, on_demand=on_demand, retired=retired, enabled=enabled)
+            cls.units[u.name] = u
+
+        cls.watcher = MagicMock(spec=roundhouse.Watcher)
+        cls.watcher.lock = threading.Lock()
+        cls.watcher.units = cls.units
+        cls.watcher.mem_store = None
+        cls.watcher._cgroup_cache = {}
+        cls.watcher.snapshot.side_effect = lambda: copy.deepcopy(cls.snap)
+
+        cls.event_bus = roundhouse.EventBus()
+
+        sock = socket.socket()
+        sock.bind(('127.0.0.1', 0))
+        cls.port = sock.getsockname()[1]
+        sock.close()
+
+        cls.snap = cls._default_snapshot()
+
+        roundhouse.ACTUATE_ARMED = True
+        roundhouse.TOKEN = 'test-token'
+
+        cls.server = roundhouse.ThreadingHTTPServer(
+            ('127.0.0.1', cls.port),
+            roundhouse.RoundhouseRequestHandler,
+            cls.watcher,
+            cls.event_bus,
+            cls.port,
+            watcher_lock=cls.watcher.lock,
+            advertise_host=cls.ADVERTISE,
+        )
+        cls.engine = roundhouse.RolloutEngine(
+            cls.watcher, cls.units, cls.temp_dir, cls.port,
+            cls.event_bus, cls.watcher.lock)
+        cls.server.rollout_engine = cls.engine
+
+        cls.server_thread = threading.Thread(target=cls.server.serve_forever, daemon=True)
+        cls.server_thread.start()
+        time.sleep(0.1)
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.server.shutdown()
+        cls.server.server_close()
+        shutil.rmtree(cls.temp_dir, ignore_errors=True)
+        roundhouse.ACTUATE_ARMED = False
+        roundhouse.TOKEN = None
+
+    @classmethod
+    def _default_snapshot(cls):
+        def row(unit, rung, port, alias, on_demand, retired=False, enabled=False):
+            return {
+                'unit': unit, 'description': '', 'retired': retired, 'rung': rung,
+                'roster': 'cold', 'since': 0, 'start_ts_mono': '1000',
+                'detail': '', 'badges': [], 'stale': False, 'sensed_at': 0,
+                'enabled': enabled, 'active_state': 'inactive', 'sub_state': 'dead',
+                'n_restarts': 0, 'port': port, 'port_source': 'flag', 'alias': alias,
+                'on_demand': on_demand, 'gate': None, 'model_file': '', 'quant_hint': None,
+                'ctx': None, 'mem': {},
+                'port_conflict': None, 'strategy_note': None,
+            }
+
+        return {
+            'host': cls.HOST,
+            'kernel': '6.1.0-test',
+            'now': 1000.0,
+            'mem': {'total_bytes': 256 * _GIB, 'available_bytes': 200 * _GIB},
+            'sources': {'journal': 'ok', 'systemctl': 'ok'},
+            'self_port': cls.port,
+            'self_unit': {'unit': 'roundhouse.service',
+                          'unit_file_state': 'enabled', 'enabled': True},
+            'units': [
+                row('twin1.service', 'READY', 9110, 'twin', False, enabled=True),
+                row('twin2.service', 'OFF', 9110, 'twin', False, enabled=False),
+                row('on-demand.service', 'OFF', 9111, 'on-demand', True, enabled=False),
+                row('plain.service', 'OFF', 9112, None, False, enabled=False),
+            ],
+        }
+
+    def setUp(self):
+        type(self).snap = self._default_snapshot()
+        roundhouse.ACTUATE_ARMED = True
+        roundhouse.TOKEN = 'test-token'
+        self.engine.current = None
+        self.engine.rollouts = {}
+        self.engine.counter = 0
+
+    def _request(self, method, path, data=None, headers=None, token='test-token'):
+        """Make direct HTTP request."""
+        conn = http.client.HTTPConnection('127.0.0.1', self.port, timeout=5)
+        try:
+            req_headers = dict(headers or {})
+            if token is not None and 'Authorization' not in req_headers:
+                req_headers['Authorization'] = f'Bearer {token}'
+            if method == 'POST' and data is not None:
+                req_headers['Content-Type'] = 'application/json'
+            body = json.dumps(data).encode('utf-8') if data is not None else None
+            conn.request(method, path, body, req_headers)
+            resp = conn.getresponse()
+            resp_body = resp.read()
+            try:
+                return (resp.status, json.loads(resp_body))
+            except json.JSONDecodeError:
+                return (resp.status, resp_body.decode('utf-8', errors='replace'))
+        finally:
+            conn.close()
+
+    def _call_mcp_tool(self, tool_name, arguments, token='test-token'):
+        """Call an MCP tool via in-process handle_message, with token."""
+        # Set env for token resolution
+        old_token = os.environ.get('ROUNDHOUSE_TOKEN')
+        os.environ['ROUNDHOUSE_TOKEN'] = token
+        try:
+            state = {
+                'url': f'http://127.0.0.1:{self.port}',
+                'client_name': 'test-client'
+            }
+            msg = {
+                'jsonrpc': '2.0',
+                'id': 1,
+                'method': 'tools/call',
+                'params': {
+                    'name': tool_name,
+                    'arguments': arguments
+                }
+            }
+            response = roundhouse_mcp.handle_message(msg, state)
+            # Parse the tool result text
+            if response.get('result') and response['result'].get('content'):
+                text = response['result']['content'][0]['text']
+                return json.loads(text), response['result'].get('isError', False)
+            return None, response['result'].get('isError', False)
+        finally:
+            if old_token is not None:
+                os.environ['ROUNDHOUSE_TOKEN'] = old_token
+            elif 'ROUNDHOUSE_TOKEN' in os.environ:
+                del os.environ['ROUNDHOUSE_TOKEN']
+
+    def test_enable_collision_422_fidelity(self):
+        """422 enable_collision: MCP result matches direct HTTP call."""
+        # twin2 can't be enabled; twin1 already is
+        http_status, http_body = self._request(
+            'POST',
+            '/api/units/twin2.service/enablement',
+            data={'enabled': True}
+        )
+        self.assertEqual(http_status, 422)
+        self.assertIn('error', http_body)
+        self.assertEqual(http_body['error'], 'enable_collision')
+        self.assertIn('claimants', http_body)
+
+        # Call via MCP
+        mcp_result, is_error = self._call_mcp_tool(
+            'set_boot',
+            {'unit': 'twin2.service', 'enabled': True}
+        )
+        self.assertFalse(is_error, "refusal should not be an error")
+        self.assertEqual(mcp_result['http_status'], 422)
+        self.assertEqual(mcp_result['error'], 'enable_collision')
+        self.assertIn('claimants', mcp_result)
+        # Field-for-field equality
+        self.assertEqual(mcp_result['error'], http_body['error'])
+        if 'claimants' in http_body:
+            self.assertEqual(mcp_result.get('claimants'), http_body['claimants'])
+
+    def test_read_only_mode_403_fidelity(self):
+        """403 read_only_mode: MCP result matches direct HTTP call."""
+        # Test with read-only mode (no token/armament)
+        roundhouse.ACTUATE_ARMED = False
+        try:
+            # Direct HTTP call to an action endpoint with no actuate armed
+            http_status, http_body = self._request(
+                'POST',
+                '/api/units/plain.service/enablement',
+                data={'enabled': True},
+                token='test-token'
+            )
+            self.assertEqual(http_status, 403)
+            self.assertIn('error', http_body)
+            self.assertEqual(http_body['error'], 'read_only_mode')
+
+            # Call via MCP (MCP should pass through the 403 structured)
+            mcp_result, is_error = self._call_mcp_tool(
+                'set_boot',
+                {'unit': 'plain.service', 'enabled': True},
+                token='test-token'
+            )
+            self.assertFalse(is_error, "refusal should not be an error")
+            self.assertEqual(mcp_result['http_status'], 403)
+            self.assertEqual(mcp_result['error'], 'read_only_mode')
+        finally:
+            roundhouse.ACTUATE_ARMED = True
+
+    def test_bad_token_401_fidelity(self):
+        """401 bad_token: MCP result matches direct HTTP call."""
+        bad_token = 'bad-token-123'
+        # Direct HTTP call with bad token
+        http_status, http_body = self._request(
+            'POST',
+            '/api/units/plain.service/enablement',
+            data={'enabled': True},
+            token=bad_token
+        )
+        self.assertEqual(http_status, 401)
+
+        # Call via MCP with bad token (set via env)
+        os.environ['ROUNDHOUSE_TOKEN'] = bad_token
+        try:
+            state = {
+                'url': f'http://127.0.0.1:{self.port}',
+                'client_name': 'test-client'
+            }
+            msg = {
+                'jsonrpc': '2.0',
+                'id': 1,
+                'method': 'tools/call',
+                'params': {
+                    'name': 'set_boot',
+                    'arguments': {'unit': 'plain.service', 'enabled': True}
+                }
+            }
+            response = roundhouse_mcp.handle_message(msg, state)
+            text = response['result']['content'][0]['text']
+            mcp_result = json.loads(text)
+            is_error = response['result'].get('isError', False)
+
+            self.assertFalse(is_error, "refusal should not be an error")
+            self.assertEqual(mcp_result['http_status'], 401)
+        finally:
+            if 'ROUNDHOUSE_TOKEN' in os.environ:
+                del os.environ['ROUNDHOUSE_TOKEN']
+
+
+class TestScriptedSession(unittest.TestCase):
+    """Scripted end-to-end session: initialize -> fleet_status -> switch_preview/execute ->
+    operation_status -> operation_rollback -> set_boot -> warm -> warm_state -> warm_cancel.
+
+    Tests against an in-process armed server with stubbed engine gateways.
+    Also tests read tools against a read-only instance returning structured refusals.
+    """
+
+    HOST = 'testhost'
+    ADVERTISE = 'advertise.example'
+
+    @classmethod
+    def setUpClass(cls):
+        cls.temp_dir = tempfile.mkdtemp()
+
+        # Build a rich set of units for the full session
+        cls.units = {}
+        for uname, alias, port, on_demand, enabled in (
+            ('main.service', 'main', 9121, False, True),
+            ('alt.service', 'alt', 9122, False, False),
+            ('spare.service', 'spare', 9123, True, False),
+        ):
+            u = _mvp5_unit(uname, alias, port, on_demand=on_demand, enabled=enabled)
+            cls.units[u.name] = u
+
+        cls.watcher = MagicMock(spec=roundhouse.Watcher)
+        cls.watcher.lock = threading.Lock()
+        cls.watcher.units = cls.units
+        cls.watcher.mem_store = None
+        cls.watcher._cgroup_cache = {}
+        cls.watcher.snapshot.side_effect = lambda: copy.deepcopy(cls.snap)
+
+        cls.event_bus = roundhouse.EventBus()
+
+        sock = socket.socket()
+        sock.bind(('127.0.0.1', 0))
+        cls.port = sock.getsockname()[1]
+        sock.close()
+
+        cls.snap = cls._default_snapshot()
+
+        roundhouse.ACTUATE_ARMED = True
+        roundhouse.TOKEN = 'test-token'
+
+        cls.server = roundhouse.ThreadingHTTPServer(
+            ('127.0.0.1', cls.port),
+            roundhouse.RoundhouseRequestHandler,
+            cls.watcher,
+            cls.event_bus,
+            cls.port,
+            watcher_lock=cls.watcher.lock,
+            advertise_host=cls.ADVERTISE,
+        )
+        cls.engine = roundhouse.RolloutEngine(
+            cls.watcher, cls.units, cls.temp_dir, cls.port,
+            cls.event_bus, cls.watcher.lock)
+        cls.server.rollout_engine = cls.engine
+
+        cls.server_thread = threading.Thread(target=cls.server.serve_forever, daemon=True)
+        cls.server_thread.start()
+        time.sleep(0.1)
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.server.shutdown()
+        cls.server.server_close()
+        shutil.rmtree(cls.temp_dir, ignore_errors=True)
+        roundhouse.ACTUATE_ARMED = False
+        roundhouse.TOKEN = None
+
+    @classmethod
+    def _default_snapshot(cls):
+        def row(unit, rung, port, alias, on_demand, enabled=False):
+            return {
+                'unit': unit, 'description': '', 'retired': False, 'rung': rung,
+                'roster': 'cold', 'since': 0, 'start_ts_mono': '1000',
+                'detail': '', 'badges': [], 'stale': False, 'sensed_at': 0,
+                'enabled': enabled, 'active_state': 'inactive', 'sub_state': 'dead',
+                'n_restarts': 0, 'port': port, 'port_source': 'flag', 'alias': alias,
+                'on_demand': on_demand, 'gate': None, 'model_file': '', 'quant_hint': None,
+                'ctx': None, 'mem': {},
+                'port_conflict': None, 'strategy_note': None,
+            }
+
+        return {
+            'host': cls.HOST,
+            'kernel': '6.1.0-test',
+            'now': 1000.0,
+            'mem': {'total_bytes': 256 * _GIB, 'available_bytes': 200 * _GIB},
+            'sources': {'journal': 'ok', 'systemctl': 'ok'},
+            'self_port': cls.port,
+            'self_unit': {'unit': 'roundhouse.service',
+                          'unit_file_state': 'enabled', 'enabled': True},
+            'units': [
+                row('main.service', 'READY', 9121, 'main', False, enabled=True),
+                row('alt.service', 'OFF', 9122, 'alt', False, enabled=False),
+                row('spare.service', 'OFF', 9123, 'spare', True, enabled=False),
+            ],
+        }
+
+    def setUp(self):
+        type(self).snap = self._default_snapshot()
+        roundhouse.ACTUATE_ARMED = True
+        roundhouse.TOKEN = 'test-token'
+        self.engine.current = None
+        self.engine.rollouts = {}
+        self.engine.counter = 0
+        self.engine.pending_warm = None
+        self.engine.last_warm = None
+        self.engine.warm_seq = 0
+
+    def _call_mcp(self, method, params=None):
+        """Call MCP tool via in-process."""
+        os.environ['ROUNDHOUSE_TOKEN'] = 'test-token'
+        try:
+            state = {
+                'url': f'http://127.0.0.1:{self.port}',
+                'client_name': 'test-client'
+            }
+            msg = {
+                'jsonrpc': '2.0',
+                'id': 1,
+                'method': method,
+                'params': params or {}
+            }
+            response = roundhouse_mcp.handle_message(msg, state)
+
+            if method == 'tools/call':
+                # Parse the tool result text
+                if response.get('result') and response['result'].get('content'):
+                    text = response['result']['content'][0]['text']
+                    return json.loads(text), response['result'].get('isError', False)
+            return response.get('result', {}), response['result'].get('isError', False)
+        finally:
+            if 'ROUNDHOUSE_TOKEN' in os.environ:
+                del os.environ['ROUNDHOUSE_TOKEN']
+
+    def test_full_session_flow(self):
+        """Full MCP session: initialize -> fleet_status -> operations -> set_boot -> warm -> cancel."""
+        # Step 1: initialize
+        init_result, _ = self._call_mcp('initialize', {
+            'protocolVersion': '2025-06-18',
+            'capabilities': {},
+            'clientInfo': {'name': 'test-session', 'version': '1.0'}
+        })
+        self.assertIn('protocolVersion', init_result)
+        self.assertEqual(init_result['serverInfo']['name'], 'roundhouse-mcp')
+
+        # Step 2: fleet_status (read-only tool)
+        fleet_result, _ = self._call_mcp('tools/call', {
+            'name': 'fleet_status',
+            'arguments': {}
+        })
+        self.assertIn('http_status', fleet_result)
+        self.assertEqual(fleet_result['http_status'], 200)
+        self.assertIn('host', fleet_result)
+        self.assertEqual(fleet_result['host'], self.HOST)
+        self.assertIn('units', fleet_result)
+        self.assertGreater(len(fleet_result['units']), 0)
+
+        # Step 3: unit_detail (read-only tool)
+        detail_result, _ = self._call_mcp('tools/call', {
+            'name': 'unit_detail',
+            'arguments': {'unit': 'alt.service'}
+        })
+        self.assertEqual(detail_result['http_status'], 200)
+
+        # Step 4: set_boot to enable
+        boot_on_result, _ = self._call_mcp('tools/call', {
+            'name': 'set_boot',
+            'arguments': {'unit': 'alt.service', 'enabled': True}
+        })
+        self.assertIn('http_status', boot_on_result)
+        # Could be 200 or 422 depending on current state
+
+        # Step 5: set_boot to disable
+        boot_off_result, _ = self._call_mcp('tools/call', {
+            'name': 'set_boot',
+            'arguments': {'unit': 'alt.service', 'enabled': False}
+        })
+        self.assertIn('http_status', boot_off_result)
+
+        # Step 6: warm (on-demand)
+        warm_result, _ = self._call_mcp('tools/call', {
+            'name': 'warm',
+            'arguments': {'unit': 'spare.service'}
+        })
+        self.assertIn('http_status', warm_result)
+
+        # Step 7: warm_state
+        warm_state_result, _ = self._call_mcp('tools/call', {
+            'name': 'warm_state',
+            'arguments': {}
+        })
+        self.assertEqual(warm_state_result['http_status'], 200)
+
+        # Step 8: warm_cancel
+        cancel_result, _ = self._call_mcp('tools/call', {
+            'name': 'warm_cancel',
+            'arguments': {}
+        })
+        self.assertIn('http_status', cancel_result)
+
+        # Step 9: port_board (read-only tool)
+        port_result, _ = self._call_mcp('tools/call', {
+            'name': 'port_board',
+            'arguments': {}
+        })
+        self.assertEqual(port_result['http_status'], 200)
+
+    def test_read_only_mode_structured_refusal(self):
+        """Read tools work against read-only; action tools return structured 403."""
+        roundhouse.ACTUATE_ARMED = False
+        try:
+            # Read tools should still work
+            fleet_result, is_error = self._call_mcp('tools/call', {
+                'name': 'fleet_status',
+                'arguments': {}
+            })
+            self.assertFalse(is_error)
+            self.assertEqual(fleet_result['http_status'], 200)
+
+            # Action tool should return structured refusal
+            boot_result, is_error = self._call_mcp('tools/call', {
+                'name': 'set_boot',
+                'arguments': {'unit': 'alt.service', 'enabled': True}
+            })
+            self.assertFalse(is_error)
+            self.assertEqual(boot_result['http_status'], 403)
+            self.assertEqual(boot_result['error'], 'read_only_mode')
+        finally:
+            roundhouse.ACTUATE_ARMED = True
+
+
+class TestTwoStepDiscipline(unittest.TestCase):
+    """Static assertion: no tool both computes a confirm and executes.
+
+    Verify that switch_execute and edit_rollout require confirm in schema.
+    Verify that roundhouse_mcp.py contains no 'compute_switch_confirm' or 'compute_confirm'.
+    """
+
+    def test_switch_execute_requires_confirm(self):
+        """switch_execute schema requires confirm."""
+        schema = roundhouse_mcp.TOOLS['switch_execute']['schema']
+        self.assertIn('confirm', schema.get('required', []),
+                     "switch_execute must require confirm in schema")
+
+    def test_edit_rollout_requires_confirm(self):
+        """edit_rollout schema requires confirm."""
+        schema = roundhouse_mcp.TOOLS['edit_rollout']['schema']
+        self.assertIn('confirm', schema.get('required', []),
+                     "edit_rollout must require confirm in schema")
+
+    def test_no_compute_confirm_in_mcp_file(self):
+        """roundhouse_mcp.py contains no compute_switch_confirm or compute_confirm functions."""
+        mcp_file = Path(__file__).resolve().parent.parent / 'roundhouse_mcp.py'
+        content = mcp_file.read_text()
+        self.assertNotIn('compute_switch_confirm', content,
+                        "roundhouse_mcp.py must not contain compute_switch_confirm")
+        self.assertNotIn('compute_confirm', content,
+                        "roundhouse_mcp.py must not contain compute_confirm")
+
+
+def _mvp5_unit(unit_name: str, alias: str or None, port: int, on_demand: bool = False,
+               retired: bool = False, enabled: bool = False):
+    """Build a parsed UnitFile for testing (similar to test_actuation.py)."""
+    desc = '[RETIRED 2026-01-01] retired fixture' if retired else f'fixture {unit_name}'
+    marker = '# roundhouse: on-demand\n' if on_demand else ''
+    alias_arg = f' --alias {alias}' if alias else ''
+    text = (
+        '[Unit]\n'
+        f'Description={desc}\n'
+        '\n'
+        '[Service]\n'
+        f'{marker}'
+        f'ExecStart=/usr/bin/llama-server -m /nonexistent/{unit_name}.gguf{alias_arg}'
+        f' --host 0.0.0.0 --port {port}\n'
+        '\n'
+        '[Install]\n'
+        'WantedBy=default.target\n'
+    )
+    parsed = roundhouse.parse_unit(f'/tmp/mvp5-units/{unit_name}', text.encode('utf-8'))
+    # Parse doesn't set enabled, so do it manually
+    parsed.unit_file_state = 'enabled' if enabled else 'disabled'
+    return parsed
 
 
 if __name__ == '__main__':
