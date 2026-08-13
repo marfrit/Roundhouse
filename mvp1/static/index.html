@@ -670,11 +670,13 @@
             color: var(--fg);
         }
 
-        body.overlay-open {
-            overflow: hidden;
-        }
-
         @media (max-width: 700px) {
+            /* Scroll lock only where overlays are full-screen. On desktop the
+               detail pane is in-flow at the bottom of the page — locking body
+               scroll there makes it unreachable (review SF1). */
+            body.overlay-open {
+                overflow: hidden;
+            }
             .header {
                 position: sticky;
                 top: 0;
@@ -1913,9 +1915,9 @@
             const freed = (fit.freed_bytes || 0) / 1e9;
             const headroom = (fit.headroom_bytes || 0) / 1e9;
             const budget = (fit.budget_bytes || 0) / 1e9;
-            fitText.textContent = 'estimate ' + estimate.toFixed(1) + ' GiB (' + fit.estimate_source + ') vs ' +
-                'available ' + available.toFixed(1) + ' GiB + freed ' + freed.toFixed(1) + ' GiB - headroom ' + headroom.toFixed(1) + ' GiB = ' +
-                budget.toFixed(1) + ' GiB budget ' + (fit.ok ? '✓' : '✗');
+            fitText.textContent = 'estimate ' + estimate.toFixed(1) + ' GB (' + fit.estimate_source + ') + headroom ' + headroom.toFixed(1) + ' GB vs ' +
+                'available ' + available.toFixed(1) + ' GB + freed ' + freed.toFixed(1) + ' GB = ' +
+                budget.toFixed(1) + ' GB budget ' + (fit.ok ? '✓' : '✗');
             fitLine.appendChild(fitText);
 
             if (!fit.ok && suggested.length > 0) {
@@ -1939,7 +1941,7 @@
                     const blockerDiv = document.createElement('div');
                     blockerDiv.style.color = 'var(--red)';
                     blockerDiv.style.fontSize = '0.9em';
-                    blockerDiv.textContent = '✗ ' + blocker;
+                    blockerDiv.textContent = '✗ ' + (blocker.detail || blocker.unit || blocker);
                     portLine.appendChild(blockerDiv);
                 }
             }
@@ -1949,7 +1951,7 @@
                     const noticeDiv = document.createElement('div');
                     noticeDiv.style.color = 'var(--amber)';
                     noticeDiv.style.fontSize = '0.9em';
-                    noticeDiv.textContent = '⚠ ' + notice;
+                    noticeDiv.textContent = '⚠ ' + (notice.detail || notice.unit || notice);
                     portLine.appendChild(noticeDiv);
                 }
             }
