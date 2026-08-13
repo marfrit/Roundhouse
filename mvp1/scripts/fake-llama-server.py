@@ -4,7 +4,6 @@
 import sys
 import time
 import os
-import argparse
 from datetime import datetime
 
 def log_line(level, tag, msg):
@@ -12,17 +11,33 @@ def log_line(level, tag, msg):
     ts = datetime.now().strftime('%H:%M:%S')
     print(f"{ts} {level} {tag:<8} {msg}", flush=True)
 
-def main():
-    # Parse args, ignoring unknown ones
-    parser = argparse.ArgumentParser(add_help=False)
-    parser.add_argument('-m', '--model', type=str, default='unknown')
-    parser.add_argument('-c', '--ctx-size', type=int, default=None)
-    parser.add_argument('--port', type=int, default=8080)
-    args, _ = parser.parse_known_args()
+def arg_value(argv, *names):
+    """Exact-token flag lookup, the way llama-server itself reads argv.
 
-    model = args.model
-    port = args.port
-    ctx = args.ctx_size
+    argparse must NOT be used here: with `-c` registered it binds `-ctk q8_0` as
+    `-c tk` (short-option clustering) and every fixture unit that carries a KV cache
+    type dies with 'invalid int value'. Exact token matching is the whole point.
+    """
+    for i, tok in enumerate(argv):
+        if tok in names and i + 1 < len(argv):
+            return argv[i + 1]
+    return None
+
+def main():
+    argv = sys.argv[1:]
+
+    model = arg_value(argv, '-m', '--model') or 'unknown'
+    port_text = arg_value(argv, '--port')
+    ctx_text = arg_value(argv, '-c', '--ctx-size')
+
+    try:
+        port = int(port_text) if port_text is not None else 8080
+    except ValueError:
+        port = 8080
+    try:
+        ctx = int(ctx_text) if ctx_text is not None else None
+    except ValueError:
+        ctx = None
 
     # Check env for test scenarios
     exit_1 = os.environ.get('FAKE_EXIT_1') == '1'

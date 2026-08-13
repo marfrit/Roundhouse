@@ -10,6 +10,8 @@ set -euo pipefail
 
 UNIT_DIR="${1:-$HOME/.config/systemd/user}"
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+# Roundhouse's own port joins the declared-port board, so pick one no unit declares.
+PORT="${2:-8099}"
 
 echo "=========================================="
 echo "Roundhouse MVP2 Rollout Drill"
@@ -39,8 +41,12 @@ echo "Phase 1: Capture pre-state"
 echo "=========================================="
 echo
 
-pre_qwen_active=$(systemctl --user is-active qwen3.6-coding.service || echo "unknown")
-pre_gemma_active=$(systemctl --user is-active llama-server-gemma4.service || echo "unknown")
+# `systemctl is-active` PRINTS the state and EXITS non-zero for anything but active, so
+# `|| echo unknown` appends a second line to the captured value instead of replacing it.
+pre_qwen_active=$(systemctl --user is-active qwen3.6-coding.service 2>/dev/null) || true
+pre_gemma_active=$(systemctl --user is-active llama-server-gemma4.service 2>/dev/null) || true
+pre_qwen_active=${pre_qwen_active:-unknown}
+pre_gemma_active=${pre_gemma_active:-unknown}
 
 echo "Pre-state:"
 echo "  qwen3.6-coding: $pre_qwen_active"
@@ -67,9 +73,9 @@ fi
 echo "Phase 3: Start Roundhouse with --actuate"
 echo "=========================================="
 echo
-echo "In another terminal, start Roundhouse on port 8091:"
+echo "In another terminal, start Roundhouse on port $PORT:"
 echo
-echo "  python3 $REPO/mvp1/roundhouse.py --serve --actuate --port 8091 --unit-dir $UNIT_DIR"
+echo "  python3 $REPO/mvp1/roundhouse.py --serve --actuate --port $PORT --unit-dir $UNIT_DIR"
 echo
 echo "Then find your token:"
 echo "  cat ~/.config/roundhouse/token"
@@ -80,7 +86,7 @@ echo
 echo "Phase 4: Open the UI and perform the rollout"
 echo "=========================================="
 echo
-echo "1. Open http://localhost:8091/ in your browser"
+echo "1. Open http://localhost:$PORT/ in your browser"
 echo "2. You should see [ACTUATE] badge in the header"
 echo "3. Paste your token into the token field"
 echo "4. Click on llama-server-gemma4 unit row to open detail pane"
@@ -113,8 +119,10 @@ echo "=========================================="
 echo
 
 # Verify final state
-post_qwen_active=$(systemctl --user is-active qwen3.6-coding.service || echo "unknown")
-post_gemma_active=$(systemctl --user is-active llama-server-gemma4.service || echo "unknown")
+post_qwen_active=$(systemctl --user is-active qwen3.6-coding.service 2>/dev/null) || true
+post_gemma_active=$(systemctl --user is-active llama-server-gemma4.service 2>/dev/null) || true
+post_qwen_active=${post_qwen_active:-unknown}
+post_gemma_active=${post_gemma_active:-unknown}
 
 echo "Post-state:"
 echo "  qwen3.6-coding: $post_qwen_active"
@@ -133,7 +141,10 @@ else
 fi
 
 # Verify qwen3.6-coding is READY via API
-if curl -s http://localhost:8091/api/units/qwen3.6-coding.service | grep -q '"rung":"READY"'; then
+# NOTE: the API is json.dumps-formatted ("rung": "READY" — with a space), so the
+# pattern must tolerate it; a space-less pattern silently never matches and this
+# check reports a healthy fleet as broken.
+if curl -s "http://localhost:$PORT/api/units/qwen3.6-coding.service" | grep -qE '"rung": *"READY"'; then
     echo "✓ qwen3.6-coding is READY via API"
 else
     echo "✗ qwen3.6-coding is not READY via API"

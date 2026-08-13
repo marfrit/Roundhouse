@@ -2052,6 +2052,9 @@ class RoundhouseRequestHandler(http.server.BaseHTTPRequestHandler):
             self.serve_mem()
         elif route == '/api/events':
             self.serve_events()
+        elif route.startswith('/api/rollouts/'):
+            rollout_id = urllib.parse.unquote(route[len('/api/rollouts/'):])
+            self.serve_rollout(rollout_id)
         else:
             self.error_404()
 
@@ -2078,7 +2081,8 @@ class RoundhouseRequestHandler(http.server.BaseHTTPRequestHandler):
             route == '/api/ports' or
             route == '/api/deployments' or
             route == '/api/mem' or
-            route == '/api/events'
+            route == '/api/events' or
+            route.startswith('/api/rollouts/')   # GET-only unless /rollback|/dismiss
         )
 
         # If it's not a POST route but is a known GET route, return 405 immediately
@@ -2215,6 +2219,19 @@ class RoundhouseRequestHandler(http.server.BaseHTTPRequestHandler):
             return
 
         unit = watcher.units[unit_name]
+
+        # [RETIRED] is a structural exclusion (§9.5): it must answer 422 here, before the
+        # staleness check, or a fabricated `confirm` masks it as 409 preview_stale.
+        retired_check = preflight_retired(unit)
+        if not retired_check['ok']:
+            self.send_response(422)
+            self.send_header('Content-Type', 'application/json; charset=utf-8')
+            self.end_headers()
+            self.wfile.write(json.dumps({
+                'error': 'preflight_failed',
+                'checks': [retired_check],
+            }).encode('utf-8'))
+            return
 
         # Plan edits
         try:
@@ -2444,6 +2461,22 @@ class RoundhouseRequestHandler(http.server.BaseHTTPRequestHandler):
 
         self.send_json({'host': host, 'deployments': deployments})
 
+    def serve_rollout(self, rollout_id: str):
+        """Serve GET /api/rollouts/<id> (§6): the rollout record, or 404.
+
+        Read route, so unauthenticated like every other GET. `/rollback` and `/dismiss`
+        are POST-only and never reach here (do_GET routes the whole suffix as an id).
+        """
+        if rollout_id.endswith('/rollback') or rollout_id.endswith('/dismiss'):
+            self.error_405()          # POST-only routes (§6 status doctrine)
+            return
+        engine = getattr(self.server, 'rollout_engine', None)
+        rollout = engine.rollouts.get(rollout_id) if engine else None
+        if not rollout:
+            self.send_json_error(404, 'not_found', f'no rollout {rollout_id}')
+            return
+        self.send_json(rollout_public_record(rollout))
+
     def serve_mem(self):
         """Serve /api/mem: measured peak rows (§6 schema) plus the current per-unit
         number the UI shows, so a caller can tell measurement from estimate."""
@@ -2546,27 +2579,35 @@ class ThreadingHTTPServer(http.server.ThreadingHTTPServer):
             snapshot = self.watcher.snapshot()
             snapshot['mode'] = 'actuate' if ACTUATE_ARMED else 'read-only'
             if self.rollout_engine and self.rollout_engine.current:
-                rollout = self.rollout_engine.current
-                snapshot['rollout'] = {
-                    'rollout_id': rollout['rollout_id'],
-                    'unit': rollout['unit'],
-                    'phase': rollout['phase'],
-                    'detail': rollout['detail'],
-                    'edits': rollout['edits'],
-                    'was_active': rollout['was_active'],
-                    'commit': rollout['commit'],
-                    'restored': rollout['restored'],
-                    'failure': rollout['failure'],
-                    'rollback': rollout['rollback'],
-                    'started_at': rollout['started_at'],
-                    'updated_at': rollout['updated_at']
-                }
+                snapshot['rollout'] = rollout_public_record(self.rollout_engine.current)
             else:
                 snapshot['rollout'] = None
             return snapshot
 
 
 # ===== SECTION E: ACTUATION (armed only by --actuate; run_actuate + run_git are the only mutation gateways) =====
+
+def rollout_public_record(rollout: dict) -> dict:
+    """The §4.3 wire shape of a rollout record.
+
+    One implementation for both consumers (snapshot merge and GET /api/rollouts/<id>) so
+    they cannot drift; `old_raw` (the in-memory pre-edit bytes) is never serialized.
+    """
+    return {
+        'rollout_id': rollout['rollout_id'],
+        'unit': rollout['unit'],
+        'phase': rollout['phase'],
+        'detail': rollout['detail'],
+        'edits': rollout['edits'],
+        'was_active': rollout['was_active'],
+        'commit': rollout['commit'],
+        'restored': rollout['restored'],
+        'failure': rollout['failure'],
+        'rollback': rollout['rollback'],
+        'started_at': rollout['started_at'],
+        'updated_at': rollout['updated_at'],
+    }
+
 
 # Module globals
 ACTUATE_ARMED = False
@@ -2646,8 +2687,13 @@ def run_git(args: List[str], unit_dir: str, timeout: float = 30, bootstrap: bool
             if not ((len(args) == 3 and args[1:3] == ["--no-edit", args[2]]) or args == ["revert", "--abort"]):
                 raise ActuationError(f"git revert must be ['revert', '--no-edit', sha] or ['revert', '--abort'], got {args}")
 
-    # Build command
-    cmd = ["git", "-C", unit_dir] + args
+    # Build command. `git version` answers "is git on PATH?" and must not depend on the
+    # unit dir existing — with -C a missing/!dir unit_dir makes git exit 128, which the
+    # startup check would misread as "git is not installed" (§2.4 step 1 vs step 2).
+    if args == ["version"]:
+        cmd = ["git", "version"]
+    else:
+        cmd = ["git", "-C", unit_dir] + args
 
     # Set author env for mutating verbs
     env = os.environ.copy()
@@ -2663,8 +2709,11 @@ def run_git(args: List[str], unit_dir: str, timeout: float = 30, bootstrap: bool
         return result
     except subprocess.TimeoutExpired:
         raise ActuationError(f"git {args[0]} timeout after {timeout}s")
+    except FileNotFoundError:
+        # git binary absent from PATH (E11): a gateway-level refusal, never a traceback.
+        raise ActuationError("git not found on PATH")
 
-def git_startup_check(unit_dir: str):
+def git_startup_check(unit_dir: str, unit_names: Optional[List[str]] = None):
     """Check git is available and repo is valid. Raises ActuationError on failure."""
     # Check git --version (bootstrap mode)
     try:
@@ -2679,12 +2728,12 @@ def git_startup_check(unit_dir: str):
     # Check repo present
     result = run_git(["rev-parse", "--show-toplevel"], unit_dir, bootstrap=True)
     if result.returncode != 0:
-        print_git_init_instructions(unit_dir)
+        print_git_init_instructions(unit_dir, unit_names)
         sys.exit(2)
 
     repo_root = result.stdout.strip()
     if os.path.realpath(repo_root) != os.path.realpath(unit_dir):
-        print_git_init_instructions(unit_dir)
+        print_git_init_instructions(unit_dir, unit_names)
         sys.exit(2)
 
     # Check worktree clean
@@ -2700,15 +2749,35 @@ Then run:  systemctl --user daemon-reload
 Relaunch with --actuate when the worktree is clean.""", file=sys.stderr)
         sys.exit(2)
 
-def print_git_init_instructions(unit_dir: str):
-    """Print the git init instructions message."""
-    # Get the selected unit filenames
-    units = []
-    if os.path.isdir(unit_dir):
-        for f in os.listdir(unit_dir):
-            if f.endswith('.service'):
-                units.append(f)
-    units.sort()
+    # Step 4: warn (never fail) about a missing/incomplete .gitignore (E3).
+    gitignore = os.path.join(unit_dir, '.gitignore')
+    try:
+        with open(gitignore, 'r') as f:
+            ignore_text = f.read()
+    except OSError:
+        ignore_text = None
+    if ignore_text is None:
+        print(f"warning: {gitignore} is missing; add '*.bak*' and '*.roundhouse-tmp' to it",
+              file=sys.stderr)
+    elif '*.bak*' not in ignore_text:
+        print(f"warning: {gitignore} does not cover '*.bak*'", file=sys.stderr)
+
+def print_git_init_instructions(unit_dir: str, unit_names: Optional[List[str]] = None):
+    """Print the git init instructions message.
+
+    `unit_names` is the SELECTED unit set (E3: scoped tracking, never `git add -A`).
+    Falling back to every .service file in the dir would tell the operator to commit
+    100+ unrelated desktop units on a real host.
+    """
+    if unit_names is not None:
+        units = sorted(unit_names)
+    else:
+        units = []
+        if os.path.isdir(unit_dir):
+            for f in os.listdir(unit_dir):
+                if f.endswith('.service'):
+                    units.append(f)
+        units.sort()
 
     unit_names = " ".join(units) if units else "<unit1>.service <unit2>.service ... <unitN>.service"
 
@@ -2833,7 +2902,14 @@ def plan_edits(unit: UnitFile, changes: Dict[str, str]) -> List[Edit]:
             if 'value' not in span_info:
                 raise EditError("field_not_editable", f"field {key} has no value span")
             value_span = span_info['value']
-            flag_text = key
+            # E12/§3.1: Edit.flag is the flag AS WRITTEN (`-c`), because commit_message
+            # uses the flag spelling while provenance_line uses the canonical field name.
+            # `key` here is the canonical name, so read the flag back from its own span.
+            flag_span = span_info.get('flag')
+            if flag_span:
+                flag_text = unit.raw[flag_span[0]:flag_span[1]].decode('utf-8', errors='replace')
+            else:
+                flag_text = key
         else:
             # Unknown field
             if not key.startswith("unknown:"):
@@ -3152,15 +3228,16 @@ def preflight_memory(unit: UnitFile, edits: List[Edit], watcher: 'Watcher',
     new_profile = dict(old_profile)
 
     for edit in edits:
-        if edit.field in old_profile:
+        # §5: the estimate runs on the profile OVERLAID with the edits — model_path very
+        # much included, or a swap to a bigger GGUF is sized against the old model and the
+        # budget check the swap exists for never fires.
+        if edit.field == "ctx":
             try:
-                if edit.field in ("ctx", "cache_type_k", "cache_type_v"):
-                    if edit.field == "ctx":
-                        new_profile[edit.field] = int(edit.new_text)
-                    else:
-                        new_profile[edit.field] = edit.new_text
-            except Exception:
+                new_profile["ctx"] = int(edit.new_text)
+            except ValueError:
                 pass
+        elif edit.field in ("cache_type_k", "cache_type_v", "model_path"):
+            new_profile[edit.field] = edit.new_text
 
     # Estimate memory
     store = getattr(watcher, 'mem_store', None)
@@ -3356,22 +3433,27 @@ class RolloutEngine:
             self._update_phase(rollout_id, "preflight", "checking prerequisites")
             pf = preflight(unit, edits, self.watcher, self.self_port, self.unit_dir)
             if not pf["ok"]:
-                self._fail_rollout(rollout_id, "preflight", "checks failed")
+                self._fail_rollout(rollout_id, "preflight", "preflight", detail="pre-flight checks failed")
                 return
 
             # Recompute confirm
             computed_confirm = compute_confirm(unit_name, unit.raw, edits)
             if computed_confirm != confirm:
-                self._fail_rollout(rollout_id, "preflight", "confirm mismatch (stale preview)")
+                self._fail_rollout(rollout_id, "preflight", "preview_stale", detail="confirm mismatch (stale preview)")
                 return
 
-            # Capture was_active
-            snapshot = self.watcher.snapshot()
+            # Capture was_active and the OLD deployment's ExecMainStartTimestamp — the
+            # `watching` phase uses it to tell the new process from a stale sample of the
+            # one this rollout is about to stop.
             was_active = False
+            prior_start_ts = None
+            with self.watcher_lock:
+                snapshot = self.watcher.snapshot()
             for u in snapshot.get('units', []):
                 if u['unit'] == unit_name:
                     rung = u.get('rung', 'OFF')
                     was_active = rung in ('STARTING', 'LOADING', 'READY', 'BUSY')
+                    prior_start_ts = u.get('since')
                     break
 
             with self.watcher_lock:
@@ -3386,7 +3468,7 @@ class RolloutEngine:
                     try:
                         self._stop_unit(unit_name)
                     except Exception as e:
-                        self._fail_rollout(rollout_id, "applying", f"stop failed: {e}")
+                        self._fail_rollout(rollout_id, "applying", "stop_error", detail=f"stop failed: {e}")
                         if was_active:
                             try:
                                 self._start_unit(unit_name)
@@ -3425,7 +3507,7 @@ class RolloutEngine:
                             self._start_unit(unit_name)
                         except Exception:
                             pass
-                    self._fail_rollout(rollout_id, "applying", f"commit failed: {e}")
+                    self._fail_rollout(rollout_id, "applying", "commit_error", detail=f"commit failed: {e}")
                     return
 
                 # Update watcher with new unit (S4)
@@ -3444,7 +3526,7 @@ class RolloutEngine:
                         self._start_unit(unit_name)
                     except Exception:
                         pass
-                self._fail_rollout(rollout_id, "applying", str(e))
+                self._fail_rollout(rollout_id, "applying", "apply_error", detail=str(e))
                 return
 
             # Reloading phase
@@ -3452,7 +3534,7 @@ class RolloutEngine:
             try:
                 self._daemon_reload()
             except Exception as e:
-                self._fail_rollout(rollout_id, "reloading", str(e), offer_rollback=True)
+                self._fail_rollout(rollout_id, "reloading", "daemon_reload", detail=str(e), offer_rollback=True)
                 return
 
             # Starting phase (if was_active)
@@ -3461,12 +3543,12 @@ class RolloutEngine:
                 try:
                     self._start_unit(unit_name)
                 except Exception as e:
-                    self._fail_rollout(rollout_id, "starting", f"start failed: {e}", offer_rollback=True)
+                    self._fail_rollout(rollout_id, "starting", "start_error", detail=f"start failed: {e}", offer_rollback=True)
                     return
 
                 # Watching phase
                 self._update_phase(rollout_id, "watching", "waiting for unit to be ready")
-                self._watch_unit(rollout_id, unit_name)
+                self._watch_unit(rollout_id, unit_name, prior_start_ts=prior_start_ts)
             else:
                 # Not starting
                 detail = "applied; unit was not running — not started"
@@ -3478,7 +3560,7 @@ class RolloutEngine:
                     rollout['updated_at'] = time.time()
 
         except Exception as e:
-            self._fail_rollout(rollout_id, "preflight", str(e))
+            self._fail_rollout(rollout_id, "preflight", "engine_error", detail=str(e))
 
     def _update_phase(self, rollout_id: str, phase: str, detail: str):
         """Update phase and publish SSE event."""
@@ -3497,13 +3579,22 @@ class RolloutEngine:
             'ts': time.time()
         })
 
-    def _fail_rollout(self, rollout_id: str, phase: str, reason: str, offer_rollback: bool = False):
-        """Mark rollout as failed."""
+    def _fail_rollout(self, rollout_id: str, phase: str, reason: str,
+                      offer_rollback: bool = False, detail: str = None):
+        """Mark rollout as failed.
+
+        `reason` is the machine code of §4.2 (`unit_failed`, `no_ready_marker`,
+        `watch_timeout`, `daemon_reload`, `start_error`, `preflight`, ...); `detail` is the
+        human text. The record's own `detail` is updated too, so a page refresh rebuilding
+        the stepper from the snapshot does not show the last in-flight sub-step.
+        """
+        text = detail or reason
         with self.watcher_lock:
             rollout = self.rollouts.get(rollout_id)
             if rollout:
                 rollout['phase'] = 'failed'
-                rollout['failure'] = {'reason': reason, 'detail': reason}
+                rollout['detail'] = text
+                rollout['failure'] = {'reason': reason, 'detail': text}
                 if offer_rollback and rollout['commit']:
                     rollout['rollback'] = {'offered': True}
                 rollout['updated_at'] = time.time()
@@ -3511,7 +3602,7 @@ class RolloutEngine:
         self.event_bus.publish('rollout', {
             'rollout_id': rollout_id,
             'phase': 'failed',
-            'detail': reason,
+            'detail': text,
             'ok': False,
             'ts': time.time()
         })
@@ -3528,40 +3619,93 @@ class RolloutEngine:
         """Reload systemd daemon."""
         run_actuate(["systemctl", "--user", "daemon-reload"], self.units)
 
-    def _watch_unit(self, rollout_id: str, unit_name: str):
-        """Watch unit for READY state (900s timeout)."""
+    def _watch_unit(self, rollout_id: str, unit_name: str, rollback_mode: bool = False,
+                    prior_start_ts: Optional[float] = None):
+        """Watch a started unit to a terminal rung (§4.2 `watching`, 900 s cap).
+
+        The rung is SAMPLED under `watcher_lock`; every state change happens after the
+        lock is released. `_update_phase`/`_fail_rollout` acquire the same non-reentrant
+        lock, so calling them from inside the `with` block deadlocks this thread while it
+        still holds the lock — which freezes `take_snapshot()` and with it every /api GET
+        and the 3 s systemctl tick, so the rung can never change either.
+
+        `rollback_mode` watches the restored config: its terminal states are
+        `rolled_back` / `rollback_failed`, never `done` / a second rollback offer.
+        """
         start = time.time()
         timeout = 900
 
         while time.time() - start < timeout:
+            rung = None
+            badges = []
+            since = None
             with self.watcher_lock:
                 snapshot = self.watcher.snapshot()
                 for u in snapshot.get('units', []):
                     if u['unit'] == unit_name:
                         rung = u.get('rung', 'OFF')
-                        if rung in ('READY', 'BUSY'):
-                            self._update_phase(rollout_id, 'done', f"loaded in {time.time() - start:.1f}s")
-                            with self.watcher_lock:
-                                rollout = self.rollouts.get(rollout_id)
-                                if rollout:
-                                    rollout['phase'] = 'done'
-                                    rollout['restored'] = False
-                                    rollout['updated_at'] = time.time()
-                            return
-                        elif rung == 'FAILED':
-                            self._fail_rollout(rollout_id, 'watching', 'unit reached FAILED state', offer_rollback=True)
-                            return
-
-                        # Check for no_ready_marker badge
-                        badges = u.get('badges', [])
-                        if 'no_ready_marker' in badges:
-                            self._fail_rollout(rollout_id, 'watching', 'unit timeout (no ready marker)', offer_rollback=True)
-                            return
+                        badges = u.get('badges') or []
+                        since = u.get('since')
                         break
+
+            # Freshness gate: the roster is refreshed by a 3 s tick, so the first samples
+            # after `start` still describe the deployment that was just stopped. Acting on
+            # them declares "done, loaded in 0.0s" against the OLD process (or fails the
+            # rollout on the old process's FAILED). `since` is ExecMainStartTimestamp, so
+            # it changes exactly when systemd reports the new main process.
+            if prior_start_ts is not None and since == prior_start_ts:
+                time.sleep(1)
+                continue
+
+            elapsed = time.time() - start
+            if rung in ('READY', 'BUSY'):
+                if rollback_mode:
+                    self._finish_rollback(rollout_id, f"rolled back; old config ready in {elapsed:.1f}s")
+                else:
+                    self._update_phase(rollout_id, 'done', f"loaded in {elapsed:.1f}s")
+                    with self.watcher_lock:
+                        rollout = self.rollouts.get(rollout_id)
+                        if rollout:
+                            rollout['phase'] = 'done'
+                            rollout['restored'] = False
+                            rollout['updated_at'] = time.time()
+                return
+            if rung == 'FAILED':
+                self._watch_failed(rollout_id, rollback_mode, 'unit_failed', 'unit reached FAILED state')
+                return
+            if 'no_ready_marker' in badges:
+                self._watch_failed(rollout_id, rollback_mode, 'no_ready_marker',
+                                   'active but no ready marker seen before TimeoutStartSec')
+                return
 
             time.sleep(1)
 
-        self._fail_rollout(rollout_id, 'watching', 'watch timeout (900s)', offer_rollback=True)
+        self._watch_failed(rollout_id, rollback_mode, 'watch_timeout', 'watch timeout (900s)')
+
+    def _finish_rollback(self, rollout_id: str, detail: str):
+        """Terminal `rolled_back` state (§4.3 rollback record)."""
+        self._update_phase(rollout_id, 'rolled_back', detail)
+        with self.watcher_lock:
+            rollout = self.rollouts.get(rollout_id)
+            if rollout:
+                rollout['phase'] = 'rolled_back'
+                rollout['rollback'] = {'offered': False, 'phase': 'rolled_back',
+                                       'revert_commit': rollout.get('revert_commit')}
+                rollout['updated_at'] = time.time()
+
+    def _watch_failed(self, rollout_id: str, rollback_mode: bool, reason: str, detail: str):
+        """A watch that ended badly: `rollback_failed` when watching a rollback (terminal,
+        no second offer), else `failed` with the rollback offer."""
+        if not rollback_mode:
+            self._fail_rollout(rollout_id, 'watching', reason, offer_rollback=True, detail=detail)
+            return
+        self._update_phase(rollout_id, 'rollback_failed', detail)
+        with self.watcher_lock:
+            rollout = self.rollouts.get(rollout_id)
+            if rollout:
+                rollout['phase'] = 'rollback_failed'
+                rollout['failure'] = {'reason': f'rollback_{reason}', 'detail': detail}
+                rollout['updated_at'] = time.time()
 
     def _check_gate(self, unit_name: str) -> bool:
         """Check if unit has an unsatisfied kernel gate."""
@@ -3599,6 +3743,16 @@ class RolloutEngine:
         was_active = rollout.get('was_active', False)
 
         try:
+            # ExecMainStartTimestamp of the failed deployment, so the watch below can tell
+            # the restored process from a stale sample of the one being torn down.
+            prior_start_ts = None
+            with self.watcher_lock:
+                snapshot = self.watcher.snapshot()
+            for u in snapshot.get('units', []):
+                if u['unit'] == unit_name:
+                    prior_start_ts = u.get('since')
+                    break
+
             # Stop unit
             self._update_phase(rollout_id, 'rolling_back', 'stopping unit')
             try:
@@ -3610,6 +3764,9 @@ class RolloutEngine:
             self._update_phase(rollout_id, 'rolling_back', 'reverting commit')
             try:
                 run_git(["revert", "--no-edit", rollout['commit']], self.unit_dir)
+                head = run_git(["rev-parse", "HEAD"], self.unit_dir)
+                if head.returncode == 0:
+                    rollout['revert_commit'] = head.stdout.strip()
             except Exception as e:
                 try:
                     run_git(["revert", "--abort"], self.unit_dir)
@@ -3621,6 +3778,17 @@ class RolloutEngine:
                     run_git(["commit", "-m", f"roundhouse: rollback {unit_name} (byte restore; revert failed)"], self.unit_dir)
                 except Exception:
                     pass
+
+            # S4 in reverse (§3.6/§4.4): the file is back to old_raw, so the in-memory
+            # UnitFile must be too — otherwise the next edit splices at the spans of a
+            # config that no longer exists on disk.
+            try:
+                old_unit = parse_unit(self.units[unit_name].path, rollout['old_raw'])
+                with self.watcher_lock:
+                    self.units[unit_name] = old_unit
+                    self.watcher.units[unit_name] = old_unit
+            except Exception:
+                pass
 
             # Reload daemon
             self._update_phase(rollout_id, 'rolling_back', 'reloading daemon')
@@ -3647,14 +3815,11 @@ class RolloutEngine:
                         rollout['updated_at'] = time.time()
                     return
 
-                # Watch old config
-                self._watch_unit(rollout_id, unit_name)
+                # Watch old config back up
+                self._watch_unit(rollout_id, unit_name, rollback_mode=True,
+                                 prior_start_ts=prior_start_ts)
             else:
-                self._update_phase(rollout_id, 'rolled_back', 'rollback complete')
-                with self.watcher_lock:
-                    rollout['phase'] = 'rolled_back'
-                    rollout['rollback'] = {'offered': False, 'phase': 'rolled_back'}
-                    rollout['updated_at'] = time.time()
+                self._finish_rollback(rollout_id, 'rollback complete; unit was not running')
 
         except Exception as e:
             self._update_phase(rollout_id, 'rollback_failed', str(e))
@@ -3816,7 +3981,7 @@ def cmd_serve(args):
     # Arming sequence (§2.4) — MUST be before any thread starts
     global ACTUATE_ARMED
     if args.actuate:
-        git_startup_check(unit_dir)
+        git_startup_check(unit_dir, selected_unit_names)
         ensure_token()
         ACTUATE_ARMED = True
 
