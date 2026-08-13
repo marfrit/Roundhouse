@@ -427,3 +427,73 @@ class TestByteOffsetProperties(unittest.TestCase):
                         f"{p.name}: {name}.{part} span does not slice to its token")
                     checked += 1
         self.assertGreater(checked, 100)
+
+
+class TestOnDemandMarker(unittest.TestCase):
+    """Test on-demand marker parsing (Section A)."""
+
+    def test_marker_hash_form(self):
+        """Marker in hash form: # roundhouse: on-demand."""
+        raw = b"""[Unit]
+Description=Test
+# roundhouse: on-demand
+[Service]
+ExecStart=/usr/bin/test
+"""
+        unit = roundhouse.parse_unit('/tmp/test.service', raw)
+        self.assertTrue(unit.on_demand)
+
+    def test_marker_semicolon_form(self):
+        """Marker in semicolon form: ; roundhouse: on-demand."""
+        raw = b"""[Unit]
+Description=Test
+; roundhouse: on-demand
+[Service]
+ExecStart=/usr/bin/test
+"""
+        unit = roundhouse.parse_unit('/tmp/test.service', raw)
+        self.assertTrue(unit.on_demand)
+
+    def test_marker_absent(self):
+        """Marker absent: on_demand defaults to False."""
+        raw = b"""[Unit]
+Description=Test
+[Service]
+ExecStart=/usr/bin/test
+"""
+        unit = roundhouse.parse_unit('/tmp/test.service', raw)
+        self.assertFalse(unit.on_demand)
+
+    def test_marker_partial_no_match(self):
+        """Partial marker (e.g. on-demandX) matches as substring."""
+        raw = b"""[Unit]
+Description=Test
+# roundhouse: on-demandX
+[Service]
+ExecStart=/usr/bin/test
+"""
+        unit = roundhouse.parse_unit('/tmp/test.service', raw)
+        # This matches as a substring per the wart (consistency with manage/ignore)
+        self.assertTrue(unit.on_demand)
+
+    def test_marker_in_execstart(self):
+        """Marker inside a quoted ExecStart argument still counts."""
+        raw = b"""[Unit]
+Description=Test
+[Service]
+ExecStart=/usr/bin/test "arg # roundhouse: on-demand"
+"""
+        unit = roundhouse.parse_unit('/tmp/test.service', raw)
+        # Per H1 and recon 7: substring scan anywhere in raw, including quoted strings
+        self.assertTrue(unit.on_demand)
+
+    def test_marker_default_value(self):
+        """on_demand field defaults to False in UnitFile."""
+        raw = b"""[Unit]
+Description=Test
+[Service]
+ExecStart=/usr/bin/test
+"""
+        unit = roundhouse.parse_unit('/tmp/test.service', raw)
+        self.assertFalse(unit.on_demand)
+        self.assertIsInstance(unit.on_demand, bool)

@@ -520,7 +520,7 @@ class TestWatcher(unittest.TestCase):
             required_unit_keys = {
                 'unit', 'description', 'retired', 'rung', 'roster', 'since', 'start_ts_mono',
                 'detail', 'badges', 'stale', 'sensed_at', 'enabled', 'active_state',
-                'sub_state', 'n_restarts', 'port', 'port_source', 'alias', 'gate',
+                'sub_state', 'n_restarts', 'port', 'port_source', 'alias', 'on_demand', 'gate',
                 'model_file', 'quant_hint', 'ctx', 'mem', 'port_conflict', 'strategy_note'
             }
             self.assertEqual(set(unit_dict.keys()), required_unit_keys)

@@ -131,6 +131,7 @@ class UnitFile:
       exec_condition: Directive or None
       gate: dict from parse_gate() or None
       install_wanted_by: decoded WantedBy field or None
+      on_demand: True if '# roundhouse: on-demand' or '; roundhouse: on-demand' found in raw
       known: dict of {field: value} for standard keys
       other_directives: list of Directive not in the known set
     """
@@ -148,6 +149,7 @@ class UnitFile:
     exec_condition: Optional[Directive] = None
     gate: Optional[Dict] = None
     install_wanted_by: Optional[str] = None
+    on_demand: bool = False
     known: Dict = field(default_factory=dict)
     other_directives: List[Directive] = field(default_factory=list)
 
@@ -180,6 +182,10 @@ def parse_unit(path: str, raw: bytes) -> UnitFile:
     exec_condition = None
     gate = None
     install_wanted_by = None
+
+    # Check for on-demand marker (same substring mechanism as manage/ignore)
+    raw_str = raw.decode('utf-8', errors='replace')
+    on_demand = ('# roundhouse: on-demand' in raw_str or '; roundhouse: on-demand' in raw_str)
 
     # Known directive keys
     KNOWN_KEYS = {
@@ -228,6 +234,7 @@ def parse_unit(path: str, raw: bytes) -> UnitFile:
         exec_condition=exec_condition,
         gate=gate,
         install_wanted_by=install_wanted_by,
+        on_demand=on_demand,
         known=known,
         other_directives=other_directives
     )
@@ -979,7 +986,8 @@ def build_deployment(unit: UnitFile, host: str, statf=os.stat) -> Dict:
     load_strategy = {
         'kind': 'on-boot' if enabled else 'manual',
         'enabled': enabled,
-        'gate': unit.gate
+        'gate': unit.gate,
+        'on_demand': unit.on_demand
     }
 
     # Build deployment dict
@@ -1622,6 +1630,7 @@ class Watcher:
                 'port': port,
                 'port_source': port_source,
                 'alias': alias,
+                'on_demand': unit.on_demand,
                 'gate': unit.gate,
                 'model_file': os.path.basename(profile.get('model_path', '')),
                 'quant_hint': quant,
@@ -2932,6 +2941,7 @@ class RoundhouseRequestHandler(http.server.BaseHTTPRequestHandler):
                 'kind': 'on-boot' if row.get('enabled') else 'manual',
                 'enabled': row.get('enabled', False),
                 'gate': unit.gate,
+                'on_demand': unit.on_demand,
                 'strategy_note': row.get('strategy_note')
             }
             dep['roster'] = {
@@ -3045,11 +3055,12 @@ class ThreadingHTTPServer(http.server.ThreadingHTTPServer):
     """HTTP server with references to watcher, event_bus, and port."""
 
     def __init__(self, host_port, handler_class, watcher, event_bus, port,
-                 watcher_lock=None, rollout_engine=None):
+                 watcher_lock=None, rollout_engine=None, advertise_host=None):
         self.watcher = watcher
         self.event_bus = event_bus
         self.port = port
         self.rollout_engine = rollout_engine
+        self.advertise_host = advertise_host
         # snapshot() reads AND writes watcher state (rung cache commit is
         # elsewhere, but _state mutates under the sensing threads), so every
         # handler read must take the same lock the threads use. Sockets are
@@ -3100,6 +3111,8 @@ def rollout_public_record(rollout: dict) -> dict:
             'stops': rollout.get('stops', []),
             'stopped': rollout.get('stopped', []),
             'target_started': rollout.get('target_started', False),
+            'origin': rollout.get('origin', 'human'),
+            'requester': rollout.get('requester'),
         })
     else:
         # Rollout record: add rollout-specific fields
@@ -3124,7 +3137,8 @@ GIT_FORBIDDEN_TOKENS = {"push", "pull", "fetch", "remote", "clone", "init",
 FROZEN_POST_ROUTES = (
     "/api/units/<name>/edit", "/api/units/<name>/rollout",
     "/api/rollouts/<id>/rollback", "/api/rollouts/<id>/dismiss",
-    "/api/switch/preview", "/api/switch", "/api/units/<name>/enablement"
+    "/api/switch/preview", "/api/switch", "/api/units/<name>/enablement",
+    "/api/warm", "/api/warm/cancel"
 )
 TOKEN_PATH = os.path.expanduser("~/.config/roundhouse/token")
 TOKEN = None
@@ -4146,6 +4160,11 @@ class RolloutEngine:
         self.rollouts = {}
         self.counter = 0
 
+        # Warm-up queue and state (mutated only under watcher_lock)
+        self.pending_warm = None
+        self.last_warm = None
+        self.warm_seq = 0
+
     def start_rollout(self, unit_name: str, edits: List[Edit], confirm: str) -> Dict:
         """Start a new rollout. Returns the rollout record."""
         with self.watcher_lock:
@@ -4578,9 +4597,45 @@ class RolloutEngine:
 
         return ('timeout',)
 
-    def start_switch(self, target: str, stops: List[str], confirm: str) -> Dict:
-        """Start a switch operation. Returns the switch record."""
+    def start_switch(self, target: str, stops: List[str], confirm: str,
+                     origin: str = 'human', requester: Optional[str] = None,
+                     warm_seq: Optional[int] = None) -> Dict:
+        """Start a switch operation. Returns the switch record.
+
+        Args:
+            target: target unit name
+            stops: list of unit names to stop
+            confirm: confirmation token
+            origin: 'human' (default) or 'warm' (autonomous)
+            requester: optional string identifying the requester
+            warm_seq: if origin='warm', the sequence number of the parked warm
+
+        When origin='warm', this performs consent re-check inside the lock:
+        target and stops must all be on-demand-marked, and warm_seq must
+        match the pending warm being fired (else warm_cancelled error).
+        """
         with self.watcher_lock:
+            # Consent fence layer 2 (engine): re-validate when origin='warm'
+            if origin == 'warm':
+                # Target must be marked
+                unit = self.units.get(target)
+                if not unit or not unit.on_demand:
+                    raise ActuationError(f"warm_consent: target {target} is not marked on-demand")
+
+                # All stops must be marked
+                for stop_unit in stops:
+                    stop_unit_obj = self.units.get(stop_unit)
+                    if not stop_unit_obj or not stop_unit_obj.on_demand:
+                        raise ActuationError(f"warm_consent: stop {stop_unit} is not marked on-demand")
+
+                # Verify warm_seq matches (or fire failed meanwhile)
+                if warm_seq is not None:
+                    if self.pending_warm is None or self.pending_warm.get('seq') != warm_seq:
+                        raise ActuationError("warm_cancelled")
+
+                # Pop the parked warm
+                self.pending_warm = None
+
             if not _slot_free(self.current):
                 if self.current and self.current.get('kind') == 'switch':
                     raise ActuationError("operation_in_progress")
@@ -4612,6 +4667,8 @@ class RolloutEngine:
                 "restored": False,
                 "started_at": now,
                 "updated_at": now,
+                "origin": origin,
+                "requester": requester,
             }
 
             self.current = switch
@@ -5021,6 +5078,188 @@ class RolloutEngine:
             # a dismissed offer has to leave a record that says so.
             rollout['rollback'] = {'offered': False, 'dismissed': True}
             rollout['updated_at'] = time.time()
+
+    def warm_state(self) -> Dict:
+        """Return the current warm-up state for GET /api/warm (read route).
+
+        Returns a dict with 'pending' (record or None) and 'last' (record or None),
+        captured under the lock.
+        """
+        with self.watcher_lock:
+            pending = None
+            if self.pending_warm:
+                pending = dict(self.pending_warm)
+
+            last = None
+            if self.last_warm:
+                last = dict(self.last_warm)
+
+            return {'pending': pending, 'last': last}
+
+    def tick_pending_warm(self):
+        """Fire the pending warm if the slot is free (called from poll_systemctl).
+
+        Runs outside the lock; takes the lock only to check state.
+        """
+        with self.watcher_lock:
+            p = self.pending_warm
+            if p is None or not _slot_free(self.current):
+                return
+
+            seq = p['seq']
+            target = p['unit']
+            requester = p['requester']
+
+        # Fire outside the lock (fresh snapshot + re-plan + re-preflight)
+        self._fire_warm(target, requester, seq)
+
+    def _fire_warm(self, target: str, requester: Optional[str], seq: int):
+        """Fire a parked warm request with fresh snapshot and re-preflight.
+
+        Called from tick_pending_warm; drops to last_warm on failure.
+        """
+        try:
+            # Fresh snapshot + re-plan + re-preflight
+            with self.watcher_lock:
+                snap = self.watcher.snapshot()
+
+            unit = self.units.get(target)
+
+            # Check 1: Target retired
+            target_row = None
+            for row in snap.get('units', []):
+                if row['unit'] == target:
+                    target_row = row
+                    break
+
+            if not target_row or target_row.get('retired'):
+                # Drop: retired
+                with self.watcher_lock:
+                    if self.pending_warm and self.pending_warm.get('seq') == seq:
+                        self.pending_warm = None
+                        self.last_warm = {
+                            'unit': target,
+                            'requester': requester,
+                            'disposition': 'already_warm',
+                            'detail': 'unit is retired',
+                            'at': time.time()
+                        }
+                return
+
+            # Check 2: Target on-demand
+            if not unit or not unit.on_demand:
+                # Drop: not marked
+                with self.watcher_lock:
+                    if self.pending_warm and self.pending_warm.get('seq') == seq:
+                        self.pending_warm = None
+                        self.last_warm = {
+                            'unit': target,
+                            'requester': requester,
+                            'disposition': 'not_on_demand',
+                            'detail': 'unit is not marked on-demand',
+                            'at': time.time()
+                        }
+                return
+
+            # Check 3: Target already warm
+            rung = target_row.get('rung')
+            if rung in ('READY', 'BUSY', 'STARTING', 'LOADING'):
+                # Drop: already warm
+                with self.watcher_lock:
+                    if self.pending_warm and self.pending_warm.get('seq') == seq:
+                        self.pending_warm = None
+                        self.last_warm = {
+                            'unit': target,
+                            'requester': requester,
+                            'disposition': 'already_warm',
+                            'detail': f'unit is {rung}',
+                            'at': time.time()
+                        }
+                return
+
+            # Warm plan
+            cgroup_cache = {}
+            mem_store = self.watcher.mem_store
+            plan = warm_plan(target, snap, self.units, cgroup_cache, mem_store)
+
+            if not plan['fits']:
+                # Drop: unfittable
+                with self.watcher_lock:
+                    if self.pending_warm and self.pending_warm.get('seq') == seq:
+                        self.pending_warm = None
+                        self.last_warm = {
+                            'unit': target,
+                            'requester': requester,
+                            'disposition': 'consent_unfittable',
+                            'detail': f"estimated {plan['estimate_bytes']} bytes + headroom {plan['headroom_bytes']} bytes exceeds available + freed by consenting stops",
+                            'at': time.time()
+                        }
+                return
+
+            # Switch preflight
+            pf = switch_preflight(target, plan['stops'], self.watcher, self.units, self.self_port)
+            if not pf['ok']:
+                # Drop: preflight failed
+                with self.watcher_lock:
+                    if self.pending_warm and self.pending_warm.get('seq') == seq:
+                        self.pending_warm = None
+                        self.last_warm = {
+                            'unit': target,
+                            'requester': requester,
+                            'disposition': 'preflight_failed',
+                            'detail': 'preflight checks failed',
+                            'at': time.time()
+                        }
+                return
+
+            # Start switch
+            try:
+                result = self.start_switch(target, plan['stops'], pf['confirm'],
+                                           origin='warm', requester=requester, warm_seq=seq)
+
+                # Record success
+                with self.watcher_lock:
+                    self.last_warm = {
+                        'unit': target,
+                        'requester': requester,
+                        'disposition': 'started',
+                        'rollout_id': result.get('rollout_id'),
+                        'at': time.time()
+                    }
+
+            except ActuationError as e:
+                err_str = str(e)
+                if 'operation_in_progress' in err_str:
+                    # Slot stolen by human: leave parked and retry next tick
+                    return
+                elif 'warm_cancelled' in err_str:
+                    # Already cleared by cancel handler
+                    return
+                else:
+                    # Other error: drop
+                    with self.watcher_lock:
+                        if self.pending_warm and self.pending_warm.get('seq') == seq:
+                            self.pending_warm = None
+                            self.last_warm = {
+                                'unit': target,
+                                'requester': requester,
+                                'disposition': 'error',
+                                'detail': str(e),
+                                'at': time.time()
+                            }
+
+        except Exception as e:
+            # Catch-all for unexpected errors
+            with self.watcher_lock:
+                if self.pending_warm and self.pending_warm.get('seq') == seq:
+                    self.pending_warm = None
+                    self.last_warm = {
+                        'unit': target,
+                        'requester': requester,
+                        'disposition': 'error',
+                        'detail': str(e),
+                        'at': time.time()
+                    }
 
 
 # ===== SECTION E PART 3: SWITCH (lifecycle verbs only; no file writes, no git, no daemon-reload) =====
@@ -5595,6 +5834,371 @@ def enablement_preflight(unit_name: str, enable: bool, snapshot: Dict, units: Di
     }
 
 
+# ===== SECTION E PART 5: ROUTING-CONFIG + WARM (generation is a pure read; warm reuses start_switch; no new verbs, no file writes, no git) =====
+
+# YAML keyword ambiguity set
+YAML_AMBIGUOUS = {'true', 'false', 'yes', 'no', 'on', 'off', 'null', 'none', '~'}
+
+# Safe bare string pattern: alphanumeric, dot, underscore, slash, dash
+SAFE_BARE_RE = re.compile(r'[A-Za-z0-9._/-]+$')
+
+
+def _yaml_str(s: str) -> str:
+    """Quote a string value per H2/§3 quoting rules exactly.
+
+    Bare iff matches [A-Za-z0-9._/-]+ AND not numeric-looking AND
+    not leading dash AND not in YAML_AMBIGUOUS set.
+    Everything else → double-quoted with exact escape rules.
+    """
+    if not isinstance(s, str):
+        s = str(s)
+
+    # Check bare class conditions
+    # Numeric-looking: integers, floats, scientific notation, etc.
+    is_numeric_looking = re.fullmatch(r'[0-9.+-]*[0-9](?:[eE][+-]?[0-9]+)?|[0-9.+-]+', s)
+
+    is_safe_bare = (
+        SAFE_BARE_RE.match(s) is not None and
+        not s.startswith('-') and
+        not is_numeric_looking and
+        s.lower() not in YAML_AMBIGUOUS
+    )
+
+    if is_safe_bare:
+        return s
+
+    # Double-quote and escape
+    escaped = ''
+    for c in s:
+        if c == '\\':
+            escaped += '\\\\'
+        elif c == '"':
+            escaped += '\\"'
+        elif ord(c) < 0x20 or ord(c) == 0x7f:
+            escaped += f'\\x{ord(c):02x}'
+        else:
+            escaped += c
+
+    return f'"{escaped}"'
+
+
+def _yaml_scalar(value):
+    """Format a scalar value per §3.3 rules.
+
+    bool → true/false; int → str; float → repr; str → _yaml_str;
+    None → asserts (should never reach here).
+    """
+    if value is None:
+        assert False, "None should not reach emitter (H3 null-omission)"
+    if isinstance(value, bool):
+        return 'true' if value else 'false'
+    if isinstance(value, int):
+        return str(value)
+    if isinstance(value, float):
+        return repr(value)
+    if isinstance(value, str):
+        return _yaml_str(value)
+    return _yaml_str(str(value))
+
+
+def emit_routing_yaml(meta: Dict, entries: List[Dict]) -> str:
+    """Emit a routing config fragment in YAML per §3.2.
+
+    Args:
+        meta: dict with 'generated_by', 'generated_at', 'warm_hook'
+        entries: list of entry dicts with frozen key order
+
+    Returns:
+        YAML string with header comments + model_list
+    """
+    lines = []
+
+    # Header comments
+    lines.append(f"# generated-by: roundhouse@{meta.get('generated_by', 'unknown')}")
+    lines.append(f"# generated-at: {meta.get('generated_at', '?')}")
+    lines.append(f"# warm-hook: {meta.get('warm_hook', '?')}")
+
+    # model_list key
+    lines.append('model_list:')
+
+    if not entries:
+        # Empty fleet
+        return '\n'.join(lines) + '\n'
+
+    # Emit entries
+    for entry in entries:
+        lines.append('  - model_name: ' + _yaml_scalar(entry.get('model_name')))
+
+        # litellm_params dict
+        if 'litellm_params' in entry:
+            lp = entry['litellm_params']
+            lines.append('    litellm_params:')
+            for key in ['model', 'api_base', 'api_key']:
+                if key in lp:
+                    lines.append(f'      {key}: {_yaml_scalar(lp[key])}')
+
+        # model_info dict
+        if 'model_info' in entry:
+            mi = entry['model_info']
+            lines.append('    model_info:')
+            for key in ['unit', 'logical', 'host', 'rung', 'on_demand',
+                       'load_strategy', 'peak_bytes', 'peak_source', 'load_seconds']:
+                if key in mi:
+                    lines.append(f'      {key}: {_yaml_scalar(mi[key])}')
+
+    return '\n'.join(lines) + '\n'
+
+
+def logical_of(row: Dict) -> str:
+    """Extract the logical model name from a row.
+
+    row['alias'] can be None (recon 2): fall back to the unit stem.
+    """
+    alias = row.get('alias')
+    if alias is not None:
+        return alias
+    unit_name = row['unit']
+    return unit_name[:-len('.service')] if unit_name.endswith('.service') else unit_name
+
+
+def include_in_routing(row: Dict) -> bool:
+    """Decide if a row should appear in the routing config.
+
+    Hot always; cold only if marked; an on-demand entry stays listed
+    through its own warm-up (STARTING/LOADING); STANDBY/FAILED/RETIRED never.
+    """
+    if row.get('retired'):
+        return False
+
+    rung = row.get('rung')
+    if rung in ('READY', 'BUSY'):
+        return True
+
+    if row.get('on_demand') and rung in ('OFF', 'STARTING', 'LOADING'):
+        return True
+
+    return False
+
+
+def build_routing_entries(snapshot: Dict, advertise_host: str) -> List[Dict]:
+    """Build routing config entries from the snapshot.
+
+    Args:
+        snapshot: from watcher.snapshot()
+        advertise_host: the advertise-host flag value or snapshot['host']
+
+    Returns:
+        list of entry dicts, sorted by model_name
+    """
+    entries = []
+    host = snapshot.get('host', '?')
+
+    for row in snapshot.get('units', []):
+        if not include_in_routing(row):
+            continue
+
+        unit_name = row['unit']
+        logical = logical_of(row)
+        model_name = f"{host}-{logical}"
+        port = row.get('port', 8080)
+        enabled = row.get('enabled', False)
+
+        # Memory info
+        mem = row.get('mem') or {}
+        model_info = {
+            'unit': unit_name,
+            'logical': logical,
+            'host': host,
+            'rung': row.get('rung', 'OFF'),
+            'on_demand': row.get('on_demand', False),
+            'load_strategy': 'on-boot' if enabled else 'manual'
+        }
+
+        # Add peak and load_seconds only when known (H3 null-omission)
+        if mem.get('bytes') is not None:
+            model_info['peak_bytes'] = mem['bytes']
+            model_info['peak_source'] = mem.get('label', 'unknown')
+
+        if mem.get('load_seconds') is not None:
+            model_info['load_seconds'] = mem['load_seconds']
+
+        entry = {
+            'model_name': model_name,
+            'litellm_params': {
+                'model': f'openai/{logical}',
+                'api_base': f'http://{advertise_host}:{port}/v1',
+                'api_key': 'none'
+            },
+            'model_info': model_info
+        }
+
+        entries.append(entry)
+
+    # Sort by model_name for determinism
+    entries.sort(key=lambda e: e['model_name'])
+
+    return entries
+
+
+def routing_meta(snapshot: Dict, advertise_host: str, self_port: int, now_utc) -> Dict:
+    """Build routing metadata (header comments).
+
+    Args:
+        snapshot: from watcher.snapshot()
+        advertise_host: the advertise-host flag value
+        self_port: Roundhouse's HTTP port
+        now_utc: datetime.now(timezone.utc)
+
+    Returns:
+        dict with 'generated_by', 'generated_at', 'warm_hook'
+    """
+    host = snapshot.get('host', '?')
+    iso_dt = now_utc.strftime('%Y-%m-%dT%H:%M:%SZ')
+
+    return {
+        'generated_by': host,
+        'generated_at': iso_dt,
+        'warm_hook': f'POST http://{advertise_host}:{self_port}/api/warm'
+    }
+
+
+def resolve_warm_target(logical: Optional[str], unit: Optional[str],
+                        snapshot: Dict, units: Dict[str, 'UnitFile']
+                        ) -> tuple:
+    """Resolve a warm request target.
+
+    Returns:
+        ('ok', unit_name) or ('error', status_code, error_code, extra_dict)
+
+    Exactly one of logical/unit must be non-None; route has already 400'd
+    if both or neither given (function asserts).
+    """
+    assert (logical is None) != (unit is None), "exactly one of logical/unit must be given"
+
+    if unit:
+        # Direct unit path
+        if unit not in units:
+            return ('error', 404, 'unknown_unit', {})
+        # Retired units resolve here; the retired refusal happens in the handler
+        return ('ok', unit)
+
+    # logical path: resolve against logical_of(row) for non-RETIRED rows
+    host = snapshot.get('host', '?')
+    namespace_prefix = f"{host}-"
+
+    search_logical = logical
+    if logical.startswith(namespace_prefix):
+        search_logical = logical[len(namespace_prefix):]
+
+    matches = []
+    for row in snapshot.get('units', []):
+        if row.get('retired'):
+            continue
+        if logical_of(row) == search_logical or logical_of(row) == logical:
+            matches.append(row['unit'])
+
+    if len(matches) == 0:
+        return ('error', 404, 'unknown_alias', {})
+    if len(matches) > 1:
+        return ('error', 422, 'ambiguous_alias', {'units': sorted(matches)})
+
+    return ('ok', matches[0])
+
+
+def warm_plan(target: str, snapshot: Dict, units: Dict[str, 'UnitFile'],
+              cgroup_cache: Dict, mem_store: 'MemStore') -> Dict:
+    """Plan a warm-up, filtering candidates to on-demand-marked units (layer 1 fence).
+
+    Args:
+        target: target unit name (must be selected and on-demand; caller enforces)
+        snapshot: from locked_snapshot
+        units: selected units dict
+        cgroup_cache: for suggest_stops
+        mem_store: for memory estimation
+
+    Returns:
+        dict with 'fits', 'stops', 'estimate_bytes', estimate_source',
+        'mem_available_bytes', 'headroom_bytes', 'freed_by', 'shortfall_bytes',
+        'consenting', 'excluded_unmarked'
+    """
+    profile = {}
+    if units[target].exec_start:
+        profile = extract_param_profile(units[target].exec_start.engine_argv)
+
+    # Estimate memory needed
+    estimate, estimate_source = _estimate_start_bytes(target, profile, mem_store)
+
+    # Get available memory
+    mem_snapshot = snapshot.get('mem', {})
+    budget = mem_snapshot.get('available_bytes') or 0
+    mem_available_source = mem_snapshot.get('available_source', 'unknown')
+
+    # Build consenting and excluded lists
+    consenting = []
+    excluded_unmarked = []
+
+    ACTIVE_RUNGS = {'STARTING', 'LOADING', 'READY', 'BUSY'}
+
+    for row in snapshot.get('units', []):
+        if row['unit'] == target or row.get('retired'):
+            continue
+        if row.get('rung') not in ACTIVE_RUNGS:
+            continue
+
+        unit_obj = units.get(row['unit'])
+        if not unit_obj:
+            continue
+
+        row_info = {
+            'unit': row['unit'],
+            'rung': row.get('rung', 'OFF'),
+            'resident_bytes': row.get('mem', {}).get('bytes'),
+            'resident_source': row.get('mem', {}).get('label')
+        }
+
+        if unit_obj.on_demand:
+            consenting.append(row_info)
+        else:
+            excluded_unmarked.append(row_info)
+
+    # Run suggest_stops on consenting pool only
+    stops = suggest_stops(target, [], consenting, estimate, budget, [],
+                          cgroup_cache, mem_store)
+
+    # Compute freed bytes
+    freed_by = []
+    freed_total = 0
+    for stop_unit in stops:
+        # Find the row for this unit
+        freed_bytes = 0
+        freed_source = 'unknown'
+        for row in snapshot.get('units', []):
+            if row['unit'] == stop_unit:
+                freed_bytes = _freed_bytes(stop_unit, row, snapshot, units)
+                freed_source = row.get('mem', {}).get('label', 'unknown')
+                break
+        freed_by.append({'unit': stop_unit, 'bytes': freed_bytes, 'source': freed_source})
+        freed_total += freed_bytes
+
+    # Check fit
+    fits = estimate + HEADROOM_BYTES <= budget + freed_total
+    shortfall = max(0, estimate + HEADROOM_BYTES - budget - freed_total)
+
+    return {
+        'fits': fits,
+        'stops': stops,
+        'estimate_bytes': estimate,
+        'estimate_source': estimate_source,
+        'mem_available_bytes': budget,
+        'mem_available_source': mem_available_source,
+        'headroom_bytes': HEADROOM_BYTES,
+        'freed_by': freed_by,
+        'shortfall_bytes': shortfall,
+        'consenting': consenting,
+        'excluded_unmarked': excluded_unmarked
+    }
+
+
 # ===== SECTION D: MAIN / CLI =====
 
 
@@ -5605,6 +6209,8 @@ def main():
     parser.add_argument('--unit-dir', default=os.path.expanduser('~/.config/systemd/user'),
                         help='Unit directory (default: ~/.config/systemd/user)')
     parser.add_argument('--port', type=int, default=8090, help='HTTP port (default: 8090)')
+    parser.add_argument('--advertise-host', default=None,
+                        help='Advertised hostname for API base URLs (default: kernel hostname)')
     parser.add_argument('--db', help='SQLite database path')
     parser.add_argument('--no-db', action='store_true', help='Skip database')
     parser.add_argument('--actuate', action='store_true', help='Enable rollouts (requires git)')
@@ -5837,6 +6443,10 @@ def cmd_serve(args):
                         last_board['board'] = board
                         event_bus.publish('ports', board)
 
+                # Tick pending warm (outside the lock; method locks internally)
+                if rollout_engine:
+                    rollout_engine.tick_pending_warm()
+
                 # Sleep 3 seconds
                 shutdown_event.wait(3)
             except Exception as e:
@@ -5980,6 +6590,11 @@ def cmd_serve(args):
     except Exception as e:
         print(f"Error in initial poll: {e}", file=sys.stderr)
 
+    # Create RolloutEngine if armed (before poll_thread starts — tick_pending_warm needs it)
+    rollout_engine = None
+    if ACTUATE_ARMED:
+        rollout_engine = RolloutEngine(watcher, units, unit_dir, port, event_bus, watcher_lock)
+
     # Start threads
     poll_thread = threading.Thread(target=poll_systemctl, daemon=True)
     poll_thread.start()
@@ -5992,13 +6607,9 @@ def cmd_serve(args):
     journal_thread = threading.Thread(target=journal_with_backfill, daemon=True)
     journal_thread.start()
 
-    # Create RolloutEngine if armed
-    rollout_engine = None
-    if ACTUATE_ARMED:
-        rollout_engine = RolloutEngine(watcher, units, unit_dir, port, event_bus, watcher_lock)
-
     # Start HTTP server
     try:
+        advertise_host = args.advertise_host or os.uname()[1]
         server = ThreadingHTTPServer(
             ('0.0.0.0', port),
             RoundhouseRequestHandler,
@@ -6006,7 +6617,8 @@ def cmd_serve(args):
             event_bus,
             port,
             watcher_lock=watcher_lock,
-            rollout_engine=rollout_engine
+            rollout_engine=rollout_engine,
+            advertise_host=advertise_host
         )
         print(f"Roundhouse listening on http://0.0.0.0:{port}")
 

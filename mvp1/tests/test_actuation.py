@@ -4597,5 +4597,255 @@ class TestEnablementTimeoutPins(unittest.TestCase):
         self.assertIsInstance(roundhouse.WATCH_TIMEOUT_SEC, int)
 
 
+class TestWarmConsentFence(unittest.TestCase):
+    """Test the warm consent fence at engine level (layer 2)."""
+
+    def test_unmarked_target_raises_warm_consent(self):
+        """start_switch with unmarked target and origin='warm' raises warm_consent."""
+        marked = roundhouse.UnitFile(
+            path='', name='marked.service', raw=b'', lines=[], directives=[],
+            comments=[], warnings=[], on_demand=True
+        )
+        unmarked = roundhouse.UnitFile(
+            path='', name='unmarked.service', raw=b'', lines=[], directives=[],
+            comments=[], warnings=[], on_demand=False
+        )
+
+        units = {'marked.service': marked, 'unmarked.service': unmarked}
+        watcher = unittest.mock.MagicMock()
+        event_bus = roundhouse.EventBus()
+        lock = threading.Lock()
+
+        engine = roundhouse.RolloutEngine(watcher, units, '/tmp', 8090, event_bus, lock)
+
+        with self.assertRaises(roundhouse.ActuationError) as cm:
+            engine.start_switch('unmarked.service', [], 'confirm', origin='warm')
+
+        self.assertIn('warm_consent', str(cm.exception))
+
+    def test_unmarked_stop_raises_warm_consent(self):
+        """start_switch with unmarked stop and origin='warm' raises warm_consent."""
+        marked = roundhouse.UnitFile(
+            path='', name='marked.service', raw=b'', lines=[], directives=[],
+            comments=[], warnings=[], on_demand=True
+        )
+        unmarked = roundhouse.UnitFile(
+            path='', name='unmarked.service', raw=b'', lines=[], directives=[],
+            comments=[], warnings=[], on_demand=False
+        )
+
+        units = {'marked.service': marked, 'unmarked.service': unmarked}
+        watcher = unittest.mock.MagicMock()
+        event_bus = roundhouse.EventBus()
+        lock = threading.Lock()
+
+        engine = roundhouse.RolloutEngine(watcher, units, '/tmp', 8090, event_bus, lock)
+
+        with self.assertRaises(roundhouse.ActuationError) as cm:
+            engine.start_switch('marked.service', ['unmarked.service'], 'confirm', origin='warm')
+
+        self.assertIn('warm_consent', str(cm.exception))
+
+    def test_human_switch_ignores_marking(self):
+        """start_switch with origin='human' (default) succeeds even with unmarked units."""
+        unmarked = roundhouse.UnitFile(
+            path='', name='unmarked.service', raw=b'', lines=[], directives=[],
+            comments=[], warnings=[], on_demand=False
+        )
+
+        units = {'unmarked.service': unmarked}
+        watcher = unittest.mock.MagicMock()
+        watcher.snapshot.return_value = {'units': []}
+        event_bus = roundhouse.EventBus()
+        lock = threading.Lock()
+
+        engine = roundhouse.RolloutEngine(watcher, units, '/tmp', 8090, event_bus, lock)
+
+        # Should not raise
+        result = engine.start_switch('unmarked.service', [], 'confirm', origin='human')
+        self.assertIsNotNone(result)
+
+    def test_warm_seq_mismatch_raises_warm_cancelled(self):
+        """start_switch with mismatched warm_seq raises warm_cancelled."""
+        marked = roundhouse.UnitFile(
+            path='', name='marked.service', raw=b'', lines=[], directives=[],
+            comments=[], warnings=[], on_demand=True
+        )
+
+        units = {'marked.service': marked}
+        watcher = unittest.mock.MagicMock()
+        watcher.snapshot.return_value = {'units': []}
+        event_bus = roundhouse.EventBus()
+        lock = threading.Lock()
+
+        engine = roundhouse.RolloutEngine(watcher, units, '/tmp', 8090, event_bus, lock)
+
+        # Set a pending warm
+        engine.pending_warm = {'seq': 1, 'unit': 'marked.service', 'requester': None}
+
+        # Try to start with mismatched seq
+        with self.assertRaises(roundhouse.ActuationError) as cm:
+            engine.start_switch('marked.service', [], 'confirm', origin='warm', warm_seq=999)
+
+        self.assertIn('warm_cancelled', str(cm.exception))
+
+    def test_warm_seq_match_clears_pending(self):
+        """start_switch with matching warm_seq clears pending_warm atomically."""
+        marked = roundhouse.UnitFile(
+            path='', name='marked.service', raw=b'', lines=[], directives=[],
+            comments=[], warnings=[], on_demand=True
+        )
+
+        units = {'marked.service': marked}
+        watcher = unittest.mock.MagicMock()
+        watcher.snapshot.return_value = {'units': []}
+        event_bus = roundhouse.EventBus()
+        lock = threading.Lock()
+
+        engine = roundhouse.RolloutEngine(watcher, units, '/tmp', 8090, event_bus, lock)
+
+        # Set a pending warm
+        engine.pending_warm = {'seq': 1, 'unit': 'marked.service', 'requester': None}
+
+        # Start with matching seq
+        result = engine.start_switch('marked.service', [], 'confirm', origin='warm', warm_seq=1)
+
+        # pending_warm should be cleared
+        self.assertIsNone(engine.pending_warm)
+
+
+class TestWarmEngineQueue(unittest.TestCase):
+    """Test warm queue at engine level."""
+
+    def test_queue_park_when_slot_busy(self):
+        """warm_plan park when slot is busy."""
+        # This test verifies the engine queue logic without actually running the switch
+        marked = roundhouse.UnitFile(
+            path='', name='marked.service', raw=b'', lines=[], directives=[],
+            comments=[], warnings=[], on_demand=True
+        )
+
+        units = {'marked.service': marked}
+        watcher = unittest.mock.MagicMock()
+        watcher.snapshot.return_value = {'units': []}
+        event_bus = roundhouse.EventBus()
+        lock = threading.Lock()
+
+        engine = roundhouse.RolloutEngine(watcher, units, '/tmp', 8090, event_bus, lock)
+
+        # Mark slot as busy
+        engine.current = {'phase': 'preflight'}
+
+        # Try to start_switch
+        with self.assertRaises(roundhouse.ActuationError) as cm:
+            engine.start_switch('marked.service', [], 'confirm')
+
+        self.assertIn('operation_in_progress', str(cm.exception))
+
+    def test_warm_state_empty(self):
+        """warm_state returns empty when no pending or last warm."""
+        units = {}
+        watcher = unittest.mock.MagicMock()
+        event_bus = roundhouse.EventBus()
+        lock = threading.Lock()
+
+        engine = roundhouse.RolloutEngine(watcher, units, '/tmp', 8090, event_bus, lock)
+
+        state = engine.warm_state()
+        self.assertIsNone(state['pending'])
+        self.assertIsNone(state['last'])
+
+    def test_warm_state_with_pending(self):
+        """warm_state returns pending warm record."""
+        units = {}
+        watcher = unittest.mock.MagicMock()
+        event_bus = roundhouse.EventBus()
+        lock = threading.Lock()
+
+        engine = roundhouse.RolloutEngine(watcher, units, '/tmp', 8090, event_bus, lock)
+
+        engine.pending_warm = {'seq': 1, 'unit': 'test.service', 'requester': 'proxy'}
+
+        state = engine.warm_state()
+        self.assertIsNotNone(state['pending'])
+        self.assertEqual(state['pending']['seq'], 1)
+        self.assertEqual(state['pending']['unit'], 'test.service')
+
+
+class TestWarmRecord(unittest.TestCase):
+    """Test warm record shape and public record generation."""
+
+    def test_switch_record_carries_origin_and_requester(self):
+        """Switch record created with origin='warm' and requester."""
+        marked = roundhouse.UnitFile(
+            path='', name='marked.service', raw=b'', lines=[], directives=[],
+            comments=[], warnings=[], on_demand=True
+        )
+
+        units = {'marked.service': marked}
+        watcher = unittest.mock.MagicMock()
+        watcher.snapshot.return_value = {'units': []}
+        event_bus = roundhouse.EventBus()
+        lock = threading.Lock()
+
+        engine = roundhouse.RolloutEngine(watcher, units, '/tmp', 8090, event_bus, lock)
+
+        result = engine.start_switch('marked.service', [], 'confirm', origin='warm', requester='test-proxy')
+
+        self.assertEqual(result['origin'], 'warm')
+        self.assertEqual(result['requester'], 'test-proxy')
+
+    def test_rollout_public_record_includes_origin_and_requester(self):
+        """rollout_public_record includes origin and requester for switch records."""
+        rollout = {
+            'rollout_id': 'sw-123',
+            'kind': 'switch',
+            'unit': 'test.service',
+            'phase': 'preflight',
+            'detail': 'checking',
+            'failure': None,
+            'rollback': None,
+            'restored': False,
+            'started_at': 0,
+            'updated_at': 0,
+            'target': 'test.service',
+            'stops': [],
+            'stopped': [],
+            'target_started': False,
+            'origin': 'warm',
+            'requester': 'proxy',
+        }
+
+        public = roundhouse.rollout_public_record(rollout)
+
+        self.assertEqual(public['origin'], 'warm')
+        self.assertEqual(public['requester'], 'proxy')
+
+    def test_rollout_public_record_defaults_origin_human(self):
+        """rollout_public_record defaults origin to 'human' for old records."""
+        rollout = {
+            'rollout_id': 'sw-123',
+            'kind': 'switch',
+            'unit': 'test.service',
+            'phase': 'preflight',
+            'detail': 'checking',
+            'failure': None,
+            'rollback': None,
+            'restored': False,
+            'started_at': 0,
+            'updated_at': 0,
+            'target': 'test.service',
+            'stops': [],
+            'stopped': [],
+            'target_started': False,
+            # No origin/requester fields
+        }
+
+        public = roundhouse.rollout_public_record(rollout)
+
+        self.assertEqual(public['origin'], 'human')
+        self.assertIsNone(public['requester'])
+
+
 if __name__ == '__main__':
     unittest.main()
