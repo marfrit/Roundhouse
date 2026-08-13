@@ -114,6 +114,12 @@ for root, dirs, files in os.walk(CHOME + '/.config'):
         shutil.chown(os.path.join(root, n), CUSER, CUSER)
 PYEOF
 
+echo "-- checking for git in container"
+if ! incus exec "$CONTAINER" -- su -l "$CUSER" -c 'git --version' >/dev/null 2>&1; then
+    echo "Error: git not found in container. Install with: incus exec $CONTAINER -- apt-get install -y git" >&2
+    exit 1
+fi
+
 echo "-- reloading and arming the :8086 pair"
 incus exec "$CONTAINER" -- su -l "$CUSER" -c 'systemctl --user daemon-reload'
 # llama-task enabled + running is one half of the :8086 collision; the other half
@@ -126,7 +132,21 @@ echo
 echo "-- installed units"
 incus exec "$CONTAINER" -- su -l "$CUSER" -c 'systemctl --user list-unit-files --no-pager | grep -E "llama|qwen|mixpert" || true'
 echo
-echo "Setup complete. Start Roundhouse in the container with:"
+echo "Setup complete."
+echo
+echo "FOR MVP2 DRILLS (if --actuate is to be used):"
+echo "1. Initialize the git repo in the container (execute as $CUSER in the container unit dir):"
+echo "   incus exec $CONTAINER -- su -l $CUSER -c 'cd ~/.config/systemd/user && git init && printf \"%s\\n\" \"*.bak*\" \"*.roundhouse-tmp\" > .gitignore && git add .gitignore qwen3.6-coding.service llama-server-qwen35-npu.service llama-task.service llama-server-gemma4-q4km.service mixperten.service && git commit -m \"roundhouse baseline: 5 managed units\"'"
+echo
+echo "2. Start Roundhouse with --actuate:"
+echo "   incus exec $CONTAINER -- su -l $CUSER -c \\"
+echo "     'nohup python3 $DEST/mvp1/roundhouse.py --serve --actuate --port 8090 >/tmp/roundhouse.log 2>&1 &'"
+echo
+echo "3. Find the token:"
+echo "   incus exec $CONTAINER -- su -l $CUSER -c 'cat ~/.config/roundhouse/token'"
+echo
+echo "FOR MVP1 READ-ONLY:"
 echo "  incus exec $CONTAINER -- su -l $CUSER -c \\"
 echo "    'nohup python3 $DEST/mvp1/roundhouse.py --serve --port 8090 >/tmp/roundhouse.log 2>&1 &'"
+echo
 echo "Then, from the host: curl http://127.0.0.1:8090/api/units"

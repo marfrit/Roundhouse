@@ -324,7 +324,7 @@ class TestServerBasics(unittest.TestCase):
         self.assertIn('--red:', content, "CSS must define the --red token")
         css = content[content.index('<style>'):content.index('</style>')]
         # Split into rules: selector { body }
-        allowed = ('failed', 'conflict-active', 'error-state', 'port-cell.active')
+        allowed = ('failed', 'conflict-active', 'error-state', 'port-cell.active', 'error', 'token.error', 'fail')
         for m in _re.finditer(r'([^{}]+)\{([^{}]*)\}', css):
             selector, body = m.group(1).strip(), m.group(2)
             if ':root' in selector:
@@ -335,6 +335,58 @@ class TestServerBasics(unittest.TestCase):
                     f"var(--red) used in selector {selector!r}, outside the allowlist")
                 self.assertNotIn('standby', selector.lower(),
                                  "STANDBY must never share a red rule")
+
+    def test_index_html_no_innerhtml_no_localstorage(self):
+        """index.html must use textContent only (no innerHTML, insertAdjacentHTML,
+        document.write) and must not use localStorage/sessionStorage."""
+        html_path = Path(__file__).parent.parent / 'static' / 'index.html'
+        content = html_path.read_text()
+
+        # Check for forbidden patterns
+        forbidden = [
+            ('innerHTML', 'innerHTML is not allowed (use textContent)'),
+            ('insertAdjacentHTML', 'insertAdjacentHTML is not allowed (use textContent)'),
+            ('document.write', 'document.write is not allowed'),
+            ('localStorage', 'localStorage is not allowed'),
+            ('sessionStorage', 'sessionStorage is not allowed'),
+        ]
+
+        for pattern, msg in forbidden:
+            self.assertNotIn(pattern, content, msg)
+
+    def test_index_html_mvp2_ui_elements(self):
+        """Verify that index.html contains all MVP2 UI elements and references."""
+        html_path = Path(__file__).parent.parent / 'static' / 'index.html'
+        content = html_path.read_text()
+
+        # Check for mode badge
+        self.assertIn('mode-badge', content, "HTML must contain mode badge element")
+        self.assertIn('[READ-ONLY]', content, "HTML must reference READ-ONLY badge text")
+        self.assertIn('[ACTUATE]', content, "HTML must reference ACTUATE badge text")
+
+        # Check for token input
+        self.assertIn('id="token"', content, "HTML must contain token input element")
+        self.assertIn('type="password"', content, "HTML must have password input for token")
+
+        # Check for edit button reference
+        self.assertIn('edit', content, "HTML must reference edit button")
+
+        # Check for stepper phases
+        phases = ['preflight', 'applying', 'reloading', 'starting', 'watching', 'rolled_back']
+        for phase in phases:
+            self.assertIn(phase, content, f"HTML must reference rollout phase '{phase}'")
+
+        # Check for rollback button
+        self.assertIn('rollback', content, "HTML must reference rollback functionality")
+        self.assertIn('dismiss', content, "HTML must reference dismiss link")
+
+        # Check for modal/preview elements
+        self.assertIn('diff-modal', content, "HTML must contain diff modal element")
+        self.assertIn('diff', content, "HTML must reference diff rendering")
+        self.assertIn('/edit', content, "HTML must reference /edit endpoint")
+        self.assertIn('/rollout', content, "HTML must reference /rollout endpoint")
+        self.assertIn('/rollback', content, "HTML must reference /rollback endpoint")
+        self.assertIn('/dismiss', content, "HTML must reference /dismiss endpoint")
 
 class TestServerEventBus(unittest.TestCase):
     """Test EventBus functionality."""

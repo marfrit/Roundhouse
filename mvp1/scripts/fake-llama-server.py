@@ -16,16 +16,24 @@ def main():
     # Parse args, ignoring unknown ones
     parser = argparse.ArgumentParser(add_help=False)
     parser.add_argument('-m', '--model', type=str, default='unknown')
+    parser.add_argument('-c', '--ctx-size', type=int, default=None)
     parser.add_argument('--port', type=int, default=8080)
     args, _ = parser.parse_known_args()
 
     model = args.model
     port = args.port
+    ctx = args.ctx_size
 
     # Check env for test scenarios
     exit_1 = os.environ.get('FAKE_EXIT_1') == '1'
     busy_after = os.environ.get('FAKE_BUSY_AFTER')
     fake_load_seconds = int(os.environ.get('FAKE_LOAD_SECONDS', '10'))
+
+    # ctx sentinel: 424242 triggers bind failure (for rollback drill)
+    if ctx == 424242:
+        log_line('E', 'srv', f"start: couldn't bind HTTP server socket, hostname: 0.0.0.0, port: {port}")
+        log_line('E', 'srv', "llama_server: exiting due to HTTP server error")
+        sys.exit(1)
 
     if exit_1:
         # Simulate bind failure
