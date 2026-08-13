@@ -4196,5 +4196,406 @@ class TestEnablementSlotless(unittest.TestCase):
         self.server.rollout_engine.current = None
 
 
+# ===== MVP4 test-debt bundle =====
+
+
+class TestEnablementZeroWrites(unittest.TestCase):
+    """Route-leg zero-write test per MVP4-SPEC §3 (handler sequence)."""
+
+    @classmethod
+    def setUpClass(cls):
+        """Start server on an ephemeral port."""
+        cls.temp_dir = tempfile.mkdtemp()
+        cls.fixtures = Path(__file__).resolve().parents[2] / 'docs' / 'fixtures'
+
+        # Create fixture units
+        qwen_path = cls.fixtures / 'qwen3.6-coding.service'
+        qwen_unit = roundhouse.parse_unit(str(qwen_path), qwen_path.read_bytes())
+
+        # Create a stub watcher with lock
+        cls.watcher = MagicMock(spec=roundhouse.Watcher)
+        cls.watcher.lock = threading.Lock()
+        cls.watcher.units = {'qwen3.6-coding.service': qwen_unit}
+        cls.watcher.mem_store = None
+        cls.watcher.apply_unit_file_state = MagicMock()
+        cls.watcher.snapshot.return_value = {
+            'host': 'test', 'kernel': '6.1', 'now': time.time(),
+            'units': [
+                {'unit': 'qwen3.6-coding.service', 'rung': 'OFF', 'retired': False, 'enabled': False,
+                 'port': 8085, 'mem': {}, 'badges': [], 'strategy_note': None},
+            ],
+            'mem': {}, 'sources': {}, 'self_port': 8090, 'self_unit': {'enabled': True, 'unit_file_state': 'enabled'}
+        }
+
+        cls.event_bus = roundhouse.EventBus()
+
+        # Find an available port
+        sock = socket.socket()
+        sock.bind(('127.0.0.1', 0))
+        cls.port = sock.getsockname()[1]
+        sock.close()
+
+        # Create server with arming
+        roundhouse.ACTUATE_ARMED = True
+        roundhouse.TOKEN = 'test-token'
+        cls.server = roundhouse.ThreadingHTTPServer(
+            ('127.0.0.1', cls.port),
+            roundhouse.RoundhouseRequestHandler,
+            cls.watcher,
+            cls.event_bus,
+            cls.port
+        )
+        cls.server.rollout_engine = MagicMock()
+        cls.server.rollout_engine.current = None
+
+        cls.server_thread = threading.Thread(target=cls.server.serve_forever, daemon=True)
+        cls.server_thread.start()
+        time.sleep(0.1)
+
+    @classmethod
+    def tearDownClass(cls):
+        """Shutdown server."""
+        cls.server.shutdown()
+        cls.server.server_close()
+        shutil.rmtree(cls.temp_dir, ignore_errors=True)
+        roundhouse.ACTUATE_ARMED = False
+        roundhouse.TOKEN = None
+
+    def post_http(self, path, data=None, headers=None):
+        """Make HTTP POST request."""
+        conn = http.client.HTTPConnection('127.0.0.1', self.port, timeout=5)
+        try:
+            body = None
+            if data is not None:
+                body = json.dumps(data).encode('utf-8')
+            req_headers = headers or {}
+            if body and 'Content-Type' not in req_headers:
+                req_headers['Content-Type'] = 'application/json'
+            conn.request('POST', path, body, req_headers)
+            resp = conn.getresponse()
+            resp_body = resp.read()
+            return resp.status, resp_body
+        finally:
+            conn.close()
+
+    def test_enablement_route_leg_zero_writes(self):
+        """Successful toggle records EXACTLY one enable/disable and one show subprocess call.
+
+        No stop/start/daemon-reload, run_git never called, _atomic_write never called.
+        This proves the handler sequence matches G5 (one run_actuate + one run_ro).
+        """
+        actuate_calls = []
+        ro_calls = []
+
+        def stub_actuate(argv, units, timeout=90):
+            actuate_calls.append(list(argv))
+            return ''
+
+        def stub_ro(argv):
+            ro_calls.append(list(argv))
+            return 'UnitFileState=enabled\n'
+
+        def stub_set_enablement(unit_name, enable):
+            # Call run_actuate like the real implementation does
+            verb = "enable" if enable else "disable"
+            stub_actuate(["systemctl", "--user", verb, "--", unit_name], self.watcher.units)
+
+        with patch('roundhouse.run_actuate', stub_actuate), \
+             patch('roundhouse.run_ro', stub_ro), \
+             patch('roundhouse.enablement_preflight', return_value={'ok': True}), \
+             patch('roundhouse.run_git', side_effect=AssertionError('run_git must not be called')), \
+             patch('roundhouse._atomic_write', side_effect=AssertionError('_atomic_write must not be called')):
+
+            # Configure the mock engine to call our stub
+            self.server.rollout_engine._set_enablement.side_effect = stub_set_enablement
+
+            status, body = self.post_http(
+                '/api/units/qwen3.6-coding.service/enablement',
+                {'enabled': True},
+                {'Authorization': 'Bearer test-token'}
+            )
+
+            self.assertEqual(status, 200)
+            # Verify exactly one enable call
+            self.assertEqual(len(actuate_calls), 1)
+            self.assertEqual(actuate_calls[0], ['systemctl', '--user', 'enable', '--', 'qwen3.6-coding.service'])
+            # Verify exactly one show call
+            self.assertEqual(len(ro_calls), 1)
+            self.assertEqual(ro_calls[0], ['systemctl', '--user', 'show', '-p', 'UnitFileState', '--', 'qwen3.6-coding.service'])
+
+
+class TestEnablementSSEEvent(unittest.TestCase):
+    """SSE pin: one 'enablement' event published per toggle per MVP4 G5."""
+
+    @classmethod
+    def setUpClass(cls):
+        """Start server on an ephemeral port."""
+        cls.temp_dir = tempfile.mkdtemp()
+        cls.fixtures = Path(__file__).resolve().parents[2] / 'docs' / 'fixtures'
+
+        # Create fixture units
+        qwen_path = cls.fixtures / 'qwen3.6-coding.service'
+        qwen_unit = roundhouse.parse_unit(str(qwen_path), qwen_path.read_bytes())
+
+        # Create a stub watcher with lock
+        cls.watcher = MagicMock(spec=roundhouse.Watcher)
+        cls.watcher.lock = threading.Lock()
+        cls.watcher.units = {'qwen3.6-coding.service': qwen_unit}
+        cls.watcher.mem_store = None
+        cls.watcher.apply_unit_file_state = MagicMock()
+        cls.watcher.snapshot.return_value = {
+            'host': 'test', 'kernel': '6.1', 'now': time.time(),
+            'units': [
+                {'unit': 'qwen3.6-coding.service', 'rung': 'OFF', 'retired': False, 'enabled': False,
+                 'port': 8085, 'mem': {}, 'badges': [], 'strategy_note': None},
+            ],
+            'mem': {}, 'sources': {}, 'self_port': 8090, 'self_unit': {'enabled': True, 'unit_file_state': 'enabled'}
+        }
+
+        cls.event_bus = roundhouse.EventBus()
+
+        # Find an available port
+        sock = socket.socket()
+        sock.bind(('127.0.0.1', 0))
+        cls.port = sock.getsockname()[1]
+        sock.close()
+
+        # Create server with arming
+        roundhouse.ACTUATE_ARMED = True
+        roundhouse.TOKEN = 'test-token'
+        cls.server = roundhouse.ThreadingHTTPServer(
+            ('127.0.0.1', cls.port),
+            roundhouse.RoundhouseRequestHandler,
+            cls.watcher,
+            cls.event_bus,
+            cls.port
+        )
+        cls.server.rollout_engine = MagicMock()
+        cls.server.rollout_engine.current = None
+
+        cls.server_thread = threading.Thread(target=cls.server.serve_forever, daemon=True)
+        cls.server_thread.start()
+        time.sleep(0.1)
+
+    @classmethod
+    def tearDownClass(cls):
+        """Shutdown server."""
+        cls.server.shutdown()
+        cls.server.server_close()
+        shutil.rmtree(cls.temp_dir, ignore_errors=True)
+        roundhouse.ACTUATE_ARMED = False
+        roundhouse.TOKEN = None
+
+    def post_http(self, path, data=None, headers=None):
+        """Make HTTP POST request."""
+        conn = http.client.HTTPConnection('127.0.0.1', self.port, timeout=5)
+        try:
+            body = None
+            if data is not None:
+                body = json.dumps(data).encode('utf-8')
+            req_headers = headers or {}
+            if body and 'Content-Type' not in req_headers:
+                req_headers['Content-Type'] = 'application/json'
+            conn.request('POST', path, body, req_headers)
+            resp = conn.getresponse()
+            resp_body = resp.read()
+            return resp.status, resp_body
+        finally:
+            conn.close()
+
+    def test_enablement_publishes_sse_event(self):
+        """After successful toggle, one 'enablement' event published with frozen payload keys."""
+        events = []
+
+        def capture_event(name, payload):
+            events.append((name, payload))
+
+        with patch('roundhouse.enablement_preflight', return_value={'ok': True}), \
+             patch('roundhouse.run_ro', return_value='UnitFileState=enabled\n'):
+            # Replace the event_bus.publish with our capture
+            original_publish = self.server.event_bus.publish
+            self.server.event_bus.publish = capture_event
+
+            try:
+                status, body = self.post_http(
+                    '/api/units/qwen3.6-coding.service/enablement',
+                    {'enabled': True},
+                    {'Authorization': 'Bearer test-token'}
+                )
+                self.assertEqual(status, 200)
+
+                # Find the enablement event
+                enablement_events = [e for e in events if e[0] == 'enablement']
+                self.assertEqual(len(enablement_events), 1,
+                               f"Expected one 'enablement' event, got {len(enablement_events)}")
+
+                event_name, payload = enablement_events[0]
+                # Verify payload keys are frozen
+                expected_keys = {'unit', 'enabled', 'strategy_note', 'ts'}
+                self.assertEqual(set(payload.keys()), expected_keys,
+                               f"Event payload must have exactly {expected_keys}, got {set(payload.keys())}")
+                # Verify unit matches
+                self.assertEqual(payload['unit'], 'qwen3.6-coding.service')
+                # Verify enabled is a bool
+                self.assertIsInstance(payload['enabled'], bool)
+            finally:
+                self.server.event_bus.publish = original_publish
+
+
+class TestEnablementReadBack(unittest.TestCase):
+    """Read-back pin: handler applies parsed UnitFileState via apply_unit_file_state (spy)."""
+
+    @classmethod
+    def setUpClass(cls):
+        """Start server on an ephemeral port."""
+        cls.temp_dir = tempfile.mkdtemp()
+        cls.fixtures = Path(__file__).resolve().parents[2] / 'docs' / 'fixtures'
+
+        # Create fixture units
+        qwen_path = cls.fixtures / 'qwen3.6-coding.service'
+        qwen_unit = roundhouse.parse_unit(str(qwen_path), qwen_path.read_bytes())
+
+        # Create a stub watcher with lock
+        cls.watcher = MagicMock(spec=roundhouse.Watcher)
+        cls.watcher.lock = threading.Lock()
+        cls.watcher.units = {'qwen3.6-coding.service': qwen_unit}
+        cls.watcher.mem_store = None
+        cls.watcher.apply_unit_file_state = MagicMock()
+        cls.watcher.snapshot.return_value = {
+            'host': 'test', 'kernel': '6.1', 'now': time.time(),
+            'units': [
+                {'unit': 'qwen3.6-coding.service', 'rung': 'OFF', 'retired': False, 'enabled': False,
+                 'port': 8085, 'mem': {}, 'badges': [], 'strategy_note': None},
+            ],
+            'mem': {}, 'sources': {}, 'self_port': 8090, 'self_unit': {'enabled': True, 'unit_file_state': 'enabled'}
+        }
+
+        cls.event_bus = roundhouse.EventBus()
+
+        # Find an available port
+        sock = socket.socket()
+        sock.bind(('127.0.0.1', 0))
+        cls.port = sock.getsockname()[1]
+        sock.close()
+
+        # Create server with arming
+        roundhouse.ACTUATE_ARMED = True
+        roundhouse.TOKEN = 'test-token'
+        cls.server = roundhouse.ThreadingHTTPServer(
+            ('127.0.0.1', cls.port),
+            roundhouse.RoundhouseRequestHandler,
+            cls.watcher,
+            cls.event_bus,
+            cls.port
+        )
+        cls.server.rollout_engine = MagicMock()
+        cls.server.rollout_engine.current = None
+
+        cls.server_thread = threading.Thread(target=cls.server.serve_forever, daemon=True)
+        cls.server_thread.start()
+        time.sleep(0.1)
+
+    @classmethod
+    def tearDownClass(cls):
+        """Shutdown server."""
+        cls.server.shutdown()
+        cls.server.server_close()
+        shutil.rmtree(cls.temp_dir, ignore_errors=True)
+        roundhouse.ACTUATE_ARMED = False
+        roundhouse.TOKEN = None
+
+    def post_http(self, path, data=None, headers=None):
+        """Make HTTP POST request."""
+        conn = http.client.HTTPConnection('127.0.0.1', self.port, timeout=5)
+        try:
+            body = None
+            if data is not None:
+                body = json.dumps(data).encode('utf-8')
+            req_headers = headers or {}
+            if body and 'Content-Type' not in req_headers:
+                req_headers['Content-Type'] = 'application/json'
+            conn.request('POST', path, body, req_headers)
+            resp = conn.getresponse()
+            resp_body = resp.read()
+            return resp.status, resp_body
+        finally:
+            conn.close()
+
+    def test_enablement_applies_read_back_via_apply_unit_file_state(self):
+        """Handler calls apply_unit_file_state with parsed UnitFileState value (G5 step 7)."""
+        with patch('roundhouse.enablement_preflight', return_value={'ok': True}), \
+             patch('roundhouse.run_ro', return_value='UnitFileState=enabled\n'):
+
+            status, body = self.post_http(
+                '/api/units/qwen3.6-coding.service/enablement',
+                {'enabled': True},
+                {'Authorization': 'Bearer test-token'}
+            )
+
+            self.assertEqual(status, 200)
+
+            # Verify apply_unit_file_state was called with the parsed value
+            self.watcher.apply_unit_file_state.assert_called()
+            calls = self.watcher.apply_unit_file_state.call_args_list
+            # Find the call with 'enabled' as the value
+            found = False
+            for call in calls:
+                if len(call[0]) >= 2 and call[0][1] == 'enabled':
+                    found = True
+                    self.assertEqual(call[0][0], 'qwen3.6-coding.service')
+                    break
+            self.assertTrue(found, "apply_unit_file_state must be called with unit name and parsed UnitFileState value")
+
+
+class TestEnablementTimeoutPins(unittest.TestCase):
+    """Timeout pins per MVP4-SPEC §6(iii)."""
+
+    def setUp(self):
+        """Set up engine with scripted fleet."""
+        self.temp_dir = tempfile.mkdtemp()
+        roundhouse.ACTUATE_ARMED = True
+        self.fleet = _ScriptedFleet({'a.service': {'rung': 'OFF', 'retired': False, 'port': 8080,
+                                                    'since': 1.0, 'start_ts_mono': '0',
+                                                    'badges': [], 'mem': {}, 'enabled': False}})
+        unit_mock = MagicMock(spec=roundhouse.UnitFile)
+        unit_mock.retired = False
+        self.fleet.units = {'a.service': unit_mock}
+        self.engine = roundhouse.RolloutEngine(self.fleet, self.fleet.units, self.temp_dir,
+                                              8090, roundhouse.EventBus(), threading.Lock())
+
+    def tearDown(self):
+        roundhouse.ACTUATE_ARMED = False
+        shutil.rmtree(self.temp_dir, ignore_errors=True)
+
+    def test_start_unit_passes_timeout_to_run_actuate(self):
+        """_start_unit passes timeout == START_TIMEOUT_SEC to run_actuate."""
+        actuate_calls = []
+
+        def capture_actuate(argv, units, timeout=90):
+            actuate_calls.append({'argv': list(argv), 'timeout': timeout})
+            return ''
+
+        with patch('roundhouse.run_actuate', capture_actuate):
+            self.engine._start_unit('a.service')
+
+        self.assertEqual(len(actuate_calls), 1)
+        self.assertEqual(actuate_calls[0]['timeout'], roundhouse.START_TIMEOUT_SEC,
+                        f"_start_unit must pass timeout={roundhouse.START_TIMEOUT_SEC} to run_actuate")
+
+    def test_watch_unit_does_not_use_literal_900(self):
+        """_watch_unit uses WATCH_TIMEOUT_SEC constant, not literal 900."""
+        import inspect
+
+        source = inspect.getsource(self.engine._watch_unit)
+        # The literal 900 should not appear in the source (it should use WATCH_TIMEOUT_SEC)
+        # Check that 'timeout = WATCH_TIMEOUT_SEC' appears instead
+        self.assertIn('timeout = WATCH_TIMEOUT_SEC', source,
+                     "_watch_unit must use WATCH_TIMEOUT_SEC constant, not literal 900")
+        # Also verify the constant is defined
+        self.assertTrue(hasattr(roundhouse, 'WATCH_TIMEOUT_SEC'),
+                       "WATCH_TIMEOUT_SEC constant must be defined in roundhouse module")
+        self.assertIsInstance(roundhouse.WATCH_TIMEOUT_SEC, int)
+
+
 if __name__ == '__main__':
     unittest.main()

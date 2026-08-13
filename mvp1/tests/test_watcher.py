@@ -863,5 +863,168 @@ class TestMeasuredLoadSeconds(unittest.TestCase):
         self.assertEqual(phases, {'ready', 'exit'})
 
 
+class TestApplyUnitFileState(unittest.TestCase):
+    """Test Watcher.apply_unit_file_state per MVP4 G5."""
+
+    def test_apply_unit_file_state_does_not_stamp_sensed_at(self):
+        """apply_unit_file_state sets unit_file_state but NEVER stamps sensed_at.
+
+        This protects _confirm_off's freshness gate: sensed_at must reflect when the
+        ActiveState was last sampled, not when the UnitFileState was read back.
+        """
+        unit = MagicMock()
+        unit.name = 'test.service'
+        units = {'test.service': unit}
+
+        watcher = roundhouse.Watcher(units, '6.1.0', None)
+
+        # Set a known sensed_at value
+        known_time = 1000.0
+        watcher._state['test.service']['sensed_at'] = known_time
+
+        # Apply a UnitFileState change
+        watcher.apply_unit_file_state('test.service', 'enabled')
+
+        # Verify unit_file_state changed
+        self.assertEqual(watcher._state['test.service']['unit_file_state'], 'enabled')
+
+        # Verify sensed_at was NOT updated
+        self.assertEqual(watcher._state['test.service']['sensed_at'], known_time,
+                        "apply_unit_file_state must NOT stamp sensed_at")
+
+
+class TestStrategyNote(unittest.TestCase):
+    """Test strategy_note truth table per MVP4 G6."""
+
+    def test_strategy_note_retired_returns_none(self):
+        """Retired units return None regardless of enabled/rung."""
+        self.assertIsNone(roundhouse.strategy_note(True, 'READY', True))
+        self.assertIsNone(roundhouse.strategy_note(False, 'OFF', True))
+        self.assertIsNone(roundhouse.strategy_note(True, 'FAILED', True))
+
+    def test_strategy_note_enabled_off_returns_returns_at_boot(self):
+        """Enabled unit in OFF rung returns 'returns at boot'."""
+        result = roundhouse.strategy_note(True, 'OFF', False)
+        self.assertEqual(result, "returns at boot")
+
+    def test_strategy_note_enabled_standby_returns_returns_at_boot(self):
+        """Enabled unit in STANDBY rung returns 'returns at boot'."""
+        result = roundhouse.strategy_note(True, 'STANDBY', False)
+        self.assertEqual(result, "returns at boot")
+
+    def test_strategy_note_enabled_failed_returns_returns_at_boot(self):
+        """Enabled unit in FAILED rung returns 'returns at boot'."""
+        result = roundhouse.strategy_note(True, 'FAILED', False)
+        self.assertEqual(result, "returns at boot")
+
+    def test_strategy_note_disabled_loading_returns_manual(self):
+        """Disabled unit in LOADING (active rung) returns 'manual — will not survive reboot'."""
+        result = roundhouse.strategy_note(False, 'LOADING', False)
+        self.assertEqual(result, "manual — will not survive reboot")
+
+    def test_strategy_note_disabled_starting_returns_manual(self):
+        """Disabled unit in STARTING (active rung) returns 'manual — will not survive reboot'."""
+        result = roundhouse.strategy_note(False, 'STARTING', False)
+        self.assertEqual(result, "manual — will not survive reboot")
+
+    def test_strategy_note_disabled_ready_returns_manual(self):
+        """Disabled unit in READY (active rung) returns 'manual — will not survive reboot'."""
+        result = roundhouse.strategy_note(False, 'READY', False)
+        self.assertEqual(result, "manual — will not survive reboot")
+
+    def test_strategy_note_disabled_busy_returns_manual(self):
+        """Disabled unit in BUSY (active rung) returns 'manual — will not survive reboot'."""
+        result = roundhouse.strategy_note(False, 'BUSY', False)
+        self.assertEqual(result, "manual — will not survive reboot")
+
+    def test_strategy_note_enabled_ready_returns_none(self):
+        """Enabled unit in READY rung returns None."""
+        self.assertIsNone(roundhouse.strategy_note(True, 'READY', False))
+
+    def test_strategy_note_enabled_loading_returns_none(self):
+        """Enabled unit in LOADING rung returns None."""
+        self.assertIsNone(roundhouse.strategy_note(True, 'LOADING', False))
+
+    def test_strategy_note_disabled_off_returns_none(self):
+        """Disabled unit in OFF rung returns None."""
+        self.assertIsNone(roundhouse.strategy_note(False, 'OFF', False))
+
+    def test_strategy_note_disabled_standby_returns_none(self):
+        """Disabled unit in STANDBY rung returns None."""
+        self.assertIsNone(roundhouse.strategy_note(False, 'STANDBY', False))
+
+    def test_strategy_note_disabled_failed_returns_none(self):
+        """Disabled unit in FAILED rung returns None."""
+        self.assertIsNone(roundhouse.strategy_note(False, 'FAILED', False))
+
+
+class TestApplySystemctlShowRoundhouse(unittest.TestCase):
+    """Test apply_systemctl_show with roundhouse.service block per MVP4 G8."""
+
+    def test_apply_systemctl_show_pops_roundhouse_service_into_self_unit_file_state(self):
+        """When roundhouse.service is in the blocks, it is popped and stored as self_unit_file_state."""
+        unit = MagicMock()
+        unit.name = 'qwen3.6-coding.service'
+        units = {'qwen3.6-coding.service': unit}
+
+        watcher = roundhouse.Watcher(units, '6.1.0', None)
+
+        # Initial state
+        self.assertEqual(watcher.self_unit_file_state, '')
+
+        # Apply with roundhouse.service included
+        props = {
+            'qwen3.6-coding.service': {
+                'ActiveState': 'inactive',
+                'SubState': 'dead',
+                'NRestarts': '0',
+                'ExecMainStartTimestampMonotonic': '0',
+                'UnitFileState': 'disabled'
+            },
+            'roundhouse.service': {
+                'ActiveState': 'active',
+                'SubState': 'running',
+                'UnitFileState': 'enabled'
+            }
+        }
+
+        events = watcher.apply_systemctl_show(props)
+
+        # Verify roundhouse.service was popped and stored
+        self.assertEqual(watcher.self_unit_file_state, 'enabled')
+
+        # Verify roundhouse.service is NOT in per-unit state
+        self.assertNotIn('roundhouse.service', watcher._state)
+
+        # Verify props was modified (roundhouse.service popped)
+        self.assertNotIn('roundhouse.service', props)
+
+        # Verify the known unit was processed
+        self.assertEqual(watcher._state['qwen3.6-coding.service']['unit_file_state'], 'disabled')
+
+    def test_apply_systemctl_show_handles_missing_roundhouse_service(self):
+        """When roundhouse.service is not in the blocks, self_unit_file_state stays empty."""
+        unit = MagicMock()
+        unit.name = 'qwen3.6-coding.service'
+        units = {'qwen3.6-coding.service': unit}
+
+        watcher = roundhouse.Watcher(units, '6.1.0', None)
+
+        props = {
+            'qwen3.6-coding.service': {
+                'ActiveState': 'inactive',
+                'SubState': 'dead',
+                'NRestarts': '0',
+                'ExecMainStartTimestampMonotonic': '0',
+                'UnitFileState': 'disabled'
+            }
+        }
+
+        events = watcher.apply_systemctl_show(props)
+
+        # self_unit_file_state should still be empty (default)
+        self.assertEqual(watcher.self_unit_file_state, '')
+
+
 if __name__ == '__main__':
     unittest.main()

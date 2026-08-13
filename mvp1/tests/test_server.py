@@ -834,9 +834,9 @@ class TestWriteGuards(unittest.TestCase):
     def test_snapshot_calls_locked(self):
         """Every snapshot() call must be inside a with-block or inside locked_snapshot.
 
-        Regression guard (§7.1 item 3): proves that snapshot() is always taken under
-        watcher.lock or via the locked_snapshot() helper; unlocked calls deadlock
-        the worker threads (Risk 2).
+        Regression guard (§7.1 item 3): proves the presence of with-blocks around
+        snapshot() calls, not lock identity — a wrong-lock with-block would pass
+        this guard. Unlocked calls would deadlock the worker threads (Risk 2).
         """
         import ast
         source, tree = self._tree()
