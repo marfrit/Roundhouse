@@ -2159,6 +2159,7 @@ class RoundhouseRequestHandler(http.server.BaseHTTPRequestHandler):
         is_post_route = (
             (route.startswith('/api/units/') and route.endswith('/edit')) or
             (route.startswith('/api/units/') and route.endswith('/rollout')) or
+            (route.startswith('/api/units/') and route.endswith('/enablement')) or
             (route.startswith('/api/rollouts/') and route.endswith('/rollback')) or
             (route.startswith('/api/rollouts/') and route.endswith('/dismiss')) or
             route == '/api/switch/preview' or
@@ -2205,6 +2206,9 @@ class RoundhouseRequestHandler(http.server.BaseHTTPRequestHandler):
         elif route.startswith('/api/units/') and route.endswith('/rollout'):
             unit_name = urllib.parse.unquote(route[len('/api/units/'):-len('/rollout')])
             self.handle_rollout(unit_name)
+        elif route.startswith('/api/units/') and route.endswith('/enablement'):
+            unit_name = urllib.parse.unquote(route[len('/api/units/'):-len('/enablement')])
+            self.handle_enablement(unit_name)
         elif route.startswith('/api/rollouts/') and route.endswith('/rollback'):
             rollout_id = urllib.parse.unquote(route[len('/api/rollouts/'):-len('/rollback')])
             self.handle_rollback(rollout_id)
@@ -2427,6 +2431,108 @@ class RoundhouseRequestHandler(http.server.BaseHTTPRequestHandler):
                 self.wfile.write(json.dumps(response).encode('utf-8'))
             else:
                 self.send_json_error(400, 'rollout_error', str(e))
+
+    def handle_enablement(self, unit_name: str):
+        """Handle POST /api/units/<name>/enablement (enable/disable boot strategy)."""
+        # Step 1: Parse body; enabled must be True or False (strict bool)
+        try:
+            content_length = int(self.headers.get('Content-Length', 0))
+            body = self.rfile.read(content_length)
+            data = json.loads(body)
+        except (ValueError, json.JSONDecodeError):
+            self.send_json_error(400, 'bad_json', 'malformed JSON body')
+            return
+
+        enabled = data.get('enabled')
+        if not isinstance(enabled, bool):
+            self.send_json_error(400, 'bad_body', 'enabled must be true or false')
+            return
+
+        # Step 2: Find unit
+        watcher = self.server.watcher
+        if unit_name not in watcher.units:
+            self.send_json_error(404, 'not_found', f'unit {unit_name} not found')
+            return
+
+        # Step 3: Get engine
+        engine = self.server.rollout_engine
+        if not engine:
+            self.send_json_error(500, 'no_engine', 'rollout engine not initialized')
+            return
+
+        # Step 4: Preflight checks
+        snap = locked_snapshot(watcher)
+        pf = enablement_preflight(unit_name, enabled, snap, watcher.units, self.server.port)
+        if not pf['ok']:
+            self.send_response(422)
+            self.send_header('Content-Type', 'application/json; charset=utf-8')
+            self.end_headers()
+            if pf.get('port'):
+                # enable_collision
+                response = {
+                    'error': 'enable_collision',
+                    'port': pf['port'],
+                    'claimants': pf.get('claimants', []),
+                    'detail': pf.get('detail', '')
+                }
+            else:
+                # preflight_failed (e.g., retired)
+                response = {
+                    'error': 'preflight_failed',
+                    'detail': pf.get('detail', '')
+                }
+            self.wfile.write(json.dumps(response).encode('utf-8'))
+            return
+
+        # Step 5: Get the 'was' value from snapshot
+        target_row = next((u for u in snap.get('units', []) if u['unit'] == unit_name), {})
+        was = target_row.get('enabled', False)
+
+        # Step 6: Execute enablement via engine gateway
+        try:
+            engine._set_enablement(unit_name, enabled)
+        except ActuationError as e:
+            self.send_json_error(500, 'enablement_error', str(e))
+            return
+
+        # Step 7: Read back via run_ro and apply under lock
+        enabled_after = enabled  # default to requested value if read fails
+        try:
+            output = run_ro(['systemctl', '--user', 'show', '-p', 'UnitFileState', '--', unit_name])
+            for line in output.split('\n'):
+                if line.startswith('UnitFileState='):
+                    state_value = line.split('=', 1)[1]
+                    with watcher.lock:
+                        watcher.apply_unit_file_state(unit_name, state_value)
+                    enabled_after = (state_value == 'enabled')
+                    break
+        except Exception:
+            # Read-back failure: continue with requested value
+            pass
+
+        # Step 8: Compute strategy note
+        note = strategy_note(enabled_after, target_row.get('rung', 'OFF'), unit.retired if (unit := watcher.units.get(unit_name)) else False)
+
+        # Step 9: Publish SSE event
+        self.server.event_bus.publish('enablement', {
+            'unit': unit_name,
+            'enabled': enabled_after,
+            'strategy_note': note,
+            'ts': time.time()
+        })
+
+        # Step 10: Send 200 response
+        self.send_response(200)
+        self.send_header('Content-Type', 'application/json; charset=utf-8')
+        self.end_headers()
+        response = {
+            'unit': unit_name,
+            'enabled': enabled_after,
+            'was': was,
+            'changed': (was != enabled_after),
+            'strategy_note': note
+        }
+        self.wfile.write(json.dumps(response).encode('utf-8'))
 
     def handle_rollback(self, rollout_id: str):
         """Handle POST /api/rollouts/<id>/rollback."""
@@ -2821,6 +2927,7 @@ class RoundhouseRequestHandler(http.server.BaseHTTPRequestHandler):
                 'kind': 'on-boot' if row.get('enabled') else 'manual',
                 'enabled': row.get('enabled', False),
                 'gate': unit.gate,
+                'strategy_note': row.get('strategy_note')
             }
             dep['roster'] = {
                 'rung': row.get('rung', 'OFF'),
@@ -5958,11 +6065,22 @@ def _build_port_board(snapshot: Dict) -> Dict:
             'self': port == self_port,
         })
 
+    # Compute boot status for self cell (G8)
+    self_unit = snapshot.get('self_unit', {})
+    self_unit_file_state = self_unit.get('unit_file_state', '')
+    if self_unit_file_state == 'enabled':
+        boot_note = 'enabled'
+    elif self_unit_file_state == 'disabled':
+        boot_note = 'manual'
+    else:
+        boot_note = 'not installed'
+
     return {
         'ports': port_list,
         'self': {
             'port': self_port,
             'claims_by_units': [c['unit'] for c in ports.get(self_port, [])],
+            'boot': boot_note,
         },
     }
 
