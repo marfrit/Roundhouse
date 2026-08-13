@@ -386,9 +386,20 @@
             color: var(--bg);
         }
 
+        .phase-chip.restored {
+            background: var(--neutral);
+            color: var(--bg);
+        }
+
+        .phase-chip.restore_failed {
+            background: var(--red);
+            color: var(--bg);
+        }
+
         .stepper-detail {
             font-size: 0.9em;
             margin-bottom: 0.5em;
+            overflow-x: auto;
         }
 
         .rollback-button-container {
@@ -586,12 +597,163 @@
             border-left: 2px solid var(--neutral);
             margin-top: 0.5em;
         }
+
+        .link-button {
+            display: inline;
+            padding: 0;
+            background: none;
+            border: none;
+            color: var(--fg);
+            text-decoration: underline;
+            cursor: pointer;
+            font-family: monospace;
+            font-size: 0.9em;
+        }
+
+        .link-button:hover {
+            background: none;
+            color: var(--neutral);
+        }
+
+        .stop-tick-row {
+            display: flex;
+            align-items: center;
+            gap: 0.5em;
+            padding: 0.5em;
+            background: var(--border);
+            margin-bottom: 0.25em;
+            border-radius: 2px;
+        }
+
+        .stop-tick-row input[type="checkbox"] {
+            cursor: pointer;
+        }
+
+        .stop-tick-row label {
+            display: flex;
+            align-items: center;
+            gap: 0.5em;
+            flex: 1;
+            cursor: pointer;
+            margin: 0;
+        }
+
+        .suggested-tag {
+            display: inline-block;
+            font-size: 0.8em;
+            color: var(--amber);
+            margin-left: 0.5em;
+        }
+
+        .kernel-wrap {
+            display: contents;
+        }
+
+        .port-board-body {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 1em;
+        }
+
+        .port-board-toggle {
+            cursor: pointer;
+            user-select: none;
+            display: none;
+            padding: 0;
+            background: none;
+            border: none;
+            font-size: inherit;
+        }
+
+        .port-board-toggle:hover {
+            background: none;
+            color: var(--fg);
+        }
+
+        body.overlay-open {
+            overflow: hidden;
+        }
+
+        @media (max-width: 700px) {
+            .header {
+                position: sticky;
+                top: 0;
+                z-index: 30;
+                background: var(--bg);
+                margin-bottom: 1em;
+                padding: 8px 0;
+                border-bottom: 1px solid var(--border);
+            }
+
+            .kernel-wrap {
+                display: none;
+            }
+
+            .port-board-body {
+                display: none;
+                flex-direction: column;
+                max-width: 100%;
+            }
+
+            .port-board-body.expanded {
+                display: flex;
+            }
+
+            .port-board-toggle {
+                display: inline;
+            }
+
+            .detail-pane.active, .modal.active .modal-content {
+                position: fixed;
+                inset: 0;
+                width: auto;
+                max-width: none;
+                max-height: none;
+                margin: 0;
+                overflow-y: auto;
+                z-index: 40;
+                border-radius: 0;
+                border-left: none;
+            }
+
+            .detail-table {
+                table-layout: fixed;
+                word-break: break-all;
+            }
+
+            body {
+                overflow-x: hidden;
+            }
+
+            .unit-row, button, .off-section-toggle, .stop-tick-row {
+                min-height: 44px;
+                align-items: center;
+            }
+
+            button {
+                padding: 0.6em 1em;
+            }
+
+            .stop-tick-row input[type="checkbox"] {
+                width: 24px;
+                height: 24px;
+            }
+
+            .diff-output pre, .operator-notes, .stepper-detail {
+                overflow-x: auto;
+                max-width: 100%;
+            }
+
+            .phase-chip:not(.current) .chip-label {
+                display: none;
+            }
+        }
     </style>
 </head>
 <body>
     <div class="header">
         <div class="header-line">
-            <span class="header-title">ROUNDHOUSE · <span id="hostname">?</span> · kernel <span id="kernel">?</span>
+            <span class="header-title">ROUNDHOUSE · <span id="hostname">?</span> · <span class="kernel-wrap">kernel <span id="kernel">?</span></span>
                 <span class="mode-badge" id="mode-badge"></span>
             </span>
             <div style="display: flex; align-items: center;">
@@ -618,7 +780,7 @@
         <div class="rollback-button-container" id="rollback-container">
             <button onclick="rollback()" id="rollback-button">roll back to previous config</button>
             <span style="margin-left: 0.5em; font-size: 0.9em;">
-                <a href="#" id="dismiss-link" onclick="dismiss(event)" style="color: var(--fg); text-decoration: underline;">dismiss</a>
+                <button id="dismiss-button" class="link-button" onclick="dismiss()">dismiss</button>
             </span>
         </div>
     </div>
@@ -635,7 +797,7 @@
 
     <div class="section" id="off-section">
         <div class="section-heading off-section-toggle">
-            OFF (<span id="off-count">0</span>) [<span id="off-toggle">show</span>]
+            OFF · turntable (<span id="off-count">0</span>) [<span id="off-toggle">show</span>]
         </div>
         <div class="off-section-list" id="off-list"></div>
     </div>
@@ -654,8 +816,13 @@
     </div>
 
     <div class="port-board">
-        <span style="font-weight: bold; width: 100%; margin-bottom: 0.5em;">PORT BOARD</span>
-        <div id="port-board-cells"></div>
+        <div style="font-weight: bold; width: 100%; margin-bottom: 0.5em; display: flex; justify-content: space-between; align-items: center;">
+            <span>PORT BOARD</span>
+            <button class="port-board-toggle" id="port-board-toggle" onclick="togglePortBoard()">[show]</button>
+        </div>
+        <div class="port-board-body" id="port-board-body">
+            <div id="port-board-cells"></div>
+        </div>
     </div>
 
     <div class="detail-pane" id="detail-pane">
@@ -685,6 +852,36 @@
         </div>
     </div>
 
+    <div class="modal" id="switch-modal">
+        <div class="modal-content">
+            <div class="modal-heading">Switch to Unit</div>
+            <div class="modal-section">
+                <div class="modal-heading" style="font-weight: normal; font-size: 0.9em;">Target</div>
+                <div id="switch-target-line"></div>
+            </div>
+            <div class="modal-section">
+                <div class="modal-heading" style="font-weight: normal; font-size: 0.9em;">Stop Candidates</div>
+                <div id="switch-candidates"></div>
+            </div>
+            <div class="modal-section">
+                <div class="modal-heading" style="font-weight: normal; font-size: 0.9em;">Memory Check</div>
+                <div id="switch-fit-line"></div>
+            </div>
+            <div class="modal-section">
+                <div class="modal-heading" style="font-weight: normal; font-size: 0.9em;">Port Check</div>
+                <div id="switch-port-line"></div>
+            </div>
+            <div class="modal-section" id="switch-notices-section" style="display: none;">
+                <div class="modal-heading" style="font-weight: normal; font-size: 0.9em;">Notices</div>
+                <div id="switch-notices"></div>
+            </div>
+            <div class="form-buttons">
+                <button id="switch-button" onclick="submitSwitch()" disabled>switch</button>
+                <button onclick="closeSwitchModal()">cancel</button>
+            </div>
+        </div>
+    </div>
+
     <script>
         let state = {
             host: '?',
@@ -703,6 +900,9 @@
         let currentEditUnit = null;
         let pendingDiffData = null;
         let pendingRolloutId = null;
+        let pendingSwitchData = null;
+        let pendingSwitchTarget = null;
+        let pendingSwitchStops = [];
 
         const eventSource = new EventSource('/api/events');
 
@@ -749,8 +949,9 @@
 
         eventSource.addEventListener('rollout', (e) => {
             const data = JSON.parse(e.data);
-            state.rollout = data;
-            renderRolloutStepper();
+            if (data.rollout_id) {
+                refreshOperation(data.rollout_id);
+            }
         });
 
         eventSource.onerror = () => {
@@ -999,6 +1200,16 @@
                 .catch(e => console.error('Error fetching unit detail:', e));
         }
 
+        function refreshOperation(id) {
+            fetch('/api/rollouts/' + encodeURIComponent(id))
+                .then(r => r.json())
+                .then(data => {
+                    state.rollout = data;
+                    renderRolloutStepper();
+                })
+                .catch(e => console.error('Error fetching operation:', e));
+        }
+
         function showDetail(unit) {
             const pane = document.getElementById('detail-pane');
             const content = document.getElementById('detail-content');
@@ -1019,6 +1230,13 @@
 
             const mode = state.mode || 'read-only';
             if (mode === 'actuate' && !unit.retired) {
+                if (unit.rung === 'OFF') {
+                    const switchBtn = document.createElement('button');
+                    switchBtn.textContent = 'switch to this';
+                    switchBtn.className = 'edit-button';
+                    switchBtn.onclick = () => previewSwitch(unit);
+                    titleDiv.appendChild(switchBtn);
+                }
                 const editBtn = document.createElement('button');
                 editBtn.textContent = 'edit';
                 editBtn.className = 'edit-button';
@@ -1156,11 +1374,13 @@
                 content.appendChild(notesDiv);
             }
 
+            document.body.classList.add('overlay-open');
             pane.classList.add('active');
         }
 
         function closeDetail() {
             document.getElementById('detail-pane').classList.remove('active');
+            document.body.classList.remove('overlay-open');
         }
 
         function showDegradedBanner(msg) {
@@ -1262,7 +1482,7 @@
             leftDiv.className = 'edit-form-left';
 
             // Gate notice
-            if (unit.gate && unit.gate.kind === 'STANDBY') {
+            if (unit.gate && unit.rung === 'STANDBY') {
                 const notice = document.createElement('div');
                 notice.className = 'gate-notice';
                 notice.textContent = 'Unit is kernel-gated (STANDBY): the edit can be applied but the unit cannot be started on this kernel';
@@ -1468,11 +1688,13 @@
             const applyBtn = document.getElementById('apply-button');
             applyBtn.disabled = !preflight.ok;
 
+            document.body.classList.add('overlay-open');
             modal.classList.add('active');
         }
 
         function closeDiffModal() {
             document.getElementById('diff-modal').classList.remove('active');
+            document.body.classList.remove('overlay-open');
         }
 
         function applyRollout() {
@@ -1500,8 +1722,7 @@
                     if (status === 202) {
                         closeDiffModal();
                         document.getElementById('edit-form-container').classList.remove('active');
-                        state.rollout = data;
-                        renderRolloutStepper();
+                        refreshOperation(data.rollout_id);
                     } else if (status === 409) {
                         if (data.error === 'preview_stale') {
                             alert('File changed on disk — re-previewing');
@@ -1527,7 +1748,10 @@
 
             stepper.classList.add('active');
 
-            const phases = ['preflight', 'applying', 'reloading', 'starting', 'watching', 'done'];
+            const isSwitch = rollout.kind === 'switch';
+            const phases = isSwitch ?
+                ['preflight', 'stopping', 'starting', 'watching', 'done'] :
+                ['preflight', 'applying', 'reloading', 'starting', 'watching', 'done'];
             const currentPhase = rollout.phase || 'preflight';
 
             const phasesDiv = document.getElementById('stepper-phases');
@@ -1536,40 +1760,297 @@
             for (const phase of phases) {
                 const chip = document.createElement('div');
                 chip.className = 'phase-chip';
-                chip.textContent = phase;
+                const iconSpan = document.createElement('span');
+                iconSpan.className = 'chip-icon';
+                const labelSpan = document.createElement('span');
+                labelSpan.className = 'chip-label';
+                labelSpan.textContent = phase;
+
+                chip.appendChild(iconSpan);
+                chip.appendChild(labelSpan);
 
                 if (phase === currentPhase) {
                     chip.classList.add('current');
-                }
-                if (phase === 'done' && rollout.ok) {
+                    iconSpan.textContent = '●';
+                } else if (rollout.phase === 'done' && phases.indexOf(phase) < phases.indexOf('done')) {
                     chip.classList.add('done');
-                }
-                if (rollout.failure && (phase === currentPhase || (phase === 'done' && rollout.phase === 'failed'))) {
+                    iconSpan.textContent = '✓';
+                } else if (rollout.phase === 'failed' && phases.indexOf(phase) <= phases.indexOf('done')) {
                     chip.classList.add('failed');
-                }
-                if (rollout.phase === 'rolled_back') {
-                    chip.classList.add('rolled_back');
+                    iconSpan.textContent = '✗';
+                } else if (rollout.phase === 'rolled_back' || rollout.phase === 'restored') {
+                    chip.classList.add(rollout.phase);
+                    iconSpan.textContent = '✓';
+                } else {
+                    iconSpan.textContent = '·';
                 }
 
                 phasesDiv.appendChild(chip);
             }
 
-            if (rollout.phase === 'rolling_back') {
-                const rollbackChip = document.createElement('div');
-                rollbackChip.className = 'phase-chip current';
-                rollbackChip.textContent = 'rolling_back';
-                phasesDiv.appendChild(rollbackChip);
+            if (isSwitch && (rollout.phase === 'restoring' || rollout.phase === 'restore_failed' || rollout.phase === 'restored')) {
+                const restoringChip = document.createElement('div');
+                restoringChip.className = 'phase-chip' + (rollout.phase === 'restoring' ? ' current' : '');
+                const icon = document.createElement('span');
+                icon.className = 'chip-icon';
+                if (rollout.phase === 'restoring') icon.textContent = '●';
+                else if (rollout.phase === 'restored') {
+                    icon.textContent = '✓';
+                    restoringChip.classList.add('restored');
+                } else if (rollout.phase === 'restore_failed') {
+                    icon.textContent = '✗';
+                    restoringChip.classList.add('restore_failed');
+                }
+                const label = document.createElement('span');
+                label.className = 'chip-label';
+                label.textContent = 'restoring';
+                restoringChip.appendChild(icon);
+                restoringChip.appendChild(label);
+                phasesDiv.appendChild(restoringChip);
             }
 
             const detailDiv = document.getElementById('stepper-detail');
             detailDiv.textContent = (rollout.detail || '');
 
             const rollbackContainer = document.getElementById('rollback-container');
+            const buttonText = isSwitch ? 'restore previous fleet' : 'roll back to previous config';
+            const buttonElem = document.getElementById('rollback-button');
+            buttonElem.textContent = buttonText;
             if (rollout.failure && rollout.rollback && rollout.rollback.offered) {
                 rollbackContainer.classList.add('active');
             } else {
                 rollbackContainer.classList.remove('active');
             }
+        }
+
+        function togglePortBoard() {
+            const body = document.getElementById('port-board-body');
+            const toggle = document.getElementById('port-board-toggle');
+            body.classList.toggle('expanded');
+            toggle.textContent = body.classList.contains('expanded') ? '[hide]' : '[show]';
+        }
+
+        function previewSwitch(unit) {
+            const body = JSON.stringify({ target: unit.unit, stops: [] });
+            fetch('/api/switch/preview', {
+                method: 'POST',
+                headers: makeAuthHeaders(),
+                body: body
+            })
+                .then(r => r.json().then(data => ({ status: r.status, data })))
+                .then(({ status, data }) => {
+                    if (status === 200 || status === 422) {
+                        pendingSwitchData = data;
+                        pendingSwitchTarget = unit.unit;
+                        pendingSwitchStops = data.stops || [];
+                        showSwitchModal(data);
+                    } else if (status === 401) {
+                        showTokenError();
+                    } else {
+                        alert('Error: ' + (data.error || 'unknown error'));
+                    }
+                })
+                .catch(e => console.error('Error:', e));
+        }
+
+        function showSwitchModal(previewData) {
+            const modal = document.getElementById('switch-modal');
+
+            const targetLine = document.getElementById('switch-target-line');
+            targetLine.replaceChildren();
+            const targetText = document.createElement('div');
+            targetText.textContent = (previewData.target?.unit || '?') + ' · ' +
+                (previewData.target?.estimate_bytes ?
+                    (previewData.target.estimate_bytes / 1e9).toFixed(1) + ' GiB (' + previewData.target.estimate_source + ')' : '?');
+            targetLine.appendChild(targetText);
+
+            const candidatesDiv = document.getElementById('switch-candidates');
+            candidatesDiv.replaceChildren();
+            const suggested = previewData.suggested_stops || [];
+            for (const cand of (previewData.stop_candidates || [])) {
+                const label = document.createElement('label');
+                label.className = 'stop-tick-row';
+
+                const checkbox = document.createElement('input');
+                checkbox.type = 'checkbox';
+                checkbox.checked = pendingSwitchStops.includes(cand.unit);
+                checkbox.onchange = () => updateSwitchTicks();
+
+                const nameSpan = document.createElement('span');
+                nameSpan.textContent = cand.unit;
+
+                const rungSpan = document.createElement('span');
+                rungSpan.style.color = 'var(--neutral)';
+                rungSpan.textContent = cand.rung;
+
+                const residencySpan = document.createElement('span');
+                residencySpan.style.color = 'var(--neutral)';
+                residencySpan.textContent = (cand.resident_bytes ? (cand.resident_bytes / 1e9).toFixed(1) + ' GiB' : '?') +
+                    ' (' + (cand.resident_source || 'unknown') + ')';
+
+                label.appendChild(checkbox);
+                label.appendChild(nameSpan);
+                label.appendChild(rungSpan);
+                label.appendChild(residencySpan);
+
+                if (suggested.includes(cand.unit)) {
+                    const tag = document.createElement('span');
+                    tag.className = 'suggested-tag';
+                    tag.textContent = '(suggested)';
+                    label.appendChild(tag);
+                }
+
+                candidatesDiv.appendChild(label);
+            }
+
+            const fitLine = document.getElementById('switch-fit-line');
+            fitLine.replaceChildren();
+            const fit = previewData.fit || {};
+            const fitText = document.createElement('div');
+            fitText.style.color = fit.ok ? 'var(--green)' : 'var(--amber)';
+            const estimate = (fit.estimate_bytes || 0) / 1e9;
+            const available = (fit.mem_available_bytes || 0) / 1e9;
+            const freed = (fit.freed_bytes || 0) / 1e9;
+            const headroom = (fit.headroom_bytes || 0) / 1e9;
+            const budget = (fit.budget_bytes || 0) / 1e9;
+            fitText.textContent = 'estimate ' + estimate.toFixed(1) + ' GiB (' + fit.estimate_source + ') vs ' +
+                'available ' + available.toFixed(1) + ' GiB + freed ' + freed.toFixed(1) + ' GiB - headroom ' + headroom.toFixed(1) + ' GiB = ' +
+                budget.toFixed(1) + ' GiB budget ' + (fit.ok ? '✓' : '✗');
+            fitLine.appendChild(fitText);
+
+            if (!fit.ok && suggested.length > 0) {
+                const hint = document.createElement('div');
+                hint.style.color = 'var(--amber)';
+                hint.style.fontSize = '0.9em';
+                hint.textContent = 'suggestion: also tick ' + suggested.join(', ');
+                fitLine.appendChild(hint);
+            }
+
+            const portLine = document.getElementById('switch-port-line');
+            portLine.replaceChildren();
+            const port = previewData.port || {};
+            const portText = document.createElement('div');
+            portText.style.color = port.ok ? 'var(--green)' : 'var(--red)';
+            portText.textContent = ':' + (port.port || '?') + ' ' + (port.ok ? '✓' : '✗');
+            portLine.appendChild(portText);
+
+            if (port.blockers && port.blockers.length > 0) {
+                for (const blocker of port.blockers) {
+                    const blockerDiv = document.createElement('div');
+                    blockerDiv.style.color = 'var(--red)';
+                    blockerDiv.style.fontSize = '0.9em';
+                    blockerDiv.textContent = '✗ ' + blocker;
+                    portLine.appendChild(blockerDiv);
+                }
+            }
+
+            if (port.notices && port.notices.length > 0) {
+                for (const notice of port.notices) {
+                    const noticeDiv = document.createElement('div');
+                    noticeDiv.style.color = 'var(--amber)';
+                    noticeDiv.style.fontSize = '0.9em';
+                    noticeDiv.textContent = '⚠ ' + notice;
+                    portLine.appendChild(noticeDiv);
+                }
+            }
+
+            const noticesSection = document.getElementById('switch-notices-section');
+            if (previewData.notices && previewData.notices.length > 0) {
+                const noticesDiv = document.getElementById('switch-notices');
+                noticesDiv.replaceChildren();
+                for (const notice of previewData.notices) {
+                    const noticeDiv = document.createElement('div');
+                    noticeDiv.style.color = 'var(--amber)';
+                    noticeDiv.style.fontSize = '0.9em';
+                    noticeDiv.textContent = '⚠ ' + notice;
+                    noticesDiv.appendChild(noticeDiv);
+                }
+                noticesSection.style.display = 'block';
+            } else {
+                noticesSection.style.display = 'none';
+            }
+
+            const switchBtn = document.getElementById('switch-button');
+            switchBtn.disabled = !previewData.confirm;
+
+            document.body.classList.add('overlay-open');
+            modal.classList.add('active');
+        }
+
+        function closeSwitchModal() {
+            document.getElementById('switch-modal').classList.remove('active');
+            document.body.classList.remove('overlay-open');
+        }
+
+        function updateSwitchTicks() {
+            const checkboxes = document.querySelectorAll('#switch-candidates input[type="checkbox"]');
+            const stops = [];
+            checkboxes.forEach(cb => {
+                if (cb.checked) {
+                    const row = cb.closest('.stop-tick-row');
+                    const nameSpan = row.querySelector('span:nth-child(2)');
+                    if (nameSpan) {
+                        stops.push(nameSpan.textContent);
+                    }
+                }
+            });
+            pendingSwitchStops = stops;
+
+            const body = JSON.stringify({ target: pendingSwitchTarget, stops: stops });
+            fetch('/api/switch/preview', {
+                method: 'POST',
+                headers: makeAuthHeaders(),
+                body: body
+            })
+                .then(r => r.json().then(data => ({ status: r.status, data })))
+                .then(({ status, data }) => {
+                    if (status === 200 || status === 422) {
+                        pendingSwitchData = data;
+                        showSwitchModal(data);
+                    } else if (status === 401) {
+                        showTokenError();
+                    } else {
+                        alert('Error: ' + (data.error || 'unknown error'));
+                    }
+                })
+                .catch(e => console.error('Error:', e));
+        }
+
+        function submitSwitch() {
+            if (!pendingSwitchData || !pendingSwitchTarget) return;
+
+            const body = JSON.stringify({
+                target: pendingSwitchTarget,
+                stops: pendingSwitchStops,
+                confirm: pendingSwitchData.confirm
+            });
+
+            fetch('/api/switch', {
+                method: 'POST',
+                headers: makeAuthHeaders(),
+                body: body
+            })
+                .then(r => r.json().then(data => ({ status: r.status, data })))
+                .then(({ status, data }) => {
+                    if (status === 202) {
+                        closeSwitchModal();
+                        refreshOperation(data.rollout_id);
+                    } else if (status === 409) {
+                        if (data.error === 'preview_stale') {
+                            alert('Fleet state changed since preview — re-previewing');
+                            previewSwitch(state.units.find(u => u.unit === pendingSwitchTarget));
+                        } else if (data.error === 'operation_in_progress') {
+                            alert('Error: ' + (data.kind || 'operation') + ' in progress');
+                        } else {
+                            alert('Error: ' + (data.error || 'unknown error'));
+                        }
+                    } else if (status === 401) {
+                        showTokenError();
+                    } else {
+                        alert('Error: ' + (data.error || 'unknown error'));
+                    }
+                })
+                .catch(e => console.error('Error:', e));
         }
 
         function rollback() {
@@ -1594,8 +2075,7 @@
                 .catch(e => console.error('Error:', e));
         }
 
-        function dismiss(e) {
-            e.preventDefault();
+        function dismiss() {
             if (!state.rollout) return;
             const id = state.rollout.rollout_id;
             fetch('/api/rollouts/' + encodeURIComponent(id) + '/dismiss', {

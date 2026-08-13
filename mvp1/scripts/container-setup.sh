@@ -5,10 +5,11 @@
 #     mvp1/scripts/container-setup.sh [CONTAINER_NAME]
 #
 # Builds the ladder scenarios of SPEC.md §8 inside a Debian container:
-#   qwen3.6-coding              normal start, 15 s fake load   -> LOADING -> READY
+#   qwen3.6-coding              normal start, 15 s fake load   -> LOADING -> READY (switch source)
 #   llama-server-qwen35-npu     ExecCondition kernel gate kept -> STANDBY (never FAILED)
 #   llama-task                  enabled + started, shares :8086 with the gated unit -> armed
 #   llama-server-gemma4-q4km    FAKE_EXIT_1 + Restart=on-failure -> FAILED, NRestarts climbing
+#   llama-server-fake-b         fake unit B on :8093 (switch target for MVP3 drill)
 #   mixperten                   installed byte-for-byte, NEVER enabled/started -> RETIRED
 #
 # Each unit is a *copy* of the real fixture with only its engine binary token spliced out
@@ -59,20 +60,25 @@ FIX   = DEST + '/docs/fixtures'
 UNITS = CHOME + '/.config/systemd/user'
 FAKE  = DEST + '/mvp1/scripts/llama-server-fake'
 
-# (fixture, Environment= to inject, extra [Service] directives)
+# (fixture, Environment= to inject, extra [Service] directives, output_name, port_override)
 SCENARIOS = [
-    ('qwen3.6-coding.service',           {'FAKE_LOAD_SECONDS': '15'}, []),
-    ('llama-server-qwen35-npu.service',  {'FAKE_LOAD_SECONDS': '5'},  []),
-    ('llama-task.service',               {'FAKE_LOAD_SECONDS': '3'},  []),
+    ('qwen3.6-coding.service',           {'FAKE_LOAD_SECONDS': '15'}, [], None, None),
+    ('llama-server-qwen35-npu.service',  {'FAKE_LOAD_SECONDS': '5'},  [], None, None),
+    ('llama-task.service',               {'FAKE_LOAD_SECONDS': '3'},  [], None, None),
     ('llama-server-gemma4-q4km.service', {'FAKE_EXIT_1': '1'},
-     ['Restart=on-failure', 'RestartSec=2']),
+     ['Restart=on-failure', 'RestartSec=2'], None, None),
+    ('llama-server-gemma4-q4km.service', {'FAKE_LOAD_SECONDS': '10'}, [], 'llama-server-fake-b.service', 8093),
 ]
 VERBATIM = ['mixperten.service']          # RETIRED render; never enabled, never started
 
 os.makedirs(UNITS, exist_ok=True)
 model_paths, workdirs = set(), set()
 
-for name, env, extra in SCENARIOS:
+for scenario in SCENARIOS:
+    name, env, extra = scenario[0], scenario[1], scenario[2]
+    output_name = scenario[3] if len(scenario) > 3 else None
+    port_override = scenario[4] if len(scenario) > 4 else None
+
     src = os.path.join(FIX, name)
     raw = open(src, 'rb').read()
     unit = roundhouse.parse_unit(src, raw)
@@ -80,13 +86,25 @@ for name, env, extra in SCENARIOS:
     tok = unit.exec_start.engine_argv[0]
     out = raw[:tok.start] + FAKE.encode() + raw[tok.end:]
 
+    # Port override if needed (for switch scenario)
+    if port_override and unit.known.get('execstart'):
+        port_pattern = b'--port'
+        if port_pattern in out:
+            # Find and replace the port number
+            import re
+            port_regex = rb'--port\s+\d+'
+            out = re.sub(port_regex, f'--port {port_override}'.encode(), out)
+
     inject = [f'Environment={k}={v}' for k, v in env.items()] + list(extra)
     marker = b'[Service]\n'
     i = out.index(marker) + len(marker)
     out = out[:i] + ('\n'.join(inject) + '\n').encode() + out[i:]
 
-    open(os.path.join(UNITS, name), 'wb').write(out)
-    print(f'  {name}: engine -> llama-server-fake, {" ".join(inject) or "no extra env"}')
+    unit_file_name = output_name if output_name else name
+    open(os.path.join(UNITS, unit_file_name), 'wb').write(out)
+    print(f'  {unit_file_name}: engine -> llama-server-fake' +
+          (f', port -> {port_override}' if port_override else '') +
+          f', {" ".join(inject) or "no extra env"}')
 
     profile = roundhouse.extract_param_profile(unit.exec_start.engine_argv)
     if profile.get('model_path'):
