@@ -94,6 +94,18 @@ def main():
 
     # Normal startup
     log_line('I', 'srv', f"load_model: loading model '{model}'")
+
+    # FAKE_RSS_MB: hold that many MiB resident for the whole run. A real llama-server's
+    # residency is the entire point of the switch/warm arithmetic (`_freed_bytes` reads
+    # cgroup memory.current first), and a fake that costs 12 MB makes "stopping A frees
+    # room for B" untestable — every fit decision lands inside the noise. Zero/absent
+    # keeps the historical featherweight behaviour, so no existing drill changes.
+    rss_mb = int(os.environ.get('FAKE_RSS_MB', '0') or '0')
+    ballast = None
+    if rss_mb > 0:
+        ballast = bytearray(rss_mb * 1024 * 1024)   # zero-filled => actually resident
+        log_line('I', 'srv', f"load_model: holding {rss_mb} MiB resident (FAKE_RSS_MB)")
+
     time.sleep(fake_load_seconds)
 
     log_line('I', 'srv', "llama_server: model loaded")

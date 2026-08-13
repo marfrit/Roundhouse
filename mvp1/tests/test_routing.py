@@ -9,8 +9,13 @@ import sys
 import os
 import unittest
 import json
+import socket
+import threading
+import time
+import http.client
 from pathlib import Path
 from datetime import datetime, timezone
+from unittest.mock import patch, MagicMock
 
 # Setup path to import roundhouse from parent directory
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -305,7 +310,9 @@ class TestRoutingGolden(unittest.TestCase):
         json_dict = {**meta, 'model_list': entries}
 
         # Verify structure
-        self.assertEqual(json_dict['generated_by'], 'boltzmann')
+        # §3.1: routing_meta carries the full source string, so the JSON twin and the
+        # YAML header comment name the same generator.
+        self.assertEqual(json_dict['generated_by'], 'roundhouse@boltzmann')
         self.assertEqual(len(json_dict['model_list']), 1)
         self.assertEqual(json_dict['model_list'][0]['model_name'], 'boltzmann-test')
 
@@ -469,6 +476,352 @@ class TestWarmPlan(unittest.TestCase):
         # Marked should be in consenting
         consenting_names = [u['unit'] for u in plan['consenting']]
         self.assertIn('marked.service', consenting_names)
+
+
+# ===== MVP5 route tests (integration) =====
+#
+# T1's TestRoutingGolden calls the emitter directly. The contract's acceptance row is
+# about the DOCUMENT A CONSUMER PULLS, so the golden is re-taken here over a real
+# socket: handler wiring (advertise-host, self port, content type, one snapshot per
+# request) is exactly the part a function-level golden cannot see.
+
+
+class TestRoutingConfigRouteGolden(unittest.TestCase):
+    """Byte-exact golden for GET /api/routing-config, pulled over HTTP."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.watcher = MagicMock(spec=roundhouse.Watcher)
+        cls.watcher.lock = threading.Lock()
+        cls.watcher.units = {}
+        cls.watcher.mem_store = None
+        cls.watcher._cgroup_cache = {}
+        cls.watcher.snapshot.side_effect = lambda: json.loads(json.dumps(cls.snap))
+
+        sock = socket.socket()
+        sock.bind(('127.0.0.1', 0))
+        cls.port = sock.getsockname()[1]
+        sock.close()
+
+        cls.snap = cls._fleet()
+        roundhouse.ACTUATE_ARMED = False
+        cls.server = roundhouse.ThreadingHTTPServer(
+            ('127.0.0.1', cls.port),
+            roundhouse.RoundhouseRequestHandler,
+            cls.watcher,
+            roundhouse.EventBus(),
+            cls.port,
+            watcher_lock=cls.watcher.lock,
+            advertise_host='boltzmann.fritz.box',
+        )
+        cls.server.rollout_engine = None
+        cls.thread = threading.Thread(target=cls.server.serve_forever, daemon=True)
+        cls.thread.start()
+        time.sleep(0.1)
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.server.shutdown()
+        cls.server.server_close()
+
+    @staticmethod
+    def _fleet():
+        def row(unit, rung, port, alias, on_demand, enabled=False, retired=False, mem=None):
+            return {'unit': unit, 'rung': rung, 'port': port, 'alias': alias,
+                    'on_demand': on_demand, 'enabled': enabled, 'retired': retired,
+                    'mem': mem if mem is not None else {}, 'badges': [],
+                    'start_ts_mono': '1', 'strategy_note': None}
+
+        return {
+            'host': 'boltzmann',
+            'kernel': '6.1.0-test',
+            'now': 1000.0,
+            'mem': {'total_bytes': 32 * 1024**3, 'available_bytes': 8 * 1024**3},
+            'sources': {'journal': 'ok', 'systemctl': 'ok'},
+            'self_port': 8090,
+            'self_unit': {'unit': 'roundhouse.service', 'unit_file_state': 'enabled',
+                          'enabled': True},
+            'units': [
+                # 3 hot (two unmarked always-on, one marked)
+                row('llama-embed.service', 'READY', 8082, 'llama-embed', False, enabled=True,
+                    mem={'bytes': 3221225472, 'label': 'measured peak'}),
+                row('llama-task.service', 'BUSY', 8086, 'llama-task', False, enabled=True,
+                    mem={'bytes': 5000000000, 'label': 'measured peak', 'load_seconds': 12.5}),
+                row('qwen3.6-coding.service', 'READY', 8085, 'qwen3.6-coding', True,
+                    mem={'bytes': 16000000000, 'label': 'estimate (formula)'}),
+                # cold + marked: in, with a null alias so the stem fallback is exercised
+                row('warm-cold-marked.service', 'OFF', 8087, None, True),
+                # cold + unmarked: out
+                row('warm-cold-plain.service', 'OFF', 8088, 'warm-cold-plain', False),
+                # STANDBY / FAILED / RETIRED: never, even when marked
+                row('gated.service', 'STANDBY', 8089, 'gated', True),
+                row('broken.service', 'FAILED', 8094, 'broken', True),
+                row('mixperten.service', 'READY', 8095, 'mixperten', True, retired=True),
+            ],
+        }
+
+    def get(self, path):
+        conn = http.client.HTTPConnection('127.0.0.1', self.port, timeout=5)
+        try:
+            conn.request('GET', path)
+            resp = conn.getresponse()
+            return resp.status, resp.read(), dict(resp.getheaders())
+        finally:
+            conn.close()
+
+    EXPECTED_BODY = (
+        '# generated-by: roundhouse@boltzmann\n'
+        '# warm-hook: POST http://boltzmann.fritz.box:%(port)d/api/warm\n'
+        'model_list:\n'
+        '  - model_name: boltzmann-llama-embed\n'
+        '    litellm_params:\n'
+        '      model: openai/llama-embed\n'
+        '      api_base: "http://boltzmann.fritz.box:8082/v1"\n'
+        '      api_key: "none"\n'
+        '    model_info:\n'
+        '      unit: llama-embed.service\n'
+        '      logical: llama-embed\n'
+        '      host: boltzmann\n'
+        '      rung: READY\n'
+        '      on_demand: false\n'
+        '      load_strategy: on-boot\n'
+        '      peak_bytes: 3221225472\n'
+        '      peak_source: "measured peak"\n'
+        '  - model_name: boltzmann-llama-task\n'
+        '    litellm_params:\n'
+        '      model: openai/llama-task\n'
+        '      api_base: "http://boltzmann.fritz.box:8086/v1"\n'
+        '      api_key: "none"\n'
+        '    model_info:\n'
+        '      unit: llama-task.service\n'
+        '      logical: llama-task\n'
+        '      host: boltzmann\n'
+        '      rung: BUSY\n'
+        '      on_demand: false\n'
+        '      load_strategy: on-boot\n'
+        '      peak_bytes: 5000000000\n'
+        '      peak_source: "measured peak"\n'
+        '      load_seconds: 12.5\n'
+        '  - model_name: boltzmann-qwen3.6-coding\n'
+        '    litellm_params:\n'
+        '      model: openai/qwen3.6-coding\n'
+        '      api_base: "http://boltzmann.fritz.box:8085/v1"\n'
+        '      api_key: "none"\n'
+        '    model_info:\n'
+        '      unit: qwen3.6-coding.service\n'
+        '      logical: qwen3.6-coding\n'
+        '      host: boltzmann\n'
+        '      rung: READY\n'
+        '      on_demand: true\n'
+        '      load_strategy: manual\n'
+        '      peak_bytes: 16000000000\n'
+        '      peak_source: "estimate (formula)"\n'
+        '  - model_name: boltzmann-warm-cold-marked\n'
+        '    litellm_params:\n'
+        '      model: openai/warm-cold-marked\n'
+        '      api_base: "http://boltzmann.fritz.box:8087/v1"\n'
+        '      api_key: "none"\n'
+        '    model_info:\n'
+        '      unit: warm-cold-marked.service\n'
+        '      logical: warm-cold-marked\n'
+        '      host: boltzmann\n'
+        '      rung: "OFF"\n'
+        '      on_demand: true\n'
+        '      load_strategy: manual\n'
+    )
+
+    def test_route_golden_body(self):
+        """The pulled YAML is byte-exact apart from the generation timestamp."""
+        status, body, headers = self.get('/api/routing-config')
+        self.assertEqual(status, 200)
+        self.assertEqual(headers.get('Content-Type'), 'text/yaml; charset=utf-8')
+
+        text = body.decode('utf-8')
+        lines = text.split('\n')
+        self.assertRegex(lines[1],
+                         r'^# generated-at: \d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$')
+        stripped = '\n'.join([lines[0]] + lines[2:])
+        self.assertEqual(stripped, self.EXPECTED_BODY % {'port': self.port})
+
+    def test_route_json_twin_is_the_same_document(self):
+        status, body, headers = self.get('/api/routing-config.json')
+        self.assertEqual(status, 200)
+        self.assertEqual(headers.get('Content-Type'), 'application/json; charset=utf-8')
+        doc = json.loads(body)
+
+        self.assertEqual(doc['generated_by'], 'roundhouse@boltzmann')
+        self.assertEqual(doc['warm_hook'],
+                         'POST http://boltzmann.fritz.box:%d/api/warm' % self.port)
+        self.assertEqual([e['model_name'] for e in doc['model_list']],
+                         ['boltzmann-llama-embed', 'boltzmann-llama-task',
+                          'boltzmann-qwen3.6-coding', 'boltzmann-warm-cold-marked'])
+
+        embed = doc['model_list'][0]
+        self.assertEqual(embed['litellm_params'], {
+            'model': 'openai/llama-embed',
+            'api_base': 'http://boltzmann.fritz.box:8082/v1',
+            'api_key': 'none'})
+        self.assertFalse(embed['model_info']['on_demand'])
+        # H3 null-omission: no peak keys when the fleet never measured one.
+        cold = doc['model_list'][3]
+        self.assertNotIn('peak_bytes', cold['model_info'])
+        self.assertNotIn('load_seconds', cold['model_info'])
+        self.assertTrue(cold['model_info']['on_demand'])
+
+    def test_route_excludes_unmarked_cold_standby_failed_retired(self):
+        _s, body, _h = self.get('/api/routing-config')
+        text = body.decode('utf-8')
+        for absent in ('warm-cold-plain', 'gated', 'broken', 'mixperten'):
+            self.assertNotIn(absent, text)
+
+    def test_route_survives_a_hostile_alias(self):
+        """A hostile alias may not add, remove or reshape a document line (§10 risk 2)."""
+        snap = self._fleet()
+        for r in snap['units']:
+            if r['unit'] == 'qwen3.6-coding.service':
+                r['alias'] = 'x"\n  - model_name: pwned\n    api_key: '
+        type(self).snap = snap
+        try:
+            _s, body, _h = self.get('/api/routing-config')
+            text = body.decode('utf-8')
+            lines = text.split('\n')
+            # The payload occurs inside quoted tokens, but it may never START a line:
+            # document structure is decided by the emitter, never by fleet data.
+            self.assertEqual(sum(1 for l in lines if l.startswith('  - model_name: ')), 4)
+            self.assertNotIn('  - model_name: pwned', lines)
+            self.assertNotIn('    api_key: ', lines)
+            self.assertIn('\\x0a', text)      # the newline is escaped, not emitted
+            for line in lines:
+                self.assertNotIn('\x00', line)
+                self.assertLess(line.count('\r'), 1)
+        finally:
+            type(self).snap = self._fleet()
+
+    def test_route_is_a_pure_read(self):
+        def boom(*a, **k):
+            raise AssertionError('write gateway called from a generation route')
+
+        with patch('roundhouse._atomic_write', side_effect=boom), \
+             patch('roundhouse.run_git', side_effect=boom), \
+             patch('roundhouse.run_actuate', side_effect=boom):
+            for _ in range(10):
+                status, _b, _h = self.get('/api/routing-config')
+                self.assertEqual(status, 200)
+                status, _b, _h = self.get('/api/routing-config.json')
+                self.assertEqual(status, 200)
+
+
+class TestWarmPlanStops(unittest.TestCase):
+    """warm_plan with a NON-EMPTY stop list — the leg the arithmetic actually runs on."""
+
+    @staticmethod
+    def _units(*specs):
+        return {name: roundhouse.UnitFile(
+            path='', name=name, raw=b'', lines=[], directives=[], comments=[],
+            warnings=[], on_demand=marked) for name, marked in specs}
+
+    def _snapshot(self, available):
+        return {
+            'host': 'boltzmann',
+            'mem': {'available_bytes': available},
+            'units': [
+                {'unit': 'target.service', 'rung': 'OFF', 'on_demand': True,
+                 'retired': False, 'mem': {}},
+                {'unit': 'big-marked.service', 'rung': 'READY', 'on_demand': True,
+                 'retired': False,
+                 'mem': {'bytes': 12 * 1024**3, 'source': 'measured',
+                         'label': 'measured peak'}},
+                {'unit': 'small-marked.service', 'rung': 'READY', 'on_demand': True,
+                 'retired': False,
+                 'mem': {'bytes': 2 * 1024**3, 'source': 'measured',
+                         'label': 'measured peak'}},
+                {'unit': 'huge-plain.service', 'rung': 'READY', 'on_demand': False,
+                 'retired': False,
+                 'mem': {'bytes': 24 * 1024**3, 'source': 'measured',
+                         'label': 'measured peak'}},
+            ],
+        }
+
+    UNITS = ('target.service', True), ('big-marked.service', True), \
+            ('small-marked.service', True), ('huge-plain.service', False)
+
+    def test_stops_are_priced_and_ordered_by_residency(self):
+        """F7 order over the consenting pool, with freed bytes actually accounted."""
+        plan = roundhouse.warm_plan('target.service', self._snapshot(1024**3),
+                                    self._units(*self.UNITS), {}, None)
+        # estimate is the 9 GiB default (no model file), headroom 1 GiB, budget 1 GiB:
+        # the 12 GiB marked resident alone closes the gap, and it is picked first.
+        self.assertEqual(plan['stops'], ['big-marked.service'])
+        self.assertTrue(plan['fits'])
+        self.assertEqual(plan['freed_by'],
+                         [{'unit': 'big-marked.service', 'bytes': 12 * 1024**3,
+                           'source': 'measured peak row'}])
+        self.assertEqual(plan['shortfall_bytes'], 0)
+
+    def test_unmarked_resident_never_pays_for_the_fit(self):
+        """The huge unmarked unit could fit it single-handed — and must not be used."""
+        plan = roundhouse.warm_plan('target.service', self._snapshot(0),
+                                    self._units(*self.UNITS), {}, None)
+        self.assertNotIn('huge-plain.service', plan['stops'])
+        self.assertEqual([e['unit'] for e in plan['excluded_unmarked']],
+                         ['huge-plain.service'])
+        self.assertEqual([c['unit'] for c in plan['consenting']],
+                         ['big-marked.service', 'small-marked.service'])
+        for c in plan['consenting']:
+            self.assertIsInstance(c['resident_bytes'], int)
+            self.assertEqual(c['resident_source'], 'measured peak row')
+
+    def test_unfittable_reports_shortfall(self):
+        units = self._units(('target.service', True), ('huge-plain.service', False))
+        snap = {
+            'host': 'boltzmann',
+            'mem': {'available_bytes': 0},
+            'units': [
+                {'unit': 'target.service', 'rung': 'OFF', 'on_demand': True,
+                 'retired': False, 'mem': {}},
+                {'unit': 'huge-plain.service', 'rung': 'READY', 'on_demand': False,
+                 'retired': False,
+                 'mem': {'bytes': 24 * 1024**3, 'source': 'measured',
+                         'label': 'measured peak'}},
+            ],
+        }
+        plan = roundhouse.warm_plan('target.service', snap, units, {}, None)
+        self.assertFalse(plan['fits'])
+        self.assertEqual(plan['stops'], [])
+        self.assertEqual(plan['consenting'], [])
+        self.assertEqual(plan['shortfall_bytes'],
+                         plan['estimate_bytes'] + roundhouse.HEADROOM_BYTES)
+
+
+class TestYamlTrailingNewlineIsQuoted(unittest.TestCase):
+    """The `$`-vs-fullmatch trap in the safe-bare rule (§3.3 says re.fullmatch).
+
+    `re.compile(r'[A-Za-z0-9._/-]+$').match('alias\\n')` SUCCEEDS — in a non-MULTILINE
+    pattern `$` also matches just before a trailing newline — so a value ending in a
+    newline would have been emitted bare, putting a raw line break in the document.
+    """
+
+    def test_trailing_newline_never_goes_bare(self):
+        for payload in ('alias\n', 'alias\n\n', 'boltzmann-x\n'):
+            with self.subTest(payload=payload):
+                out = roundhouse._yaml_str(payload)
+                self.assertTrue(out.startswith('"') and out.endswith('"'), out)
+                self.assertNotIn('\n', out)
+                self.assertIn('\\x0a', out)
+
+    def test_emitted_document_has_no_stray_line_break(self):
+        entries = [{'model_name': 'boltzmann-x',
+                    'litellm_params': {'model': 'openai/x',
+                                       'api_base': 'http://h:1/v1', 'api_key': 'none'},
+                    'model_info': {'unit': 'x.service', 'logical': 'x\n',
+                                   'host': 'boltzmann', 'rung': 'READY',
+                                   'on_demand': True, 'load_strategy': 'manual'}}]
+        meta = {'generated_by': 'roundhouse@boltzmann',
+                'generated_at': '2026-08-13T12:00:00Z',
+                'warm_hook': 'POST http://h:8090/api/warm'}
+        text = roundhouse.emit_routing_yaml(meta, entries)
+        self.assertEqual(len(text.split('\n')), 17)   # 16 content lines + trailing ''
+        self.assertTrue(text.endswith('load_strategy: manual\n'))
 
 
 if __name__ == '__main__':

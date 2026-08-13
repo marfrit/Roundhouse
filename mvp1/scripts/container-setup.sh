@@ -60,14 +60,19 @@ FIX   = DEST + '/docs/fixtures'
 UNITS = CHOME + '/.config/systemd/user'
 FAKE  = DEST + '/mvp1/scripts/llama-server-fake'
 
-# (fixture, Environment= to inject, extra [Service] directives, output_name, port_override, on_demand_marker)
+# (fixture, Environment= to inject, extra [Service] directives, output_name, port_override,
+#  on_demand_marker, alias_override)
 SCENARIOS = [
     ('qwen3.6-coding.service',           {'FAKE_LOAD_SECONDS': '15'}, [], None, None, True),
     ('llama-server-qwen35-npu.service',  {'FAKE_LOAD_SECONDS': '5'},  [], None, None, False),
     ('llama-task.service',               {'FAKE_LOAD_SECONDS': '3'},  [], None, None, False),
     ('llama-server-gemma4-q4km.service', {'FAKE_EXIT_1': '1'},
      ['Restart=on-failure', 'RestartSec=2'], None, None, False),
-    ('llama-server-gemma4-q4km.service', {'FAKE_LOAD_SECONDS': '10'}, [], 'llama-server-fake-b.service', 8093, True),
+    # Fake B is a SECOND copy of the gemma4-q4km fixture, so it needs its own --alias as
+    # much as its own --port: two selected units advertising 'gemma4-12b-it-q4km' make
+    # every logical-name lookup ambiguous (POST /api/warm {"logical": ...} -> 422
+    # ambiguous_alias) and would collide on one model_name in the routing fragment.
+    ('llama-server-gemma4-q4km.service', {'FAKE_LOAD_SECONDS': '10'}, [], 'llama-server-fake-b.service', 8093, True, 'fake-b'),
 ]
 VERBATIM = ['mixperten.service']          # RETIRED render; never enabled, never started
 
@@ -79,6 +84,7 @@ for scenario in SCENARIOS:
     output_name = scenario[3] if len(scenario) > 3 else None
     port_override = scenario[4] if len(scenario) > 4 else None
     on_demand = scenario[5] if len(scenario) > 5 else False
+    alias_override = scenario[6] if len(scenario) > 6 else None
 
     src = os.path.join(FIX, name)
     raw = open(src, 'rb').read()
@@ -102,6 +108,13 @@ for scenario in SCENARIOS:
         # the human-readable port in Description= would otherwise contradict the flag
         out = re.sub(rb'\(port \d+\)', f'(port {port_override})'.encode(), out)
 
+    # Alias override — same rule, same failure mode if the flag is not there.
+    if alias_override:
+        import re
+        out, n = re.subn(rb'--alias\s+\S+', f'--alias {alias_override}'.encode(), out)
+        if n != 1:
+            raise SystemExit(f'{name}: expected exactly one --alias to override, found {n}')
+
     inject = [f'Environment={k}={v}' for k, v in env.items()] + list(extra)
     marker = b'[Service]\n'
     i = out.index(marker) + len(marker)
@@ -114,6 +127,7 @@ for scenario in SCENARIOS:
     open(os.path.join(UNITS, unit_file_name), 'wb').write(out)
     print(f'  {unit_file_name}: engine -> llama-server-fake' +
           (f', port -> {port_override}' if port_override else '') +
+          (f', alias -> {alias_override}' if alias_override else '') +
           (', on-demand' if on_demand else '') +
           f', {" ".join(inject) or "no extra env"}')
 

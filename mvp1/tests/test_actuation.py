@@ -12,6 +12,8 @@ import tempfile
 import shutil
 import subprocess
 import json
+import re
+import copy
 import time
 import socket
 import threading
@@ -4845,6 +4847,792 @@ class TestWarmRecord(unittest.TestCase):
 
         self.assertEqual(public['origin'], 'human')
         self.assertIsNone(public['requester'])
+
+
+# ===== MVP5 route tests (integration) =====
+#
+# The route-level matrix for SPEC §7.3 (T2-owned classes: TestWarmRoutes,
+# TestWarmQueueRoutes, TestGenerationZeroWrites). Everything here drives a REAL
+# RolloutEngine over a stub watcher through a real HTTP socket, so the frozen
+# handler sequence in §4.3 — and its lock discipline — is exercised end to end.
+
+_GIB = 1024 ** 3
+
+
+def _mvp5_unit(unit_name, alias, port, on_demand=False, retired=False):
+    """Build a parsed UnitFile for the MVP5 route harness (real parse_unit)."""
+    desc = '[RETIRED 2026-01-01] retired fixture' if retired else 'fixture %s' % unit_name
+    marker = '# roundhouse: on-demand\n' if on_demand else ''
+    alias_arg = ' --alias %s' % alias if alias else ''
+    text = (
+        '[Unit]\n'
+        'Description=%s\n'
+        '\n'
+        '[Service]\n'
+        '%s'
+        'ExecStart=/usr/bin/llama-server -m /nonexistent/%s.gguf%s'
+        ' --host 0.0.0.0 --port %d\n'
+        '\n'
+        '[Install]\n'
+        'WantedBy=default.target\n'
+    ) % (desc, marker, unit_name, alias_arg, port)
+    return roundhouse.parse_unit('/tmp/mvp5-units/%s' % unit_name, text.encode('utf-8'))
+
+
+class _WarmRouteHarness(unittest.TestCase):
+    """Armed server + a real RolloutEngine over a stub watcher (shared by §7.3 classes).
+
+    The stub watcher carries the SAME non-reentrant lock the engine gets, exactly as
+    `cmd_serve` wires it (`watcher_lock = watcher.lock`) — a handler that takes the lock
+    and then calls into the engine deadlocks here just like it would in production, and
+    the client-side socket timeout turns that into a red test rather than a wedged box.
+    """
+
+    HOST = 'testhost'
+    ADVERTISE = 'advertise.example'
+
+    @classmethod
+    def setUpClass(cls):
+        cls.temp_dir = tempfile.mkdtemp()
+
+        cls.units = {}
+        for uname, alias, port, marked, retired in (
+            ('warm-a.service', 'warm-a', 9101, True, False),
+            ('warm-b.service', 'warm-b', 9102, True, False),
+            ('warm-plain.service', 'warm-plain', 9103, False, False),
+            ('warm-dup1.service', 'twin', 9104, True, False),
+            ('warm-dup2.service', 'twin', 9105, True, False),
+            ('warm-gone.service', 'warm-gone', 9106, True, True),
+            ('warm-stem.service', None, 9107, True, False),
+        ):
+            u = _mvp5_unit(uname, alias, port, on_demand=marked, retired=retired)
+            cls.units[u.name] = u
+
+        cls.watcher = MagicMock(spec=roundhouse.Watcher)
+        cls.watcher.lock = threading.Lock()
+        cls.watcher.units = cls.units
+        cls.watcher.mem_store = None
+        cls.watcher._cgroup_cache = {}
+        cls.watcher.snapshot.side_effect = lambda: copy.deepcopy(cls.snap)
+
+        cls.event_bus = roundhouse.EventBus()
+
+        sock = socket.socket()
+        sock.bind(('127.0.0.1', 0))
+        cls.port = sock.getsockname()[1]
+        sock.close()
+
+        cls.snap = cls._default_snapshot()
+
+        roundhouse.ACTUATE_ARMED = True
+        roundhouse.TOKEN = 'test-token'
+
+        cls.server = roundhouse.ThreadingHTTPServer(
+            ('127.0.0.1', cls.port),
+            roundhouse.RoundhouseRequestHandler,
+            cls.watcher,
+            cls.event_bus,
+            cls.port,
+            watcher_lock=cls.watcher.lock,
+            advertise_host=cls.ADVERTISE,
+        )
+        cls.engine = roundhouse.RolloutEngine(
+            cls.watcher, cls.units, cls.temp_dir, cls.port,
+            cls.event_bus, cls.watcher.lock)
+        cls.server.rollout_engine = cls.engine
+
+        cls.server_thread = threading.Thread(target=cls.server.serve_forever, daemon=True)
+        cls.server_thread.start()
+        time.sleep(0.1)
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.server.shutdown()
+        cls.server.server_close()
+        shutil.rmtree(cls.temp_dir, ignore_errors=True)
+        roundhouse.ACTUATE_ARMED = False
+        roundhouse.TOKEN = None
+
+    @classmethod
+    def _default_snapshot(cls):
+        def row(unit, rung, port, alias, on_demand, retired=False, mem=None, enabled=False):
+            return {
+                'unit': unit, 'description': '', 'retired': retired, 'rung': rung,
+                'roster': 'cold', 'since': 0, 'start_ts_mono': '1000',
+                'detail': '', 'badges': [], 'stale': False, 'sensed_at': 0,
+                'enabled': enabled, 'active_state': 'inactive', 'sub_state': 'dead',
+                'n_restarts': 0, 'port': port, 'port_source': 'flag', 'alias': alias,
+                'on_demand': on_demand, 'gate': None, 'model_file': '', 'quant_hint': None,
+                'ctx': None, 'mem': mem if mem is not None else {},
+                'port_conflict': None, 'strategy_note': None,
+            }
+
+        return {
+            'host': cls.HOST,
+            'kernel': '6.1.0-test',
+            'now': 1000.0,
+            'mem': {'total_bytes': 32 * _GIB, 'available_bytes': 24 * _GIB},
+            'sources': {'journal': 'ok', 'systemctl': 'ok'},
+            'self_port': cls.port,
+            'self_unit': {'unit': 'roundhouse.service',
+                          'unit_file_state': 'enabled', 'enabled': True},
+            'units': [
+                row('warm-a.service', 'READY', 9101, 'warm-a', True, enabled=True,
+                    mem={'bytes': 12 * _GIB, 'source': 'measured', 'label': 'measured peak'}),
+                row('warm-b.service', 'OFF', 9102, 'warm-b', True),
+                row('warm-plain.service', 'READY', 9103, 'warm-plain', False, enabled=True,
+                    mem={'bytes': 20 * _GIB, 'source': 'measured', 'label': 'measured peak'}),
+                row('warm-dup1.service', 'OFF', 9104, 'twin', True),
+                row('warm-dup2.service', 'OFF', 9105, 'twin', True),
+                row('warm-gone.service', 'OFF', 9106, 'warm-gone', True, retired=True),
+                row('warm-stem.service', 'OFF', 9107, None, True),
+            ],
+        }
+
+    def setUp(self):
+        type(self).snap = self._default_snapshot()
+        roundhouse.ACTUATE_ARMED = True
+        roundhouse.TOKEN = 'test-token'
+        self.engine.current = None
+        self.engine.rollouts = {}
+        self.engine.counter = 0
+        self.engine.pending_warm = None
+        self.engine.last_warm = None
+        self.engine.warm_seq = 0
+
+    # --- HTTP helpers (short timeouts: a lock deadlock must surface as a failure) ---
+
+    def _request(self, method, path, data=None, headers=None, raw_body=None, timeout=5):
+        conn = http.client.HTTPConnection('127.0.0.1', self.port, timeout=timeout)
+        try:
+            body = raw_body
+            if body is None and data is not None:
+                body = json.dumps(data).encode('utf-8')
+            req_headers = dict(headers or {})
+            if body is not None and 'Content-Type' not in req_headers:
+                req_headers['Content-Type'] = 'application/json'
+            conn.request(method, path, body, req_headers)
+            resp = conn.getresponse()
+            return resp.status, resp.read(), dict(resp.getheaders())
+        finally:
+            conn.close()
+
+    def post(self, path, data=None, headers=None, raw_body=None, token='test-token'):
+        hdrs = dict(headers or {})
+        if token is not None and 'Authorization' not in hdrs:
+            hdrs['Authorization'] = 'Bearer %s' % token
+        return self._request('POST', path, data=data, headers=hdrs, raw_body=raw_body)
+
+    def get(self, path):
+        return self._request('GET', path)
+
+    def post_warm(self, data, requester=None, token='test-token', raw_body=None):
+        headers = {}
+        if requester is not None:
+            headers['X-Roundhouse-Requester'] = requester
+        status, body, _ = self.post('/api/warm', data=data, headers=headers,
+                                    raw_body=raw_body, token=token)
+        return status, body
+
+    def busy_slot(self):
+        """Claim the operation slot with a running switch record (not `_slot_free`)."""
+        self.engine.current = {
+            'rollout_id': 'sw-human-1', 'kind': 'switch', 'unit': 'warm-plain.service',
+            'phase': 'stopping', 'detail': 'human switch', 'failure': None,
+            'rollback': None, 'restored': False,
+        }
+
+
+class TestWarmRoutes(_WarmRouteHarness):
+    """SPEC §7.3 `TestWarmRoutes` — POST/GET /api/warm route matrix (T2-owned)."""
+
+    # --- auth (E8) ---
+
+    def test_warm_post_unarmed_403(self):
+        roundhouse.ACTUATE_ARMED = False
+        try:
+            status, body = self.post_warm({'unit': 'warm-b.service'})
+        finally:
+            roundhouse.ACTUATE_ARMED = True
+        self.assertEqual(status, 403)
+        self.assertEqual(json.loads(body)['error'], 'read_only_mode')
+
+    def test_warm_cancel_unarmed_403(self):
+        roundhouse.ACTUATE_ARMED = False
+        try:
+            status, body, _ = self.post('/api/warm/cancel', data={})
+        finally:
+            roundhouse.ACTUATE_ARMED = True
+        self.assertEqual(status, 403)
+        self.assertEqual(json.loads(body)['error'], 'read_only_mode')
+
+    def test_warm_post_bad_token_401(self):
+        status, body = self.post_warm({'unit': 'warm-b.service'}, token='wrong-token')
+        self.assertEqual(status, 401)
+
+    def test_warm_cancel_bad_token_401(self):
+        status, _body, _h = self.post('/api/warm/cancel', data={}, token='wrong-token')
+        self.assertEqual(status, 401)
+
+    # --- 400: malformed body / logical-xor-unit ---
+
+    def test_warm_bad_json_400(self):
+        status, body = self.post_warm(None, raw_body=b'{not json')
+        self.assertEqual(status, 400)
+        self.assertEqual(json.loads(body)['error'], 'bad_json')
+
+    def test_warm_both_logical_and_unit_400(self):
+        status, body = self.post_warm({'logical': 'warm-b', 'unit': 'warm-b.service'})
+        self.assertEqual(status, 400)
+        doc = json.loads(body)
+        self.assertEqual(doc['error'], 'bad_body')
+        self.assertIn('exactly one', doc['detail'])
+
+    def test_warm_neither_logical_nor_unit_400(self):
+        status, body = self.post_warm({})
+        self.assertEqual(status, 400)
+        self.assertEqual(json.loads(body)['error'], 'bad_body')
+
+    def test_warm_non_string_values_400(self):
+        status, body = self.post_warm({'unit': 17})
+        self.assertEqual(status, 400)
+        self.assertEqual(json.loads(body)['error'], 'bad_body')
+
+    # --- 404: unknown resource ---
+
+    def test_warm_unknown_unit_404(self):
+        status, body = self.post_warm({'unit': 'nope.service'})
+        self.assertEqual(status, 404)
+        self.assertEqual(json.loads(body)['error'], 'unknown_unit')
+
+    def test_warm_empty_unit_string_404(self):
+        """`{"unit": ""}` is an unknown unit, not a 500 (`if unit:` vs `is not None`)."""
+        status, body = self.post_warm({'unit': ''})
+        self.assertEqual(status, 404)
+        self.assertEqual(json.loads(body)['error'], 'unknown_unit')
+
+    def test_warm_unknown_alias_404(self):
+        status, body = self.post_warm({'logical': 'no-such-model'})
+        self.assertEqual(status, 404)
+        self.assertEqual(json.loads(body)['error'], 'unknown_alias')
+
+    # --- 422: validation against the world ---
+
+    def test_warm_ambiguous_alias_422(self):
+        status, body = self.post_warm({'logical': 'twin'})
+        self.assertEqual(status, 422)
+        doc = json.loads(body)
+        self.assertEqual(doc['error'], 'ambiguous_alias')
+        self.assertEqual(doc['units'], ['warm-dup1.service', 'warm-dup2.service'])
+
+    def test_warm_not_on_demand_422_exact_detail(self):
+        """The consent fence, layer 1: an unmarked target can never be warmed."""
+        snap = self._default_snapshot()
+        for r in snap['units']:
+            if r['unit'] == 'warm-plain.service':
+                r['rung'] = 'OFF'
+                r['mem'] = {}
+        type(self).snap = snap
+        status, body = self.post_warm({'unit': 'warm-plain.service'})
+        self.assertEqual(status, 422)
+        doc = json.loads(body)
+        self.assertEqual(doc['error'], 'not_on_demand')
+        self.assertEqual(doc['unit'], 'warm-plain.service')
+        self.assertEqual(
+            doc['detail'],
+            "unit is not marked '# roundhouse: on-demand' — a warm request may neither "
+            "start nor stop it (add the marker and restart roundhouse)")
+
+    def test_warm_retired_target_422_preflight_failed(self):
+        status, body = self.post_warm({'unit': 'warm-gone.service'})
+        self.assertEqual(status, 422)
+        doc = json.loads(body)
+        self.assertEqual(doc['error'], 'preflight_failed')
+        self.assertEqual(doc['checks'][0]['check'], 'retired')
+
+    def test_warm_consent_unfittable_422_arithmetic(self):
+        """Unfittable within consenting stops → 422 with the full frozen arithmetic."""
+        snap = self._default_snapshot()
+        snap['mem']['available_bytes'] = 100 * 1024 * 1024
+        for r in snap['units']:
+            if r['unit'] == 'warm-a.service':
+                r['mem'] = {'bytes': 1000, 'source': 'measured', 'label': 'measured peak'}
+        type(self).snap = snap
+
+        status, body = self.post_warm({'unit': 'warm-b.service'})
+        self.assertEqual(status, 422)
+        doc = json.loads(body)
+        self.assertEqual(doc['error'], 'consent_unfittable')
+        self.assertEqual(doc['unit'], 'warm-b.service')
+        for key in ('estimate_bytes', 'estimate_source', 'mem_available_bytes',
+                    'headroom_bytes', 'freed_by', 'shortfall_bytes',
+                    'consenting', 'excluded_unmarked'):
+            self.assertIn(key, doc)
+        self.assertEqual(doc['headroom_bytes'], roundhouse.HEADROOM_BYTES)
+        self.assertEqual(doc['mem_available_bytes'], 100 * 1024 * 1024)
+        self.assertGreater(doc['shortfall_bytes'], 0)
+        # The fence names both sides: only marked units may be stopped, and the
+        # unmarked resident is reported as excluded rather than silently ignored.
+        self.assertEqual([c['unit'] for c in doc['consenting']], ['warm-a.service'])
+        self.assertEqual([e['unit'] for e in doc['excluded_unmarked']],
+                         ['warm-plain.service'])
+        self.assertNotIn('warm-plain.service',
+                         [f['unit'] for f in doc['freed_by']])
+
+    def test_warm_preflight_failed_422_without_confirm(self):
+        with patch('roundhouse.switch_preflight',
+                   return_value={'ok': False, 'checks': [{'check': 'port', 'ok': False}],
+                                 'target': {}, 'stop_candidates': [], 'fit': {},
+                                 'port': {}, 'suggested_stops': [], 'notices': [],
+                                 'confirm': 'must-not-leak'}):
+            status, body = self.post_warm({'unit': 'warm-b.service'})
+        self.assertEqual(status, 422)
+        doc = json.loads(body)
+        self.assertEqual(doc['error'], 'preflight_failed')
+        self.assertNotIn('confirm', doc)
+
+    # --- 200 already_warm ---
+
+    def test_warm_already_warm_ready_200(self):
+        status, body = self.post_warm({'unit': 'warm-a.service'})
+        self.assertEqual(status, 200)
+        doc = json.loads(body)
+        self.assertEqual(doc['status'], 'already_warm')
+        self.assertEqual(doc['unit'], 'warm-a.service')
+        self.assertEqual(doc['rung'], 'READY')
+
+    def test_warm_already_warm_loading_200(self):
+        """LOADING counts as warm (H6): it is warm or becoming warm."""
+        snap = self._default_snapshot()
+        for r in snap['units']:
+            if r['unit'] == 'warm-b.service':
+                r['rung'] = 'LOADING'
+        type(self).snap = snap
+        status, body = self.post_warm({'unit': 'warm-b.service'})
+        self.assertEqual(status, 200)
+        doc = json.loads(body)
+        self.assertEqual(doc['status'], 'already_warm')
+        self.assertEqual(doc['rung'], 'LOADING')
+
+    def test_warm_by_logical_and_namespaced_logical_resolve(self):
+        status, body = self.post_warm({'logical': 'warm-a'})
+        self.assertEqual(status, 200)
+        self.assertEqual(json.loads(body)['unit'], 'warm-a.service')
+
+        status, body = self.post_warm({'logical': '%s-warm-a' % self.HOST})
+        self.assertEqual(status, 200)
+        self.assertEqual(json.loads(body)['unit'], 'warm-a.service')
+
+    # --- 202 started (the frozen §4.3 tail: plan → preflight → start_switch) ---
+
+    def _start_warm(self, requester=None, unit='warm-b.service'):
+        snap = self._default_snapshot()
+        snap['mem']['available_bytes'] = 512 * 1024 * 1024
+        type(self).snap = snap
+        with patch.object(roundhouse.RolloutEngine, '_run_switch',
+                          lambda *a, **k: None), \
+             patch('roundhouse.switch_preflight',
+                   return_value={'ok': True, 'checks': [], 'confirm': 'sw-confirm'}):
+            return self.post_warm({'unit': unit}, requester=requester)
+
+    def test_warm_started_202_carries_stops_and_starts_switch(self):
+        """Fit needs one consenting stop: 202, stops echoed, engine slot claimed.
+
+        This is the whole §4.3 tail in one request — `warm_plan` (which must value
+        residency through `_freed_bytes` on real snapshot rows) followed by
+        `start_switch`, which claims the slot under `watcher_lock`. A handler holding
+        that same non-reentrant lock across the call never answers.
+        """
+        status, body = self._start_warm(requester='litellm-proxy')
+        self.assertEqual(status, 202)
+        doc = json.loads(body)
+        self.assertEqual(doc['stops'], ['warm-a.service'])
+        self.assertTrue(doc['rollout_id'].startswith('sw-'))
+        self.assertFalse(roundhouse._slot_free(self.engine.current))
+
+    def test_warm_record_origin_and_requester_via_rollouts_route(self):
+        status, body = self._start_warm(requester='litellm-proxy')
+        self.assertEqual(status, 202)
+        rid = json.loads(body)['rollout_id']
+
+        status, body, _ = self.get('/api/rollouts/%s' % rid)
+        self.assertEqual(status, 200)
+        rec = json.loads(body)
+        self.assertEqual(rec['kind'], 'switch')
+        self.assertEqual(rec['origin'], 'warm')
+        self.assertEqual(rec['requester'], 'litellm-proxy')
+        self.assertEqual(rec['stops'], ['warm-a.service'])
+
+    # --- requester sanitization (H7), asserted where it lands: the record ---
+
+    def _requester_in_record(self, header):
+        status, body = self._start_warm(requester=header)
+        self.assertEqual(status, 202)
+        rid = json.loads(body)['rollout_id']
+        status, body, _ = self.get('/api/rollouts/%s' % rid)
+        self.assertEqual(status, 200)
+        return json.loads(body)['requester']
+
+    def test_requester_absent_defaults_to_token(self):
+        self.assertEqual(self._requester_in_record(None), 'token')
+
+    def test_requester_hostile_characters_filtered(self):
+        self.assertEqual(self._requester_in_record('ll<>am"a;proxy/1.0!'),
+                         'llamaproxy1.0')
+
+    def test_requester_all_disallowed_falls_back_to_token(self):
+        self.assertEqual(self._requester_in_record('<<<>>>'), 'token')
+
+    def test_requester_truncated_to_64(self):
+        self.assertEqual(self._requester_in_record('a' * 100), 'a' * 64)
+
+    def test_requester_allowed_class_survives(self):
+        self.assertEqual(self._requester_in_record('llm-proxy@hossenfelder v1.0_beta'),
+                         'llm-proxy@hossenfelder v1.0_beta')
+
+    # --- GET /api/warm (read) and method discipline ---
+
+    def test_get_warm_shape_unauthenticated_200(self):
+        status, body, headers = self.get('/api/warm')
+        self.assertEqual(status, 200)
+        doc = json.loads(body)
+        self.assertEqual(set(doc.keys()), {'pending', 'last'})
+        self.assertIsNone(doc['pending'])
+        self.assertIsNone(doc['last'])
+
+    def test_get_warm_works_while_unarmed(self):
+        roundhouse.ACTUATE_ARMED = False
+        try:
+            status, body, _ = self.get('/api/warm')
+        finally:
+            roundhouse.ACTUATE_ARMED = True
+        self.assertEqual(status, 200)
+        self.assertEqual(set(json.loads(body).keys()), {'pending', 'last'})
+
+    def test_get_warm_cancel_405(self):
+        status, _body, _h = self.get('/api/warm/cancel')
+        self.assertEqual(status, 405)
+
+    def test_post_routing_config_405(self):
+        for path in ('/api/routing-config', '/api/routing-config.json'):
+            status, _body, _h = self.post(path, data={})
+            self.assertEqual(status, 405, path)
+
+    # --- routing-config GETs: unauthenticated reads, content types, twin ---
+
+    def test_routing_config_unauthenticated_200_and_content_types(self):
+        status, body, headers = self.get('/api/routing-config')
+        self.assertEqual(status, 200)
+        self.assertEqual(headers.get('Content-Type'), 'text/yaml; charset=utf-8')
+
+        status_j, body_j, headers_j = self.get('/api/routing-config.json')
+        self.assertEqual(status_j, 200)
+        self.assertEqual(headers_j.get('Content-Type'), 'application/json; charset=utf-8')
+
+    def test_routing_config_header_comments_carry_advertise_host(self):
+        _status, body, _h = self.get('/api/routing-config')
+        lines = body.decode('utf-8').split('\n')
+        self.assertEqual(lines[0], '# generated-by: roundhouse@%s' % self.HOST)
+        self.assertRegex(lines[1],
+                         r'^# generated-at: \d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$')
+        self.assertEqual(lines[2], '# warm-hook: POST http://%s:%d/api/warm'
+                                   % (self.ADVERTISE, self.port))
+        self.assertEqual(lines[3], 'model_list:')
+
+    def test_routing_config_yaml_parses_and_matches_json_twin(self):
+        _s, yaml_body, _h = self.get('/api/routing-config')
+        _s, json_body, _h = self.get('/api/routing-config.json')
+
+        parsed = _parse_routing_fragment(yaml_body.decode('utf-8'))
+        twin = json.loads(json_body)
+
+        self.assertEqual(parsed['header']['generated_by'], twin['generated_by'])
+        self.assertEqual(parsed['header']['warm_hook'], twin['warm_hook'])
+        self.assertEqual(len(parsed['model_list']), len(twin['model_list']))
+        for got, want in zip(parsed['model_list'], twin['model_list']):
+            self.assertEqual(got['model_name'], want['model_name'])
+            self.assertEqual(got['litellm_params'], want['litellm_params'])
+            # The hand-rolled parser returns strings; compare against JSON coerced
+            # the same way so a type change on either side is still caught.
+            self.assertEqual(got['model_info'],
+                             {k: _scalar_text(v) for k, v in want['model_info'].items()})
+
+    def test_routing_config_inclusion_policy_over_the_route(self):
+        _s, json_body, _h = self.get('/api/routing-config.json')
+        names = [e['model_name'] for e in json.loads(json_body)['model_list']]
+        # hot (marked and unmarked) in; cold+marked in; retired never.
+        self.assertIn('%s-warm-a' % self.HOST, names)
+        self.assertIn('%s-warm-plain' % self.HOST, names)
+        self.assertIn('%s-warm-b' % self.HOST, names)
+        self.assertNotIn('%s-warm-gone' % self.HOST, names)
+
+
+class TestWarmQueueRoutes(_WarmRouteHarness):
+    """SPEC §7.3 `TestWarmQueueRoutes` — depth-1 queue matrix at route level."""
+
+    def test_busy_slot_parks_202_queued(self):
+        self.busy_slot()
+        status, body = self.post_warm({'unit': 'warm-b.service'}, requester='proxy')
+        self.assertEqual(status, 202)
+        doc = json.loads(body)
+        self.assertTrue(doc['queued'])
+        self.assertEqual(doc['unit'], 'warm-b.service')
+        self.assertIsNotNone(self.engine.pending_warm)
+        self.assertEqual(self.engine.pending_warm['unit'], 'warm-b.service')
+        self.assertEqual(self.engine.pending_warm['requester'], 'proxy')
+
+    def test_duplicate_parked_target_200_already_queued(self):
+        self.busy_slot()
+        self.post_warm({'unit': 'warm-b.service'})
+        status, body = self.post_warm({'unit': 'warm-b.service'})
+        self.assertEqual(status, 200)
+        doc = json.loads(body)
+        self.assertEqual(doc['status'], 'already_queued')
+        self.assertEqual(doc['unit'], 'warm-b.service')
+        self.assertEqual(doc['pending']['unit'], 'warm-b.service')
+
+    def test_distinct_second_warm_409_queue_full(self):
+        self.busy_slot()
+        self.post_warm({'unit': 'warm-b.service'})
+        status, body = self.post_warm({'unit': 'warm-dup1.service'})
+        self.assertEqual(status, 409)
+        doc = json.loads(body)
+        self.assertEqual(doc['error'], 'warm_queue_full')
+        self.assertEqual(doc['pending']['unit'], 'warm-b.service')
+        self.assertEqual(self.engine.pending_warm['unit'], 'warm-b.service')
+
+    def test_no_queue_jump_when_slot_free_but_pending_set(self):
+        """H5 corollary: pending non-None routes every warm through queue rules."""
+        self.engine.current = None
+        self.engine.warm_seq = 7
+        self.engine.pending_warm = {'seq': 7, 'unit': 'warm-b.service', 'logical': None,
+                                    'requester': 'proxy', 'requested_at': 0.0}
+        status, body = self.post_warm({'unit': 'warm-dup1.service'})
+        self.assertEqual(status, 409)
+        self.assertEqual(json.loads(body)['error'], 'warm_queue_full')
+
+        status, body = self.post_warm({'unit': 'warm-b.service'})
+        self.assertEqual(status, 200)
+        self.assertEqual(json.loads(body)['status'], 'already_queued')
+
+    def test_cancel_then_cancel_again(self):
+        self.busy_slot()
+        self.post_warm({'unit': 'warm-b.service'}, requester='proxy')
+
+        status, body, _h = self.post('/api/warm/cancel', data={})
+        self.assertEqual(status, 200)
+        doc = json.loads(body)
+        self.assertTrue(doc['cancelled'])
+        self.assertEqual(doc['unit'], 'warm-b.service')
+        self.assertIsNone(self.engine.pending_warm)
+
+        status, body, _h = self.post('/api/warm/cancel', data={})
+        self.assertEqual(status, 404)
+        self.assertEqual(json.loads(body)['error'], 'no_pending')
+
+    def test_get_warm_reports_pending_then_cancelled_disposition(self):
+        self.busy_slot()
+        self.post_warm({'unit': 'warm-b.service'}, requester='proxy')
+
+        status, body, _h = self.get('/api/warm')
+        self.assertEqual(status, 200)
+        doc = json.loads(body)
+        self.assertEqual(doc['pending']['unit'], 'warm-b.service')
+        self.assertEqual(doc['pending']['requester'], 'proxy')
+        self.assertIn('seq', doc['pending'])
+        self.assertIn('requested_at', doc['pending'])
+        self.assertIsNone(doc['last'])
+
+        self.post('/api/warm/cancel', data={})
+
+        status, body, _h = self.get('/api/warm')
+        doc = json.loads(body)
+        self.assertIsNone(doc['pending'])
+        self.assertEqual(doc['last']['disposition'], 'cancelled')
+        self.assertEqual(doc['last']['unit'], 'warm-b.service')
+
+    def test_parked_warm_fires_on_tick_after_slot_frees(self):
+        """The tick is the only firing trigger (H5); it re-plans from a fresh snapshot."""
+        self.busy_slot()
+        self.post_warm({'unit': 'warm-b.service'}, requester='proxy')
+        seq = self.engine.pending_warm['seq']
+
+        # Tick while busy: no-op, still parked.
+        self.engine.tick_pending_warm()
+        self.assertIsNotNone(self.engine.pending_warm)
+
+        # Free the slot and shrink the budget so the fresh plan must stop warm-a.
+        self.engine.current = None
+        snap = self._default_snapshot()
+        snap['mem']['available_bytes'] = 512 * 1024 * 1024
+        type(self).snap = snap
+
+        with patch.object(roundhouse.RolloutEngine, '_run_switch', lambda *a, **k: None), \
+             patch('roundhouse.switch_preflight',
+                   return_value={'ok': True, 'checks': [], 'confirm': 'sw-confirm'}):
+            self.engine.tick_pending_warm()
+
+        self.assertIsNone(self.engine.pending_warm)
+        status, body, _h = self.get('/api/warm')
+        last = json.loads(body)['last']
+        self.assertEqual(last['disposition'], 'started')
+        self.assertEqual(last['unit'], 'warm-b.service')
+
+        status, body, _h = self.get('/api/rollouts/%s' % last['rollout_id'])
+        rec = json.loads(body)
+        self.assertEqual(rec['origin'], 'warm')
+        self.assertEqual(rec['requester'], 'proxy')
+        self.assertEqual(rec['stops'], ['warm-a.service'])
+        self.assertNotEqual(seq, None)
+
+    def test_parked_warm_dropped_when_unfittable_at_fire_time(self):
+        """Drop, do not retry (H5): the disposition is visible on GET /api/warm."""
+        self.busy_slot()
+        self.post_warm({'unit': 'warm-b.service'}, requester='proxy')
+
+        self.engine.current = None
+        snap = self._default_snapshot()
+        snap['mem']['available_bytes'] = 100 * 1024 * 1024
+        for r in snap['units']:
+            if r['unit'] == 'warm-a.service':
+                r['mem'] = {'bytes': 1000, 'source': 'measured', 'label': 'measured peak'}
+        type(self).snap = snap
+
+        self.engine.tick_pending_warm()
+
+        self.assertIsNone(self.engine.pending_warm)
+        status, body, _h = self.get('/api/warm')
+        last = json.loads(body)['last']
+        self.assertEqual(last['disposition'], 'consent_unfittable')
+
+        # And it stays dropped: a second tick does nothing.
+        self.engine.tick_pending_warm()
+        self.assertIsNone(self.engine.pending_warm)
+
+
+class TestGenerationZeroWrites(_WarmRouteHarness):
+    """SPEC §7.3 `TestGenerationZeroWrites` — the three-leg proof for read routes."""
+
+    def test_generation_routes_write_nothing(self):
+        recorder = []
+
+        def boom(*a, **k):
+            raise AssertionError('write gateway called from a read route')
+
+        def record_popen(*a, **k):
+            recorder.append(a)
+            raise AssertionError('subprocess spawned from a read route')
+
+        with patch('roundhouse._atomic_write', side_effect=boom), \
+             patch('roundhouse.run_git', side_effect=boom), \
+             patch('roundhouse.run_actuate', side_effect=boom), \
+             patch('roundhouse.subprocess.Popen', side_effect=record_popen), \
+             patch('roundhouse.subprocess.run', side_effect=record_popen):
+            for path in ('/api/routing-config', '/api/routing-config.json', '/api/warm'):
+                status, _body, _h = self.get(path)
+                self.assertEqual(status, 200, path)
+        self.assertEqual(recorder, [])
+
+    def test_repeated_pulls_are_byte_stable_apart_from_the_timestamp(self):
+        bodies = []
+        for _ in range(5):
+            _s, body, _h = self.get('/api/routing-config')
+            text = body.decode('utf-8')
+            bodies.append('\n'.join(l for l in text.split('\n')
+                                    if not l.startswith('# generated-at:')))
+        self.assertEqual(len(set(bodies)), 1)
+
+    def test_warm_switch_completes_with_write_gateways_disabled(self):
+        """Engine leg: a warm-origin switch touches no file-write or git gateway."""
+        snap = self._default_snapshot()
+        snap['mem']['available_bytes'] = 512 * 1024 * 1024
+        type(self).snap = snap
+
+        def boom(*a, **k):
+            raise AssertionError('write gateway called from the warm path')
+
+        with patch('roundhouse._atomic_write', side_effect=boom), \
+             patch('roundhouse.run_git', side_effect=boom), \
+             patch.object(roundhouse.RolloutEngine, '_run_switch', lambda *a, **k: None), \
+             patch('roundhouse.switch_preflight',
+                   return_value={'ok': True, 'checks': [], 'confirm': 'sw-confirm'}):
+            status, body = self.post_warm({'unit': 'warm-b.service'}, requester='proxy')
+        self.assertEqual(status, 202)
+        self.assertEqual(json.loads(body)['stops'], ['warm-a.service'])
+
+
+def _scalar_text(value):
+    """Render a JSON scalar the way the hand-rolled YAML parser below reads it back."""
+    if isinstance(value, bool):
+        return 'true' if value else 'false'
+    return str(value)
+
+
+def _parse_routing_fragment(text):
+    """A deliberately independent reader for the fragment (no pyyaml, no emitter code).
+
+    Understands exactly the shape §3.2 promises — three header comments, `model_list:`,
+    and two-space-stepped entries — and rejects anything else, so a document that only
+    *looks* like YAML because the emitter quoted badly fails here.
+    """
+    lines = text.split('\n')
+    assert lines[-1] == '', 'fragment must end with a trailing newline'
+    lines = lines[:-1]
+
+    header = {}
+    for line, key in zip(lines[:3], ('generated_by', 'generated_at', 'warm_hook')):
+        prefix = {'generated_by': '# generated-by: ',
+                  'generated_at': '# generated-at: ',
+                  'warm_hook': '# warm-hook: '}[key]
+        assert line.startswith(prefix), 'bad header line: %r' % line
+        header[key] = line[len(prefix):]
+    assert lines[3] == 'model_list:', 'missing model_list key'
+
+    def unscalar(token):
+        if token.startswith('"'):
+            assert token.endswith('"') and len(token) >= 2, 'unbalanced quote: %r' % token
+            body, out, i = token[1:-1], '', 0
+            while i < len(body):
+                c = body[i]
+                if c == '\\':
+                    nxt = body[i + 1]
+                    if nxt == 'x':
+                        out += chr(int(body[i + 2:i + 4], 16))
+                        i += 4
+                        continue
+                    assert nxt in ('\\', '"'), 'unknown escape %r' % nxt
+                    out += nxt
+                    i += 2
+                    continue
+                assert c != '"', 'raw quote inside quoted token'
+                assert ord(c) >= 0x20 and ord(c) != 0x7f, 'raw control byte in token'
+                out += c
+                i += 1
+            return out
+        assert re.fullmatch(r'[A-Za-z0-9._/-]+', token), 'unsafe bare token: %r' % token
+        assert not token.startswith('-'), 'bare token may not lead with a dash'
+        return token
+
+    entries, cur, sub = [], None, None
+    for line in lines[4:]:
+        if line.startswith('  - '):
+            key, _, val = line[4:].partition(': ')
+            assert key == 'model_name'
+            cur = {'model_name': unscalar(val)}
+            entries.append(cur)
+            sub = None
+        elif line.startswith('      '):
+            assert sub is not None, 'value line outside a sub-map'
+            key, _, val = line[6:].partition(': ')
+            sub[key] = unscalar(val)
+        elif line.startswith('    '):
+            key = line[4:]
+            assert key.endswith(':'), 'bad sub-map key line: %r' % line
+            sub = {}
+            cur[key[:-1]] = sub
+        else:
+            raise AssertionError('unexpected line: %r' % line)
+    return {'header': header, 'model_list': entries}
 
 
 if __name__ == '__main__':

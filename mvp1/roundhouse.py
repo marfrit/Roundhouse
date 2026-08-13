@@ -3156,8 +3156,8 @@ class RoundhouseRequestHandler(http.server.BaseHTTPRequestHandler):
         target = result[1]
 
         # Step 4: Sanitize requester
-        requester_header = self.headers.get('X-Roundhouse-Requester', '')
-        # Strip non-allowed characters, keep only [A-Za-z0-9._@ -]
+        # H7: strip, keep only [A-Za-z0-9._@ -], truncate to 64, empty -> 'token'
+        requester_header = self.headers.get('X-Roundhouse-Requester', '').strip()
         requester = ''.join(c for c in requester_header if c in 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789._@ -')
         # Truncate to 64 chars
         requester = requester[:64]
@@ -3257,7 +3257,7 @@ class RoundhouseRequestHandler(http.server.BaseHTTPRequestHandler):
                 return
 
         # Step 9: Plan warm (slot is free, no pending)
-        cgroup_cache = {}
+        cgroup_cache = getattr(watcher, '_cgroup_cache', None) or {}
         mem_store = watcher.mem_store
         plan = warm_plan(target, snap, watcher.units, cgroup_cache, mem_store)
 
@@ -3300,53 +3300,55 @@ class RoundhouseRequestHandler(http.server.BaseHTTPRequestHandler):
             self.wfile.write(json.dumps(response).encode('utf-8'))
             return
 
-        # Step 11: Start switch
+        # Step 11: Start switch.
+        #
+        # NEVER hold `watcher.lock` across this call: `start_switch` claims the slot
+        # inside its own `with self.watcher_lock:` block (H4 — that block is where the
+        # consent re-check, the warm_seq handshake and the slot claim are made atomic),
+        # and the lock is a plain non-reentrant `threading.Lock`. A caller that already
+        # holds it deadlocks the request thread WITH the lock held, wedging every
+        # snapshot, poll and route in the process.
         try:
-            with watcher.lock:
-                # Re-check queue state after plan/preflight
-                if engine.pending_warm is not None:
-                    pending_unit = engine.pending_warm.get('unit')
-                    if pending_unit == target:
-                        # Dup
-                        self.send_response(200)
-                        self.send_header('Content-Type', 'application/json; charset=utf-8')
-                        self.end_headers()
-                        self.wfile.write(json.dumps({
-                            'status': 'already_queued',
-                            'unit': target,
-                            'pending': dict(engine.pending_warm)
-                        }).encode('utf-8'))
-                        return
-                    else:
-                        # Different unit in queue
-                        self.send_response(409)
-                        self.send_header('Content-Type', 'application/json; charset=utf-8')
-                        self.end_headers()
-                        self.wfile.write(json.dumps({
-                            'error': 'warm_queue_full',
-                            'pending': dict(engine.pending_warm)
-                        }).encode('utf-8'))
-                        return
+            result = engine.start_switch(target, plan['stops'], pf['confirm'],
+                                         origin='warm', requester=requester)
 
-                # Slot is free and nothing pending, start the switch
-                result = engine.start_switch(target, plan['stops'], pf['confirm'],
-                                            origin='warm', requester=requester, warm_seq=None)
-
-                self.send_response(202)
-                self.send_header('Content-Type', 'application/json; charset=utf-8')
-                self.end_headers()
-                response = {
-                    'rollout_id': result.get('rollout_id'),
-                    'stops': plan['stops']
-                }
-                self.wfile.write(json.dumps(response).encode('utf-8'))
+            self.send_response(202)
+            self.send_header('Content-Type', 'application/json; charset=utf-8')
+            self.end_headers()
+            response = {
+                'rollout_id': result.get('rollout_id'),
+                'stops': plan['stops']
+            }
+            self.wfile.write(json.dumps(response).encode('utf-8'))
 
         except ActuationError as e:
             error_str = str(e)
             if 'operation_in_progress' in error_str:
-                # Slot stolen: re-enter queue gate
+                # A human claimed the slot between step 8 and here: re-enter step 8's
+                # locked block exactly once (park / dup / full).
                 with watcher.lock:
-                    if engine.pending_warm is None:
+                    if engine.pending_warm is not None:
+                        pending = dict(engine.pending_warm)
+                        if pending.get('unit') == target:
+                            self.send_response(200)
+                            self.send_header('Content-Type',
+                                             'application/json; charset=utf-8')
+                            self.end_headers()
+                            self.wfile.write(json.dumps({
+                                'status': 'already_queued',
+                                'unit': target,
+                                'pending': pending
+                            }).encode('utf-8'))
+                        else:
+                            self.send_response(409)
+                            self.send_header('Content-Type',
+                                             'application/json; charset=utf-8')
+                            self.end_headers()
+                            self.wfile.write(json.dumps({
+                                'error': 'warm_queue_full',
+                                'pending': pending
+                            }).encode('utf-8'))
+                    else:
                         engine.warm_seq += 1
                         engine.pending_warm = {
                             'seq': engine.warm_seq,
@@ -3361,15 +3363,6 @@ class RoundhouseRequestHandler(http.server.BaseHTTPRequestHandler):
                         self.wfile.write(json.dumps({
                             'queued': True,
                             'unit': target
-                        }).encode('utf-8'))
-                    else:
-                        # Queue full
-                        self.send_response(409)
-                        self.send_header('Content-Type', 'application/json; charset=utf-8')
-                        self.end_headers()
-                        self.wfile.write(json.dumps({
-                            'error': 'warm_queue_full',
-                            'pending': dict(engine.pending_warm)
                         }).encode('utf-8'))
             elif 'warm_consent' in error_str:
                 self.send_json_error(422, 'not_on_demand', str(e))
@@ -4993,13 +4986,14 @@ class RolloutEngine:
                     if not stop_unit_obj or not stop_unit_obj.on_demand:
                         raise ActuationError(f"warm_consent: stop {stop_unit} is not marked on-demand")
 
-                # Verify warm_seq matches (or fire failed meanwhile)
+                # Verify warm_seq matches (or the park was cancelled meanwhile), then
+                # pop it in the SAME lock hold as the slot claim (H4). The pop belongs
+                # to the fire path only: a direct route-driven warm (warm_seq=None)
+                # must never silently discard somebody else's parked request.
                 if warm_seq is not None:
                     if self.pending_warm is None or self.pending_warm.get('seq') != warm_seq:
                         raise ActuationError("warm_cancelled")
-
-                # Pop the parked warm
-                self.pending_warm = None
+                    self.pending_warm = None
 
             if not _slot_free(self.current):
                 if self.current and self.current.get('kind') == 'switch':
@@ -5543,7 +5537,7 @@ class RolloutEngine:
                 return
 
             # Warm plan
-            cgroup_cache = {}
+            cgroup_cache = getattr(self.watcher, '_cgroup_cache', None) or {}
             mem_store = self.watcher.mem_store
             plan = warm_plan(target, snap, self.units, cgroup_cache, mem_store)
 
@@ -6204,8 +6198,11 @@ def enablement_preflight(unit_name: str, enable: bool, snapshot: Dict, units: Di
 # YAML keyword ambiguity set
 YAML_AMBIGUOUS = {'true', 'false', 'yes', 'no', 'on', 'off', 'null', 'none', '~'}
 
-# Safe bare string pattern: alphanumeric, dot, underscore, slash, dash
-SAFE_BARE_RE = re.compile(r'[A-Za-z0-9._/-]+$')
+# Safe bare string pattern: alphanumeric, dot, underscore, slash, dash.
+# Matched with fullmatch(), NOT match(): in a `...$` pattern, `$` also matches just
+# before a trailing newline, so 'alias\n' would qualify as bare and inject a raw line
+# break into the document (§3.3 spells the rule as re.fullmatch for exactly this).
+SAFE_BARE_RE = re.compile(r'[A-Za-z0-9._/-]+')
 
 
 def _yaml_str(s: str) -> str:
@@ -6223,7 +6220,7 @@ def _yaml_str(s: str) -> str:
     is_numeric_looking = re.fullmatch(r'[0-9.+-]*[0-9](?:[eE][+-]?[0-9]+)?|[0-9.+-]+', s)
 
     is_safe_bare = (
-        SAFE_BARE_RE.match(s) is not None and
+        SAFE_BARE_RE.fullmatch(s) is not None and
         not s.startswith('-') and
         not is_numeric_looking and
         s.lower() not in YAML_AMBIGUOUS
@@ -6278,8 +6275,9 @@ def emit_routing_yaml(meta: Dict, entries: List[Dict]) -> str:
     """
     lines = []
 
-    # Header comments
-    lines.append(f"# generated-by: roundhouse@{meta.get('generated_by', 'unknown')}")
+    # Header comments — emitted verbatim from routing_meta (§3.2); server-controlled
+    # strings only, no row data reaches a comment line.
+    lines.append(f"# generated-by: {meta.get('generated_by', 'unknown')}")
     lines.append(f"# generated-at: {meta.get('generated_at', '?')}")
     lines.append(f"# warm-hook: {meta.get('warm_hook', '?')}")
 
@@ -6421,7 +6419,10 @@ def routing_meta(snapshot: Dict, advertise_host: str, self_port: int, now_utc) -
     iso_dt = now_utc.strftime('%Y-%m-%dT%H:%M:%SZ')
 
     return {
-        'generated_by': host,
+        # H3/§3.1: the source string is 'roundhouse@<host>' — the JSON twin serves this
+        # dict verbatim, so the prefix belongs here and NOT in the YAML emitter, or the
+        # two documents disagree about who generated them.
+        'generated_by': f'roundhouse@{host}',
         'generated_at': iso_dt,
         'warm_hook': f'POST http://{advertise_host}:{self_port}/api/warm'
     }
@@ -6440,8 +6441,10 @@ def resolve_warm_target(logical: Optional[str], unit: Optional[str],
     """
     assert (logical is None) != (unit is None), "exactly one of logical/unit must be given"
 
-    if unit:
-        # Direct unit path
+    if unit is not None:
+        # Direct unit path. `is not None`, never truthiness: `{"unit": ""}` is a
+        # perfectly well-formed request for a unit that does not exist (404), and
+        # falling through to the logical branch would dereference logical=None.
         if unit not in units:
             return ('error', 404, 'unknown_unit', {})
         # Retired units resolve here; the retired refusal happens in the handler
@@ -6498,11 +6501,13 @@ def warm_plan(target: str, snapshot: Dict, units: Dict[str, 'UnitFile'],
     budget = mem_snapshot.get('available_bytes') or 0
     mem_available_source = mem_snapshot.get('available_source', 'unknown')
 
-    # Build consenting and excluded lists
+    # Build consenting and excluded lists. `suggest_stops` and `_freed_bytes` read
+    # residency off the FULL snapshot row (`mem`/`rung`) plus the watcher's cgroup
+    # cache, so the greedy pool must be rows, not projections — a projection with no
+    # `mem` key values every candidate at 0 bytes and destroys the F7 ordering.
+    consenting_rows = []
     consenting = []
     excluded_unmarked = []
-
-    ACTIVE_RUNGS = {'STARTING', 'LOADING', 'READY', 'BUSY'}
 
     for row in snapshot.get('units', []):
         if row['unit'] == target or row.get('retired'):
@@ -6514,34 +6519,31 @@ def warm_plan(target: str, snapshot: Dict, units: Dict[str, 'UnitFile'],
         if not unit_obj:
             continue
 
+        resident_bytes, resident_source = _freed_bytes(row['unit'], row, cgroup_cache)
         row_info = {
             'unit': row['unit'],
             'rung': row.get('rung', 'OFF'),
-            'resident_bytes': row.get('mem', {}).get('bytes'),
-            'resident_source': row.get('mem', {}).get('label')
+            'resident_bytes': resident_bytes,
+            'resident_source': resident_source
         }
 
         if unit_obj.on_demand:
+            consenting_rows.append(row)          # THE FENCE, layer 1
             consenting.append(row_info)
         else:
             excluded_unmarked.append(row_info)
 
-    # Run suggest_stops on consenting pool only
-    stops = suggest_stops(target, [], consenting, estimate, budget, [],
+    # Run the UNMODIFIED F7 greedy over the consent-filtered pool
+    stops = suggest_stops(target, [], consenting_rows, estimate, budget, [],
                           cgroup_cache, mem_store)
 
     # Compute freed bytes
     freed_by = []
     freed_total = 0
+    rows_by_unit = {row['unit']: row for row in snapshot.get('units', [])}
     for stop_unit in stops:
-        # Find the row for this unit
-        freed_bytes = 0
-        freed_source = 'unknown'
-        for row in snapshot.get('units', []):
-            if row['unit'] == stop_unit:
-                freed_bytes = _freed_bytes(stop_unit, row, snapshot, units)
-                freed_source = row.get('mem', {}).get('label', 'unknown')
-                break
+        stop_row = rows_by_unit.get(stop_unit) or {}
+        freed_bytes, freed_source = _freed_bytes(stop_unit, stop_row, cgroup_cache)
         freed_by.append({'unit': stop_unit, 'bytes': freed_bytes, 'source': freed_source})
         freed_total += freed_bytes
 
