@@ -622,6 +622,68 @@ def _tokenize_pieces(pieces: List[tuple]) -> List[Token]:
     return tokens
 
 
+# Known-flag table (SPEC §2.5): flag -> (canonical field, arity, type).
+# Module level so the splice engine (§3.2.2 type validation) and verify (§3.5(a) typed
+# re-parse) share ONE table with the extractor instead of re-deriving it.
+KNOWN_FLAG_MAP = {
+    '-m': ('model_path', 1, 'str'),
+    '--model': ('model_path', 1, 'str'),
+    '-c': ('ctx', 1, 'int'),
+    '--ctx-size': ('ctx', 1, 'int'),
+    '-t': ('threads', 1, 'int'),
+    '--threads': ('threads', 1, 'int'),
+    '-tb': ('threads_batch', 1, 'int'),
+    '--threads-batch': ('threads_batch', 1, 'int'),
+    '-fa': ('flash_attn', 1, 'str'),
+    '--flash-attn': ('flash_attn', 1, 'str'),
+    '-ctk': ('cache_type_k', 1, 'str'),
+    '--cache-type-k': ('cache_type_k', 1, 'str'),
+    '-ctv': ('cache_type_v', 1, 'str'),
+    '--cache-type-v': ('cache_type_v', 1, 'str'),
+    '--jinja': (None, 0, 'bool'),
+    '--chat-template-kwargs': ('chat_template_kwargs', 1, 'str'),
+    '--temp': ('sampling.temp', 1, 'float'),
+    '--top-p': ('sampling.top_p', 1, 'float'),
+    '--top-k': ('sampling.top_k', 1, 'int'),
+    '--min-p': ('sampling.min_p', 1, 'float'),
+    '--presence-penalty': ('sampling.presence_penalty', 1, 'float'),
+    '--repeat-penalty': ('sampling.repeat_penalty', 1, 'float'),
+    '-n': ('n_predict', 1, 'int'),
+    '--predict': ('n_predict', 1, 'int'),
+    '--reasoning-budget': ('reasoning_budget', 1, 'int'),
+    '--reasoning': ('reasoning', 1, 'str'),
+    '-Cr': ('cpu_range', 1, 'str'),
+    '-Crb': ('cpu_range_batch', 1, 'str'),
+    '--cpu-strict': ('cpu_strict', 1, 'int'),
+    '--cpu-strict-batch': ('cpu_strict_batch', 1, 'int'),
+    '--alias': ('alias', 1, 'str'),
+    '--host': ('host_bind', 1, 'str'),
+    '--port': ('port', 1, 'int'),
+}
+
+# canonical field name -> type, derived from the one table above.
+FIELD_TYPES = {field: type_hint
+               for (field, _arity, type_hint) in KNOWN_FLAG_MAP.values()
+               if field}
+
+
+def coerce_field_value(field: str, text: str):
+    """Coerce a value string the way `extract_param_profile` would for this field.
+
+    Same contract as the extractor: on a type mismatch the raw text is kept (the
+    extractor never raises; `plan_edits` is where bad input is refused).
+    """
+    type_hint = FIELD_TYPES.get(field, 'str')
+    try:
+        if type_hint == 'int':
+            return int(text)
+        if type_hint == 'float':
+            return float(text)
+    except (ValueError, TypeError):
+        return text
+    return text
+
+
 def extract_param_profile(engine_argv: List[Token]) -> Dict:
     """Extract parameter profile from engine argv.
 
@@ -656,42 +718,8 @@ def extract_param_profile(engine_argv: List[Token]) -> Dict:
         'spans': {}
     }
 
-    # Known flags with their arities and target fields
-    flag_map = {
-        '-m': ('model_path', 1, 'str'),
-        '--model': ('model_path', 1, 'str'),
-        '-c': ('ctx', 1, 'int'),
-        '--ctx-size': ('ctx', 1, 'int'),
-        '-t': ('threads', 1, 'int'),
-        '--threads': ('threads', 1, 'int'),
-        '-tb': ('threads_batch', 1, 'int'),
-        '--threads-batch': ('threads_batch', 1, 'int'),
-        '-fa': ('flash_attn', 1, 'str'),
-        '--flash-attn': ('flash_attn', 1, 'str'),
-        '-ctk': ('cache_type_k', 1, 'str'),
-        '--cache-type-k': ('cache_type_k', 1, 'str'),
-        '-ctv': ('cache_type_v', 1, 'str'),
-        '--cache-type-v': ('cache_type_v', 1, 'str'),
-        '--jinja': (None, 0, 'bool'),
-        '--chat-template-kwargs': ('chat_template_kwargs', 1, 'str'),
-        '--temp': ('sampling.temp', 1, 'float'),
-        '--top-p': ('sampling.top_p', 1, 'float'),
-        '--top-k': ('sampling.top_k', 1, 'int'),
-        '--min-p': ('sampling.min_p', 1, 'float'),
-        '--presence-penalty': ('sampling.presence_penalty', 1, 'float'),
-        '--repeat-penalty': ('sampling.repeat_penalty', 1, 'float'),
-        '-n': ('n_predict', 1, 'int'),
-        '--predict': ('n_predict', 1, 'int'),
-        '--reasoning-budget': ('reasoning_budget', 1, 'int'),
-        '--reasoning': ('reasoning', 1, 'str'),
-        '-Cr': ('cpu_range', 1, 'str'),
-        '-Crb': ('cpu_range_batch', 1, 'str'),
-        '--cpu-strict': ('cpu_strict', 1, 'int'),
-        '--cpu-strict-batch': ('cpu_strict_batch', 1, 'int'),
-        '--alias': ('alias', 1, 'str'),
-        '--host': ('host_bind', 1, 'str'),
-        '--port': ('port', 1, 'int'),
-    }
+    # Known flags with their arities and target fields (module-level table)
+    flag_map = KNOWN_FLAG_MAP
 
     # Build raw_argv
     result['raw_argv'] = [tok.text for tok in engine_argv]
@@ -2147,6 +2175,40 @@ class RoundhouseRequestHandler(http.server.BaseHTTPRequestHandler):
 
         unit = watcher.units[unit_name]
 
+        # E5 companion: preview against the bytes ON DISK. Unit files are parsed once at
+        # startup and refreshed only by a successful apply (S4), so after an external hand
+        # edit the in-memory spans are dead — and since apply now refuses on a disk/memory
+        # mismatch, without this refresh the unit would be un-appliable until a restart.
+        # §7.5's "re-preview once on preview_stale" recovery depends on this.
+        try:
+            disk_raw = _read_file_bytes(unit.path)
+        except OSError as exc:
+            self.send_json_error(404, 'not_found', f'cannot read {unit.path}: {exc}')
+            return
+        if disk_raw != unit.raw:
+            engine = self.server.rollout_engine
+            fresh = None
+            if engine is None or _slot_free(getattr(engine, 'current', None)):
+                # Never swap the file's parse out from under a live rollout.
+                try:
+                    fresh = parse_unit(unit.path, disk_raw)
+                except Exception:
+                    fresh = None
+            if fresh is None:
+                self.send_response(409)
+                self.send_header('Content-Type', 'application/json; charset=utf-8')
+                self.end_headers()
+                self.wfile.write(json.dumps({
+                    'error': 'preview_stale',
+                    'detail': 'unit file or edits changed since preview; re-preview',
+                }).encode('utf-8'))
+                return
+            with self.server.watcher_lock:
+                watcher.units[unit_name] = fresh
+                if engine is not None:
+                    engine.units[unit_name] = fresh
+            unit = fresh
+
         # Plan edits
         try:
             edits = plan_edits(unit, data.get('edits', {}))
@@ -2233,6 +2295,27 @@ class RoundhouseRequestHandler(http.server.BaseHTTPRequestHandler):
             }).encode('utf-8'))
             return
 
+        # E5 staleness FIRST, and against the bytes ON DISK (not the in-memory copy).
+        # A hash of `unit.raw` cannot notice an external edit made after the preview: it
+        # matches, the splice runs at the old spans and silently clobbers the change.
+        # It precedes plan_edits because staleness is a property of the base bytes — if
+        # the hand edit removed the field being edited, "re-preview" is the honest answer,
+        # not "field_not_editable".
+        try:
+            disk_raw = _read_file_bytes(unit.path)
+        except OSError as exc:
+            self.send_json_error(404, 'not_found', f'cannot read {unit.path}: {exc}')
+            return
+        if disk_raw != unit.raw:
+            self.send_response(409)
+            self.send_header('Content-Type', 'application/json; charset=utf-8')
+            self.end_headers()
+            self.wfile.write(json.dumps({
+                'error': 'preview_stale',
+                'detail': 'unit file or edits changed since preview; re-preview'
+            }).encode('utf-8'))
+            return
+
         # Plan edits
         try:
             edits = plan_edits(unit, data.get('edits', {}))
@@ -2240,9 +2323,9 @@ class RoundhouseRequestHandler(http.server.BaseHTTPRequestHandler):
             self.send_json_error(400, e.reason, e.detail or e.reason)
             return
 
-        # Check confirm matches (E5)
+        # Check confirm matches (E5), computed from the verified disk bytes.
         confirm = data.get('confirm', '')
-        computed = compute_confirm(unit_name, unit.raw, edits)
+        computed = compute_confirm(unit_name, disk_raw, edits)
         if confirm != computed:
             self.send_response(409)
             self.send_header('Content-Type', 'application/json; charset=utf-8')
@@ -2287,7 +2370,9 @@ class RoundhouseRequestHandler(http.server.BaseHTTPRequestHandler):
             self.send_json_error(404, 'not_found', f'rollout {rollout_id} not found')
             return
 
-        if rollout.get('phase') != 'failed' or not rollout.get('rollback', {}).get('offered'):
+        # `rollout['rollback']` is None until an offer is made, so `.get('rollback', {})`
+        # returned None here and `.get('offered')` raised AttributeError -> 500.
+        if rollout.get('phase') != 'failed' or not _rollback_offered(rollout):
             self.send_response(409)
             self.send_header('Content-Type', 'application/json; charset=utf-8')
             self.end_headers()
@@ -2302,6 +2387,13 @@ class RoundhouseRequestHandler(http.server.BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(json.dumps({'rollout_id': rollout_id}).encode('utf-8'))
         except ActuationError as e:
+            # Lost the race against a concurrent rollback/dismiss: concurrency, so 409.
+            if 'not_rollbackable' in str(e):
+                self.send_response(409)
+                self.send_header('Content-Type', 'application/json; charset=utf-8')
+                self.end_headers()
+                self.wfile.write(json.dumps({'error': 'not_rollbackable'}).encode('utf-8'))
+                return
             self.send_json_error(400, 'rollback_error', str(e))
 
     def handle_dismiss(self, rollout_id: str):
@@ -2316,7 +2408,7 @@ class RoundhouseRequestHandler(http.server.BaseHTTPRequestHandler):
             self.send_json_error(404, 'not_found', f'rollout {rollout_id} not found')
             return
 
-        if rollout.get('phase') != 'failed' or not rollout.get('rollback', {}).get('offered'):
+        if rollout.get('phase') != 'failed' or not _rollback_offered(rollout):
             self.send_response(409)
             self.send_header('Content-Type', 'application/json; charset=utf-8')
             self.end_headers()
@@ -2324,7 +2416,16 @@ class RoundhouseRequestHandler(http.server.BaseHTTPRequestHandler):
             self.wfile.write(json.dumps(response).encode('utf-8'))
             return
 
-        engine.dismiss(rollout_id)
+        try:
+            engine.dismiss(rollout_id)
+        except ActuationError:
+            # Lost the race against a concurrent rollback/dismiss.
+            self.send_response(409)
+            self.send_header('Content-Type', 'application/json; charset=utf-8')
+            self.end_headers()
+            self.wfile.write(json.dumps({'error': 'not_dismissable'}).encode('utf-8'))
+            return
+
         self.send_response(200)
         self.send_header('Content-Type', 'application/json; charset=utf-8')
         self.end_headers()
@@ -2666,8 +2767,14 @@ def run_actuate(argv: List[str], units: Dict[str, 'UnitFile'], timeout: float = 
     except subprocess.TimeoutExpired:
         raise ActuationError(f"{' '.join(argv)} timeout after {timeout}s")
 
-def run_git(args: List[str], unit_dir: str, timeout: float = 30, bootstrap: bool = False) -> subprocess.CompletedProcess:
-    """Run a git command. Raises ActuationError unless armed and conditions met."""
+def run_git(args: List[str], unit_dir: str, timeout: float = 30, bootstrap: bool = False,
+            units: Optional[Dict[str, 'UnitFile']] = None) -> subprocess.CompletedProcess:
+    """Run a git command. Raises ActuationError unless armed and conditions met.
+
+    `units` is the selected unit set; when supplied, `git add -- <basename>` must name a
+    member of it (§2.2). Callers that mutate always pass it — staging an arbitrary
+    basename is how a unit Roundhouse does not manage ends up in a Roundhouse commit.
+    """
     if not ACTUATE_ARMED and not bootstrap:
         raise ActuationError("actuation not armed")
 
@@ -2681,10 +2788,25 @@ def run_git(args: List[str], unit_dir: str, timeout: float = 30, bootstrap: bool
             raise ActuationError(f"git forbidden token found in {args}")
 
         if args[0] == "add":
-            if not (len(args) == 3 and args[1] == "--" and "/" not in args[2]):
+            if not (len(args) == 3 and args[1] == "--"):
                 raise ActuationError(f"git add must be exactly ['add', '--', 'basename'], got {args}")
+            basename = args[2]
+            # A basename, not a path and not an option: no separators, no `..`, no leading
+            # dash, and it must look like a unit file.
+            if ("/" in basename or os.sep in basename or ".." in basename
+                    or basename.startswith("-") or not basename.endswith(".service")):
+                raise ActuationError(f"git add basename is not a unit filename: {basename!r}")
+            if units is not None and basename not in units:
+                raise ActuationError(f"git add {basename!r} is not a selected unit")
         elif args[0] == "revert":
-            if not ((len(args) == 3 and args[1:3] == ["--no-edit", args[2]]) or args == ["revert", "--abort"]):
+            # `args[1:3] == ["--no-edit", args[2]]` was a tautology — it only constrained
+            # args[1], so 'HEAD~5..HEAD', '--all' and 'main' all passed as the "sha".
+            if args == ["revert", "--abort"]:
+                pass
+            elif (len(args) == 3 and args[1] == "--no-edit"
+                    and re.fullmatch(r'[0-9a-f]{7,64}', args[2])):
+                pass
+            else:
                 raise ActuationError(f"git revert must be ['revert', '--no-edit', sha] or ['revert', '--abort'], got {args}")
 
     # Build command. `git version` answers "is git on PATH?" and must not depend on the
@@ -2815,7 +2937,8 @@ def ensure_token() -> str:
         if not token_content:
             # Empty file, regenerate
             token = secrets.token_urlsafe(32)
-            _atomic_write(TOKEN_PATH, token.encode() + b'\n')
+            # mode=0o600 at CREATE time: no world-readable window (chmod-after-replace had one)
+            _atomic_write(TOKEN_PATH, token.encode() + b'\n', mode=0o600)
             os.chmod(TOKEN_PATH, 0o600)
             print(f"generated bearer token at {TOKEN_PATH} — paste its contents into the UI", file=sys.stderr)
             TOKEN = token
@@ -2826,7 +2949,8 @@ def ensure_token() -> str:
     else:
         # Generate new token
         token = secrets.token_urlsafe(32)
-        _atomic_write(TOKEN_PATH, token.encode() + b'\n')
+        # mode=0o600 at CREATE time: no world-readable window (chmod-after-replace had one)
+        _atomic_write(TOKEN_PATH, token.encode() + b'\n', mode=0o600)
         os.chmod(TOKEN_PATH, 0o600)
         print(f"generated bearer token at {TOKEN_PATH} — paste its contents into the UI", file=sys.stderr)
         TOKEN = token
@@ -2880,6 +3004,40 @@ class Edit:
     new_text: str           # submitted value
     span: tuple             # (start, end) of value bytes in raw
     quote: str              # '' or "'"
+
+def validate_field_value(field: str, new_value: str) -> None:
+    """§3.2.2 type/range validation for a canonical field. Raises EditError invalid_value.
+
+    Unknown flags (`unknown:<flag>`) carry no declared type and are only byte-safety
+    checked — the parser never typed them either.
+    """
+    if field.startswith('unknown:'):
+        return
+
+    if field == 'chat_template_kwargs':
+        try:
+            json.loads(new_value)
+        except (ValueError, json.JSONDecodeError):
+            raise EditError("invalid_value",
+                            f"{field} must be valid JSON: {new_value!r}")
+        return
+
+    type_hint = FIELD_TYPES.get(field)
+    if type_hint == 'int':
+        try:
+            parsed = int(new_value)
+        except (ValueError, TypeError):
+            raise EditError("invalid_value", f"{field} must be an integer: {new_value!r}")
+        if field == 'ctx' and parsed <= 0:
+            raise EditError("invalid_value", f"ctx must be > 0: {new_value!r}")
+        if field == 'port' and not (1 <= parsed <= 65535):
+            raise EditError("invalid_value", f"port must be 1..65535: {new_value!r}")
+    elif type_hint == 'float':
+        try:
+            float(new_value)
+        except (ValueError, TypeError):
+            raise EditError("invalid_value", f"{field} must be a number: {new_value!r}")
+
 
 def plan_edits(unit: UnitFile, changes: Dict[str, str]) -> List[Edit]:
     """Validate and plan edits from user changes."""
@@ -2942,10 +3100,16 @@ def plan_edits(unit: UnitFile, changes: Dict[str, str]) -> List[Edit]:
 
         old_text = old_bytes.decode('utf-8', errors='replace')
 
+        # Type/range validate (§3.2.2) before byte safety: 'abc' for an int field is a
+        # type error, not a tokenization hazard, and must never reach the splice.
+        validate_field_value(key, new_value)
+
         # Byte safety validate
         if quote == '':
-            # Unquoted: must match alphanumeric + safe chars
-            if not re.match(r'^[A-Za-z0-9._:/=,+\-]*$', new_value):
+            # Unquoted: must match alphanumeric + safe chars. `fullmatch` + `+` (§3.2.3):
+            # non-empty, and no `$`-before-trailing-newline hole (a value ending in \n
+            # would otherwise pass and split the token).
+            if not re.fullmatch(r'[A-Za-z0-9._:/=,+\-]+', new_value):
                 raise EditError("invalid_value", f"unquoted value contains invalid chars: {new_value}")
         elif quote == "'":
             # Single-quoted: no ' or \ or newline
@@ -3023,14 +3187,125 @@ def assert_span_invariants(unit: UnitFile) -> None:
                 start, end = span_dict['value']
                 assert start < end and end <= len(raw), f"span {field} out of bounds"
 
+def _expected_profile(old_norm: Dict, edits: List[Edit]) -> Dict:
+    """The profile the splice is SUPPOSED to produce: old, with each edit applied (§3.5(a)).
+
+    Building the expectation (instead of skipping edited keys) is what makes the check
+    strong AND correct for the two shapes where the key name is not the field name:
+
+    * `unknown:<flag>` edits land in the `unknown_flags` list, never in a key called
+      `unknown:--foo` — comparing `unknown_flags` as an *unedited* field failed every
+      unknown-flag edit after the service was already stopped and spliced.
+    * `sampling.temp` and friends land inside the `sampling` sub-dict, same trap.
+    """
+    expected = {k: (dict(v) if isinstance(v, dict) else list(v) if isinstance(v, list) else v)
+                for k, v in old_norm.items()}
+
+    for e in edits:
+        if e.field.startswith('unknown:'):
+            pairs = list(expected.get('unknown_flags') or [])
+            # plan_edits binds the first entry with this flag text that HAS a value span;
+            # `value == old_text` reproduces that choice on the normalized list. The
+            # flag-only fallback covers tokens whose decoded text differs from their raw
+            # bytes (escapes, quoting) — never fail verify on a bookkeeping mismatch after
+            # the file has already been written.
+            index = None
+            for i, (flag, value) in enumerate(pairs):
+                if flag == e.flag and value == e.old_text:
+                    index = i
+                    break
+            if index is None:
+                for i, (flag, value) in enumerate(pairs):
+                    if flag == e.flag and value is not None:
+                        index = i
+                        break
+            if index is None:
+                raise VerifyError("profile_changed",
+                                  f"edited unknown flag {e.flag} not found in the old profile")
+            pairs[index] = (pairs[index][0], e.new_text)
+            expected['unknown_flags'] = pairs
+            continue
+
+        typed = coerce_field_value(e.field, e.new_text)
+        if '.' in e.field:
+            parent, sub = e.field.split('.', 1)
+            sub_dict = dict(expected.get(parent) or {})
+            sub_dict[sub] = typed
+            expected[parent] = sub_dict
+            continue
+
+        expected[e.field] = typed
+        # Derived keys that follow their source field.
+        if e.field == 'chat_template_kwargs':
+            try:
+                expected['chat_template_kwargs_json'] = json.loads(e.new_text)
+            except (ValueError, json.JSONDecodeError):
+                expected['chat_template_kwargs_json'] = None
+        elif e.field == 'port':
+            expected['port_source'] = 'flag'
+
+    return expected
+
+
+def assert_outside_spans_unchanged(old_raw: bytes, new_raw: bytes,
+                                   edits: List[Edit], provenance: str) -> None:
+    """§3.5(c) MVP2 addition, as a RUNTIME assertion.
+
+    Replays the splice arithmetic forward — descending-order splicing is equivalent to
+    shifting every later offset by the cumulative length delta — and asserts every byte of
+    `new_raw` outside the replaced spans and the appended EOF provenance region equals the
+    corresponding old byte. Deliberately independent of `assert_span_invariants` (which
+    only re-checks the NEW file against itself and would pass a wholesale rewrite).
+    """
+    ordered = sorted(edits, key=lambda e: e.span[0])
+
+    cursor_old = 0        # old-file offset of the next unedited run
+    delta = 0             # cumulative length change of all preceding edits
+    for e in ordered:
+        start, end = e.span
+        if start < cursor_old:
+            raise VerifyError("overlapping_spans", f"span {e.span} overlaps a previous edit")
+        run = old_raw[cursor_old:start]
+        got = new_raw[cursor_old + delta:start + delta]
+        if got != run:
+            raise VerifyError(
+                "outside_span_mutation",
+                f"bytes {cursor_old}..{start} outside the edited spans changed")
+        delta += len(render_value_bytes(e)) - (end - start)
+        cursor_old = end
+
+    tail = old_raw[cursor_old:]
+    tail_start = cursor_old + delta
+    if new_raw[tail_start:tail_start + len(tail)] != tail:
+        raise VerifyError(
+            "outside_span_mutation",
+            f"bytes after {cursor_old} outside the edited spans changed")
+
+    # Everything past the replayed body is the appended EOF region, and nothing else.
+    body = new_raw[:tail_start + len(tail)]
+    eof_region = new_raw[tail_start + len(tail):]
+    expected_eof = (b'' if (not body or body.endswith(b'\n')) else b'\n')
+    expected_eof += b'# roundhouse: ' + provenance.encode('utf-8') + b'\n'
+    if eof_region != expected_eof:
+        raise VerifyError("eof_region_changed",
+                          "appended EOF region is not exactly the provenance line")
+
+
 def verify_splice(old_unit: UnitFile, new_raw: bytes, edits: List[Edit], provenance: str) -> UnitFile:
     """Verify a splice is correct and return the new parsed unit."""
     # Parse the new file
     path = old_unit.path
     new_unit = parse_unit(path, new_raw)
 
+    # A spliced file whose ExecStart no longer parses must never pass verify: check (a)
+    # used to be guarded by `and new_unit.exec_start`, so the single worst outcome the
+    # splice can produce — a destroyed ExecStart — silently SKIPPED the whole check.
+    if new_unit.exec_start is None:
+        raise VerifyError("execstart_unparseable",
+                          "spliced file has no parseable ExecStart")
+
     # Check (a): Profile equality except edited fields and spans
-    if old_unit.exec_start and new_unit.exec_start:
+    if old_unit.exec_start:
         old_profile = extract_param_profile(old_unit.exec_start.engine_argv)
         new_profile = extract_param_profile(new_unit.exec_start.engine_argv)
 
@@ -3042,13 +3317,22 @@ def verify_splice(old_unit: UnitFile, new_raw: bytes, edits: List[Edit], provena
 
         old_norm = normalize_profile(old_profile)
         new_norm = normalize_profile(new_profile)
+        expected_norm = _expected_profile(old_norm, edits)
 
-        # Check edited fields are present, unedited fields are identical
         edited_fields = {e.field for e in edits}
-        for key in old_norm:
-            if key not in edited_fields:
-                if old_norm.get(key) != new_norm.get(key):
-                    raise VerifyError("profile_changed", f"unedited field {key} changed")
+        for key in expected_norm:
+            if expected_norm[key] != new_norm.get(key):
+                touched = (key in edited_fields
+                           or key == 'unknown_flags'
+                           or any(e.field.startswith(key + '.') for e in edits))
+                if touched:
+                    raise VerifyError(
+                        "profile_changed",
+                        f"edited field {key} did not take the expected value")
+                raise VerifyError("profile_changed", f"unedited field {key} changed")
+        for key in new_norm:
+            if key not in expected_norm:
+                raise VerifyError("profile_changed", f"unexpected new field {key}")
 
     # Check (b): Comments unchanged except for provenance
     old_comments = [c['text'] for c in old_unit.comments]
@@ -3057,8 +3341,10 @@ def verify_splice(old_unit: UnitFile, new_raw: bytes, edits: List[Edit], provena
     if new_comments != old_comments + [expected_prov]:
         raise VerifyError("comments_changed", "comments don't match expected")
 
-    # Check (c): Span invariants
+    # Check (c): Span invariants, plus the MVP2 addition — the splice touched nothing
+    # outside the replaced spans and the appended EOF region.
     assert_span_invariants(new_unit)
+    assert_outside_spans_unchanged(old_unit.raw, new_raw, edits, provenance)
 
     return new_unit
 
@@ -3104,13 +3390,39 @@ def compute_confirm(unit_name: str, old_raw: bytes, edits: List[Edit]) -> str:
     canonical_json = json.dumps(data, separators=(',', ':'), sort_keys=True)
     return hashlib.sha256(canonical_json.encode()).hexdigest()
 
-def _atomic_write(path: str, data: bytes) -> None:
-    """Atomically write data to path via tmp+fsync+replace."""
+def _read_file_bytes(path: str) -> bytes:
+    """Read a file's bytes. The disk side of the E5 staleness check (§4.2)."""
+    with open(path, 'rb') as f:
+        return f.read()
+
+
+def _atomic_write(path: str, data: bytes, mode: Optional[int] = None) -> None:
+    """Atomically write data to path via tmp+fsync+replace.
+
+    `mode` (used by `ensure_token`) creates the tmp file with those permissions at
+    open() time. Chmod-after-replace leaves a window in which a freshly generated bearer
+    token is on disk under the process umask — world-readable on a default umask — and
+    `os.replace` carries the TMP file's mode onto the target, so the mode has to be right
+    before a single byte is written.
+    """
     dir_path = os.path.dirname(path) or '.'
 
     # Write to tmp file in same directory
     tmp_path = path + '.roundhouse-tmp'
-    with open(tmp_path, 'wb') as f:
+    if mode is None:
+        opener = None
+    else:
+        def opener(p, flags):
+            # O_EXCL: never write through a tmp file we did not create (and thus never
+            # inherit a mode someone else chose). A leftover tmp from a crash is cleared
+            # once, deliberately, rather than bricking every future write.
+            try:
+                return os.open(p, os.O_WRONLY | os.O_CREAT | os.O_EXCL, mode)
+            except FileExistsError:
+                os.unlink(p)
+                return os.open(p, os.O_WRONLY | os.O_CREAT | os.O_EXCL, mode)
+
+    with open(tmp_path, 'wb', opener=opener) as f:
         f.write(data)
         f.flush()
         os.fsync(f.fileno())
@@ -3132,6 +3444,42 @@ def _atomic_write(path: str, data: bytes) -> None:
 # Rollout phases
 ROLLOUT_PHASES = ("preflight", "applying", "reloading", "starting", "watching",
                   "done", "failed", "rolling_back", "rolled_back", "rollback_failed")
+
+# Terminal phases: the slot is unconditionally free in these.
+ROLLOUT_TERMINAL_PHASES = ("done", "rolled_back", "rollback_failed")
+
+
+def _slot_free(record: Optional[Dict]) -> bool:
+    """§4.1: is the global rollout slot idle?
+
+    Free iff no record, or a terminal phase, or `failed` that has been settled — either
+    the bytes were restored, or no rollback was ever offered / the offer was dismissed.
+
+    Treating ONLY the three terminal phases as free wedged the slot forever on every
+    `failed` that carries no offer (preflight drift, stop/apply/commit errors, stale
+    confirm, engine_error) and on every dismissed offer. `record.get('rollback') or {}`
+    matters just as much: the key exists with value None from record creation, so
+    `.get('rollback', {})` returns None and `.get('offered')` on it raises
+    AttributeError — a 500 out of the route, not a 409.
+    """
+    if record is None:
+        return True
+    phase = record.get('phase')
+    if phase in ROLLOUT_TERMINAL_PHASES:
+        return True
+    if phase == 'failed':
+        if record.get('restored'):
+            return True
+        if not (record.get('rollback') or {}).get('offered'):
+            return True
+    return False
+
+
+def _rollback_offered(record: Optional[Dict]) -> bool:
+    """True iff this record currently carries a live rollback offer."""
+    if not record:
+        return False
+    return bool((record.get('rollback') or {}).get('offered'))
 
 
 def preflight_retired(unit: UnitFile) -> Dict:
@@ -3181,7 +3529,16 @@ def preflight_port(unit: UnitFile, edits: List[Edit], watcher: 'Watcher', self_p
     if not port_edit:
         return {"ok": True, "check": "port"}
 
-    new_port = int(port_edit.new_text)
+    # plan_edits refuses a non-integer port, but preflight is also called with edits built
+    # by hand (tests, engine re-runs): a bare int() here turned bad input into a 500.
+    try:
+        new_port = int(port_edit.new_text)
+    except (ValueError, TypeError):
+        return {
+            "ok": False,
+            "check": "port",
+            "detail": f"port value is not an integer: {port_edit.new_text!r}"
+        }
 
     # Check against all other units and self
     if new_port == self_port:
@@ -3298,15 +3655,35 @@ def preflight_memory(unit: UnitFile, edits: List[Edit], watcher: 'Watcher',
     if mem_available is None:
         mem_available = 0
 
-    # Freed memory from stopping this unit
+    # Freed memory from stopping this unit (E9).
+    #
+    # Only a unit that is actually RESIDENT frees anything. The snapshot's `mem` row is a
+    # measured peak or an estimate FORMULA and is reported for units that are OFF too, so
+    # reading it unconditionally credited the budget with memory nobody is holding.
+    # Order (active case only): cgroup memory.current -> last_peak -> measured row -> 0.
     freed_bytes = 0
+    freed_source = 'none (unit not active)'
     snapshot = watcher.snapshot()
+    unit_row = None
     for u in snapshot.get('units', []):
         if u['unit'] == unit.name:
-            mem = u.get('mem', {})
-            if mem and 'bytes' in mem:
-                freed_bytes = mem['bytes']
+            unit_row = u
             break
+
+    rung = (unit_row or {}).get('rung')
+    if rung in ('STARTING', 'LOADING', 'READY', 'BUSY'):
+        cgroup = (getattr(watcher, '_cgroup_cache', None) or {}).get(unit.name) or {}
+        current = cgroup.get('current')
+        last_peak = cgroup.get('last_peak')
+        row_mem = (unit_row or {}).get('mem') or {}
+        if current:
+            freed_bytes, freed_source = current, 'cgroup memory.current'
+        elif last_peak:
+            freed_bytes, freed_source = last_peak, 'cgroup memory.peak (last sample)'
+        elif row_mem.get('source') == 'measured' and row_mem.get('bytes'):
+            freed_bytes, freed_source = row_mem['bytes'], 'measured peak row'
+        else:
+            freed_bytes, freed_source = 0, 'active, but no cgroup sample yet'
 
     budget = mem_available + freed_bytes
     headroom = HEADROOM_BYTES
@@ -3317,11 +3694,14 @@ def preflight_memory(unit: UnitFile, edits: List[Edit], watcher: 'Watcher',
             "check": "memory",
             "detail": f"estimated {estimate_bytes/(1024**3):.1f} GiB ({estimate_source}), "
                      f"+ {headroom/(1024**3):.1f} GiB headroom exceeds budget {budget/(1024**3):.1f} GiB "
-                     f"(MemAvailable {mem_available/(1024**3):.1f} GiB + freed {freed_bytes/(1024**3):.1f} GiB)",
+                     f"(MemAvailable {mem_available/(1024**3):.1f} GiB + "
+                     f"{freed_bytes/(1024**3):.1f} GiB freed by stopping {unit.name} "
+                     f"[{freed_source}])",
             "estimate_bytes": estimate_bytes,
             "estimate_source": estimate_source,
             "mem_available_bytes": mem_available,
             "freed_bytes": freed_bytes,
+            "freed_source": freed_source,
             "headroom_bytes": headroom,
             "budget_bytes": budget
         }
@@ -3377,8 +3757,8 @@ class RolloutEngine:
     def start_rollout(self, unit_name: str, edits: List[Edit], confirm: str) -> Dict:
         """Start a new rollout. Returns the rollout record."""
         with self.watcher_lock:
-            if self.current and self.current.get('phase') not in ('done', 'rolled_back', 'rollback_failed'):
-                if self.current.get('phase') == 'failed' and self.current.get('rollback', {}).get('offered'):
+            if not _slot_free(self.current):
+                if self.current.get('phase') == 'failed' and _rollback_offered(self.current):
                     raise ActuationError("rollout_in_progress: rollback offered")
                 raise ActuationError("rollout_in_progress")
 
@@ -3433,13 +3813,33 @@ class RolloutEngine:
             self._update_phase(rollout_id, "preflight", "checking prerequisites")
             pf = preflight(unit, edits, self.watcher, self.self_port, self.unit_dir)
             if not pf["ok"]:
-                self._fail_rollout(rollout_id, "preflight", "preflight", detail="pre-flight checks failed")
+                self._fail_rollout(rollout_id, "preflight", "preflight",
+                                   detail="pre-flight checks failed", restored=True)
                 return
 
-            # Recompute confirm
-            computed_confirm = compute_confirm(unit_name, unit.raw, edits)
+            # E5 staleness against DISK, not against memory (§4.2 preflight row).
+            # The confirm hash was recomputed from the in-memory `unit.raw`, which the
+            # watcher only refreshes on its own terms — an external edit between preview
+            # and apply hashed identically and was silently clobbered by the splice.
+            try:
+                disk_raw = _read_file_bytes(unit.path)
+            except OSError as exc:
+                self._fail_rollout(rollout_id, "preflight", "preflight",
+                                   detail=f"cannot read {unit.path}: {exc}", restored=True)
+                return
+            if disk_raw != unit.raw:
+                self._fail_rollout(
+                    rollout_id, "preflight", "preview_stale",
+                    detail="unit file changed on disk since preview; nothing was touched — re-preview",
+                    restored=True)
+                return
+
+            # Recompute confirm from the verified disk bytes (identical to unit.raw here,
+            # by the check above — the point is that the hash is disk-derived).
+            computed_confirm = compute_confirm(unit_name, disk_raw, edits)
             if computed_confirm != confirm:
-                self._fail_rollout(rollout_id, "preflight", "preview_stale", detail="confirm mismatch (stale preview)")
+                self._fail_rollout(rollout_id, "preflight", "preview_stale",
+                                   detail="confirm mismatch (stale preview)", restored=True)
                 return
 
             # Capture was_active and the OLD deployment's ExecMainStartTimestamp — the
@@ -3468,7 +3868,8 @@ class RolloutEngine:
                     try:
                         self._stop_unit(unit_name)
                     except Exception as e:
-                        self._fail_rollout(rollout_id, "applying", "stop_error", detail=f"stop failed: {e}")
+                        self._fail_rollout(rollout_id, "applying", "stop_error",
+                                           detail=f"stop failed: {e}", restored=True)
                         if was_active:
                             try:
                                 self._start_unit(unit_name)
@@ -3476,10 +3877,10 @@ class RolloutEngine:
                                 pass
                         return
 
-                # Splice
+                # Splice — from the disk bytes verified in preflight (§4.2/E5)
                 self._update_phase(rollout_id, "applying", "splicing")
                 prov_line = provenance_line(edits, datetime.now(timezone.utc))
-                new_raw = splice(unit.raw, edits, prov_line)
+                new_raw = splice(disk_raw, edits, prov_line)
 
                 # Write
                 self._update_phase(rollout_id, "applying", "writing")
@@ -3492,7 +3893,7 @@ class RolloutEngine:
                 # Commit
                 self._update_phase(rollout_id, "applying", "committing")
                 try:
-                    run_git(["add", "--", unit_name], self.unit_dir)
+                    run_git(["add", "--", unit_name], self.unit_dir, units=self.units)
                     run_git(["commit", "-m", commit_message(unit_name, edits)], self.unit_dir)
                     result = run_git(["rev-parse", "HEAD"], self.unit_dir)
                     commit_sha = result.stdout.strip()
@@ -3507,7 +3908,8 @@ class RolloutEngine:
                             self._start_unit(unit_name)
                         except Exception:
                             pass
-                    self._fail_rollout(rollout_id, "applying", "commit_error", detail=f"commit failed: {e}")
+                    self._fail_rollout(rollout_id, "applying", "commit_error",
+                                       detail=f"commit failed: {e}", restored=True)
                     return
 
                 # Update watcher with new unit (S4)
@@ -3516,17 +3918,20 @@ class RolloutEngine:
                     self.watcher.units[unit_name] = new_unit
 
             except Exception as e:
-                # Restore
+                # Restore. `restored` reports what actually happened — claiming a restore
+                # that raised would free the slot over a half-written file.
+                restored_ok = True
                 try:
                     _atomic_write(unit.path, unit.raw)
                 except Exception:
-                    pass
+                    restored_ok = False
                 if was_active:
                     try:
                         self._start_unit(unit_name)
                     except Exception:
                         pass
-                self._fail_rollout(rollout_id, "applying", "apply_error", detail=str(e))
+                self._fail_rollout(rollout_id, "applying", "apply_error", detail=str(e),
+                                   restored=restored_ok)
                 return
 
             # Reloading phase
@@ -3580,13 +3985,17 @@ class RolloutEngine:
         })
 
     def _fail_rollout(self, rollout_id: str, phase: str, reason: str,
-                      offer_rollback: bool = False, detail: str = None):
+                      offer_rollback: bool = False, detail: str = None,
+                      restored: bool = False):
         """Mark rollout as failed.
 
         `reason` is the machine code of §4.2 (`unit_failed`, `no_ready_marker`,
         `watch_timeout`, `daemon_reload`, `start_error`, `preflight`, ...); `detail` is the
         human text. The record's own `detail` is updated too, so a page refresh rebuilding
         the stepper from the snapshot does not show the last in-flight sub-step.
+
+        `restored=True` on every path that put the old bytes back (or never touched them):
+        §4.1 reads it to free the slot, and the record has to say so out loud.
         """
         text = detail or reason
         with self.watcher_lock:
@@ -3595,6 +4004,8 @@ class RolloutEngine:
                 rollout['phase'] = 'failed'
                 rollout['detail'] = text
                 rollout['failure'] = {'reason': reason, 'detail': text}
+                if restored:
+                    rollout['restored'] = True
                 if offer_rollback and rollout['commit']:
                     rollout['rollback'] = {'offered': True}
                 rollout['updated_at'] = time.time()
@@ -3715,16 +4126,25 @@ class RolloutEngine:
         return True
 
     def rollback(self, rollout_id: str):
-        """Start rollback of a failed rollout."""
-        rollout = self.rollouts.get(rollout_id)
-        if not rollout or not rollout.get('commit'):
-            raise ActuationError("not_rollbackable")
+        """Start rollback of a failed rollout.
 
-        if rollout.get('phase') != 'failed' or not rollout.get('rollback', {}).get('offered'):
-            raise ActuationError("not_rollbackable")
+        Eligibility check AND the `rolling_back` transition happen under `watcher_lock`:
+        check-and-set outside it let a double-click through twice, and two `_run_rollback`
+        workers on one unit interleave `git revert` with a byte-restore commit.
+        """
+        with self.watcher_lock:
+            rollout = self.rollouts.get(rollout_id)
+            if not rollout or not rollout.get('commit'):
+                raise ActuationError("not_rollbackable")
 
-        rollout['phase'] = 'rolling_back'
-        rollout['updated_at'] = time.time()
+            if rollout.get('phase') != 'failed' or not _rollback_offered(rollout):
+                raise ActuationError("not_rollbackable")
+
+            # Claim the offer inside the lock: the loser of a race (second click, or a
+            # dismiss arriving concurrently) now sees phase != 'failed' / no offer.
+            rollout['phase'] = 'rolling_back'
+            rollout['rollback'] = {'offered': False, 'phase': 'rolling_back'}
+            rollout['updated_at'] = time.time()
 
         # Spawn rollback worker
         threading.Thread(
@@ -3774,7 +4194,7 @@ class RolloutEngine:
                     pass
                 _atomic_write(rollout.get('unit_path') or self.units[unit_name].path, rollout['old_raw'])
                 try:
-                    run_git(["add", "--", unit_name], self.unit_dir)
+                    run_git(["add", "--", unit_name], self.unit_dir, units=self.units)
                     run_git(["commit", "-m", f"roundhouse: rollback {unit_name} (byte restore; revert failed)"], self.unit_dir)
                 except Exception:
                     pass
@@ -3828,12 +4248,21 @@ class RolloutEngine:
                 rollout['updated_at'] = time.time()
 
     def dismiss(self, rollout_id: str):
-        """Dismiss a failed rollout."""
-        rollout = self.rollouts.get(rollout_id)
-        if rollout and rollout.get('rollback', {}).get('offered'):
-            with self.watcher_lock:
-                rollout['rollback'] = {'offered': False}
-                rollout['updated_at'] = time.time()
+        """Dismiss a failed rollout's rollback offer, freeing the slot (§6).
+
+        Same lock as `rollback()` and the same first-one-wins rule: whichever of
+        dismiss/rollback takes the lock first settles the offer; the loser raises
+        `not_dismissable` / `not_rollbackable` and the route answers 409.
+        """
+        with self.watcher_lock:
+            rollout = self.rollouts.get(rollout_id)
+            if not rollout or rollout.get('phase') != 'failed' or not _rollback_offered(rollout):
+                raise ActuationError("not_dismissable")
+
+            # The record is SET (not just read): `_slot_free` reads `rollback.offered`, so
+            # a dismissed offer has to leave a record that says so.
+            rollout['rollback'] = {'offered': False, 'dismissed': True}
+            rollout['updated_at'] = time.time()
 
 
 # ===== SECTION D: MAIN / CLI =====

@@ -1115,5 +1115,751 @@ class TestArmingSequence(unittest.TestCase):
         self.assertNotIn('plasma-foo.service', out)
 
 
+FIXTURES = Path(__file__).resolve().parents[2] / 'docs' / 'fixtures'
+
+
+def load_fixture(name: str) -> roundhouse.UnitFile:
+    """Parse a fixture straight from docs/fixtures (read-only)."""
+    path = FIXTURES / name
+    return roundhouse.parse_unit(str(path), path.read_bytes())
+
+
+def copy_fixture(name: str, dest_dir: str) -> roundhouse.UnitFile:
+    """Copy a fixture into a scratch dir and parse the COPY (writable path)."""
+    src = FIXTURES / name
+    dest = os.path.join(dest_dir, name)
+    shutil.copyfile(src, dest)
+    with open(dest, 'rb') as f:
+        return roundhouse.parse_unit(dest, f.read())
+
+
+class _EngineHarness(unittest.TestCase):
+    """Engine driven with stubbed gateways: no systemd, no git, real files."""
+
+    def setUp(self):
+        self.temp_dir = tempfile.mkdtemp()
+        self.actuate_calls = []
+        self.git_calls = []
+
+    def tearDown(self):
+        shutil.rmtree(self.temp_dir, ignore_errors=True)
+
+    def _stub_run_actuate(self):
+        def stub(argv, units, timeout=90):
+            self.actuate_calls.append(list(argv))
+            return ''
+        return stub
+
+    def _stub_run_git(self, head_sha='a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0'):
+        def stub(args, unit_dir, timeout=30, bootstrap=False, units=None):
+            self.git_calls.append(list(args))
+            out = ''
+            if args and args[0] == 'rev-parse':
+                out = head_sha + '\n'
+            return subprocess.CompletedProcess(args, 0, out, '')
+        return stub
+
+    def _engine(self, unit, rung='OFF'):
+        watcher = MagicMock()
+        watcher.units = {unit.name: unit}
+        watcher.mem_store = None
+        watcher._cgroup_cache = {}
+        watcher.snapshot.return_value = {'units': [
+            {'unit': unit.name, 'rung': rung, 'retired': False, 'enabled': True,
+             'since': 1.0, 'badges': [], 'port': 8086, 'mem': {}},
+        ]}
+        units = {unit.name: unit}
+        return roundhouse.RolloutEngine(watcher, units, self.temp_dir, 8090,
+                                        roundhouse.EventBus(), threading.Lock())
+
+    def _drive(self, engine, unit, changes, confirm=None, timeout=15.0):
+        """Run one rollout to a terminal phase with the gateways stubbed out."""
+        edits = roundhouse.plan_edits(unit, changes)
+        if confirm is None:
+            confirm = roundhouse.compute_confirm(unit.name, unit.raw, edits)
+        with patch.object(roundhouse, 'run_actuate', self._stub_run_actuate()), \
+             patch.object(roundhouse, 'run_git', self._stub_run_git()):
+            rec = engine.start_rollout(unit.name, edits, confirm)
+            deadline = time.time() + timeout
+            while time.time() < deadline:
+                if rec['phase'] in ('done', 'failed', 'rolled_back', 'rollback_failed'):
+                    break
+                time.sleep(0.02)
+        self.assertIn(rec['phase'], ('done', 'failed', 'rolled_back', 'rollback_failed'),
+                      f"rollout never reached a terminal phase: {rec['phase']}")
+        return rec
+
+
+class TestSlotRelease(_EngineHarness):
+    """B1: the global rollout slot must be released by every settled failure (§4.1)."""
+
+    def _record(self, phase, rollback=None, restored=False, commit='abc1234'):
+        return {'rollout_id': 'ro-0-0', 'unit': 'u.service', 'phase': phase,
+                'detail': '', 'edits': [], 'was_active': True, 'commit': commit,
+                'restored': restored, 'failure': {'reason': 'x', 'detail': 'x'},
+                'rollback': rollback, 'started_at': 0.0, 'updated_at': 0.0,
+                'old_raw': b''}
+
+    def _accepting_engine(self):
+        """An engine whose worker is a no-op: this tests the SLOT GATE, nothing else."""
+        unit = copy_fixture('llama-server-gemma4.service', self.temp_dir)
+        engine = self._engine(unit)
+        return engine, unit
+
+    def _try_start(self, engine, unit):
+        edits = roundhouse.plan_edits(unit, {'ctx': '8192'})
+        confirm = roundhouse.compute_confirm(unit.name, unit.raw, edits)
+        with patch.object(roundhouse.RolloutEngine, '_run_rollout', lambda *a, **k: None):
+            return engine.start_rollout(unit.name, edits, confirm)
+
+    # --- the pure predicate ------------------------------------------------------
+
+    def test_slot_free_matrix(self):
+        cases = [
+            (None, True, 'no rollout at all'),
+            (self._record('preflight'), False, 'in flight'),
+            (self._record('watching'), False, 'in flight'),
+            (self._record('rolling_back'), False, 'rollback in flight'),
+            (self._record('done'), True, 'terminal'),
+            (self._record('rolled_back'), True, 'terminal'),
+            (self._record('rollback_failed'), True, 'terminal'),
+            (self._record('failed', rollback=None), True, 'failed, no offer ever made'),
+            (self._record('failed', rollback={'offered': True}), False, 'offer pending'),
+            (self._record('failed', rollback={'offered': False}), True, 'offer dismissed'),
+            (self._record('failed', rollback={'offered': True}, restored=True), True,
+             'bytes restored'),
+        ]
+        for record, expected, why in cases:
+            self.assertEqual(roundhouse._slot_free(record), expected, why)
+
+    def test_rollback_none_does_not_raise_attributeerror(self):
+        """The exact B1 crash: `rollback` exists with value None from record creation.
+
+        `record.get('rollback', {})` returns None (the default only applies to a MISSING
+        key), so `.get('offered')` on it raised AttributeError -> 500 out of the route.
+        """
+        record = self._record('failed', rollback=None)
+        with self.assertRaises(AttributeError):
+            record.get('rollback', {}).get('offered')   # the shape that used to ship
+        self.assertFalse(roundhouse._rollback_offered(record))
+        self.assertTrue(roundhouse._slot_free(record))
+
+    # --- the gate as the engine enforces it --------------------------------------
+
+    def test_failed_without_offer_frees_the_slot(self):
+        engine, unit = self._accepting_engine()
+        engine.current = self._record('failed', rollback=None)
+        rec = self._try_start(engine, unit)
+        self.assertEqual(rec['phase'], 'preflight')
+        self.assertIs(engine.current, rec)
+
+    def test_failed_with_offer_holds_the_slot(self):
+        engine, unit = self._accepting_engine()
+        engine.current = self._record('failed', rollback={'offered': True})
+        with self.assertRaises(roundhouse.ActuationError) as ctx:
+            self._try_start(engine, unit)
+        self.assertIn('rollout_in_progress', str(ctx.exception))
+
+    def test_dismiss_frees_the_slot(self):
+        engine, unit = self._accepting_engine()
+        held = self._record('failed', rollback={'offered': True})
+        engine.current = held
+        engine.rollouts[held['rollout_id']] = held
+        with self.assertRaises(roundhouse.ActuationError):
+            self._try_start(engine, unit)
+
+        engine.dismiss(held['rollout_id'])
+        self.assertFalse(held['rollback']['offered'])
+        rec = self._try_start(engine, unit)
+        self.assertEqual(rec['phase'], 'preflight')
+
+    def test_rolled_back_frees_the_slot(self):
+        engine, unit = self._accepting_engine()
+        engine.current = self._record('rolled_back',
+                                      rollback={'offered': False, 'phase': 'rolled_back'})
+        rec = self._try_start(engine, unit)
+        self.assertEqual(rec['phase'], 'preflight')
+
+    def test_restored_failure_frees_the_slot(self):
+        """A verify/apply failure that restored the bytes is settled — slot free."""
+        engine, unit = self._accepting_engine()
+        engine.current = self._record('failed', rollback={'offered': True}, restored=True)
+        rec = self._try_start(engine, unit)
+        self.assertEqual(rec['phase'], 'preflight')
+
+    def test_preflight_failure_marks_restored_and_frees_the_slot(self):
+        """End to end: a preflight failure must not wedge the next rollout."""
+        unit = copy_fixture('llama-server-gemma4.service', self.temp_dir)
+        engine = self._engine(unit)
+        edits = roundhouse.plan_edits(unit, {'ctx': '8192'})
+        confirm = roundhouse.compute_confirm(unit.name, unit.raw, edits)
+
+        def untracked_git(args, unit_dir, timeout=30, bootstrap=False, units=None):
+            self.git_calls.append(list(args))
+            rc = 1 if args[0] == 'ls-files' else 0
+            return subprocess.CompletedProcess(args, rc, '', 'not tracked')
+
+        with patch.object(roundhouse, 'run_actuate', self._stub_run_actuate()), \
+             patch.object(roundhouse, 'run_git', untracked_git):
+            rec = engine.start_rollout(unit.name, edits, confirm)
+            deadline = time.time() + 10
+            while time.time() < deadline and rec['phase'] != 'failed':
+                time.sleep(0.02)
+
+        self.assertEqual(rec['phase'], 'failed')
+        self.assertIsNone(rec['rollback'])
+        self.assertTrue(rec['restored'], "a preflight failure touched nothing")
+        self.assertTrue(roundhouse._slot_free(engine.current))
+        follow_up = self._try_start(engine, unit)
+        self.assertEqual(follow_up['phase'], 'preflight')
+
+    # --- S5: rollback/dismiss race ----------------------------------------------
+
+    def test_double_rollback_only_starts_one_worker(self):
+        """S5: check-and-set under watcher_lock — the second click loses."""
+        unit = copy_fixture('llama-server-gemma4.service', self.temp_dir)
+        engine = self._engine(unit)
+        rec = self._record('failed', rollback={'offered': True})
+        engine.current = rec
+        engine.rollouts[rec['rollout_id']] = rec
+
+        started = []
+        with patch.object(roundhouse.RolloutEngine, '_run_rollback',
+                          lambda self, rid: started.append(rid)):
+            engine.rollback(rec['rollout_id'])
+            with self.assertRaises(roundhouse.ActuationError) as ctx:
+                engine.rollback(rec['rollout_id'])
+        self.assertIn('not_rollbackable', str(ctx.exception))
+        time.sleep(0.2)
+        self.assertEqual(len(started), 1, "two rollback workers were spawned")
+
+    def test_dismiss_racing_rollback_loses(self):
+        unit = copy_fixture('llama-server-gemma4.service', self.temp_dir)
+        engine = self._engine(unit)
+        rec = self._record('failed', rollback={'offered': True})
+        engine.current = rec
+        engine.rollouts[rec['rollout_id']] = rec
+
+        with patch.object(roundhouse.RolloutEngine, '_run_rollback', lambda self, rid: None):
+            engine.rollback(rec['rollout_id'])
+        with self.assertRaises(roundhouse.ActuationError) as ctx:
+            engine.dismiss(rec['rollout_id'])
+        self.assertIn('not_dismissable', str(ctx.exception))
+
+    def test_dismiss_without_an_offer_raises(self):
+        unit = copy_fixture('llama-server-gemma4.service', self.temp_dir)
+        engine = self._engine(unit)
+        rec = self._record('failed', rollback=None)
+        engine.rollouts[rec['rollout_id']] = rec
+        with self.assertRaises(roundhouse.ActuationError):
+            engine.dismiss(rec['rollout_id'])
+
+
+class TestUnknownFlagApply(_EngineHarness):
+    """B2: an unknown-flag edit must survive verify — it used to fail AFTER the stop."""
+
+    def test_verify_accepts_an_unknown_flag_edit(self):
+        unit = load_fixture('llama-server-gemma4.service')
+        edits = roundhouse.plan_edits(unit, {'unknown:-np': '2'})
+        self.assertEqual(edits[0].field, 'unknown:-np')
+
+        prov = roundhouse.provenance_line(edits, datetime(2026, 8, 13, 14, 2, 11,
+                                                          tzinfo=timezone.utc))
+        new_raw = roundhouse.splice(unit.raw, edits, prov)
+
+        # The old check compared exactly these two lists as an "unedited field": edited
+        # unknown flags are named `unknown:<flag>`, so the profile key `unknown_flags`
+        # never appeared in `edited_fields` and every unknown-flag edit raised.
+        old_pairs = [(f['flag'], f['value']) for f in
+                     roundhouse.extract_param_profile(unit.exec_start.engine_argv)['unknown_flags']]
+        new_unit_probe = roundhouse.parse_unit(unit.path, new_raw)
+        new_pairs = [(f['flag'], f['value']) for f in
+                     roundhouse.extract_param_profile(new_unit_probe.exec_start.engine_argv)['unknown_flags']]
+        self.assertNotEqual(old_pairs, new_pairs, "fixture does not exercise the bug")
+
+        new_unit = roundhouse.verify_splice(unit, new_raw, edits, prov)
+        profile = roundhouse.extract_param_profile(new_unit.exec_start.engine_argv)
+        self.assertIn(('-np', '2'), [(f['flag'], f['value']) for f in profile['unknown_flags']])
+
+    def test_verify_rejects_an_unknown_flag_that_moved(self):
+        """The relaxed comparison must stay strict about everything it did not edit."""
+        unit = load_fixture('llama-embed.service')
+        edits = roundhouse.plan_edits(unit, {'unknown:-b': '4096'})
+        prov = roundhouse.provenance_line(edits, datetime(2026, 8, 13, tzinfo=timezone.utc))
+        new_raw = roundhouse.splice(unit.raw, edits, prov)
+        roundhouse.verify_splice(unit, new_raw, edits, prov)      # baseline passes
+
+        # A second, UNEDITED unknown flag changing value must still be caught.
+        tampered = new_raw.replace(b'-ub 8192', b'-ub 4096')
+        self.assertNotEqual(tampered, new_raw)
+        with self.assertRaises(roundhouse.VerifyError):
+            roundhouse.verify_splice(unit, tampered, edits, prov)
+
+    def test_sampling_subfield_edit_verifies(self):
+        """Same trap, other shape: `sampling.temp` lives inside the `sampling` dict."""
+        unit = load_fixture('qwen3.6-coding.service')
+        edits = roundhouse.plan_edits(unit, {'sampling.temp': '0.7'})
+        prov = roundhouse.provenance_line(edits, datetime(2026, 8, 13, tzinfo=timezone.utc))
+        new_raw = roundhouse.splice(unit.raw, edits, prov)
+        new_unit = roundhouse.verify_splice(unit, new_raw, edits, prov)
+        profile = roundhouse.extract_param_profile(new_unit.exec_start.engine_argv)
+        self.assertEqual(profile['sampling']['temp'], 0.7)
+
+    def test_unknown_flag_rollout_applies_end_to_end(self):
+        """Full apply path with stubbed gateways: splice -> verify -> commit -> done."""
+        unit = copy_fixture('llama-server-gemma4.service', self.temp_dir)
+        engine = self._engine(unit, rung='OFF')          # not running: no stop/start
+        rec = self._drive(engine, unit, {'unknown:-np': '2'})
+
+        self.assertEqual(rec['phase'], 'done', rec['detail'])
+        self.assertIsNone(rec['failure'])
+        with open(unit.path, 'rb') as f:
+            written = f.read()
+        exec_line = [l for l in written.split(b'\n') if b'-np ' in l][0]
+        self.assertIn(b'-np 2', exec_line)
+        self.assertNotIn(b'-np 1', exec_line)
+        self.assertIn(b'# roundhouse: ', written.rsplit(b'\n', 2)[-2])
+
+        verbs = [c[0] for c in self.git_calls]
+        self.assertIn('add', verbs)
+        self.assertIn('commit', verbs)
+        self.assertEqual(self.actuate_calls,
+                         [['systemctl', '--user', 'daemon-reload']],
+                         "a stopped unit must not be stopped or started")
+
+
+class TestPlanEditsValidation(unittest.TestCase):
+    """S1: §3.2.2 type/range validation — none of this used to be checked."""
+
+    def setUp(self):
+        self.unit = load_fixture('qwen3.6-coding.service')
+
+    def _expect_invalid(self, changes, label):
+        with self.assertRaises(roundhouse.EditError, msg=label) as ctx:
+            roundhouse.plan_edits(self.unit, changes)
+        self.assertEqual(ctx.exception.reason, 'invalid_value', label)
+
+    def test_invalid_value_table(self):
+        cases = [
+            ({'ctx': 'abc'}, 'ctx: not a number'),
+            ({'ctx': '-1'}, 'ctx: negative'),
+            ({'ctx': '0'}, 'ctx: zero'),
+            ({'ctx': ''}, 'ctx: empty string'),
+            ({'ctx': '--port=9999'}, 'ctx: a flag, not a value'),
+            ({'ctx': '65536.5'}, 'ctx: float for an int field'),
+            ({'port': '0'}, 'port: below range'),
+            ({'port': '65536'}, 'port: above range'),
+            ({'port': '99999999'}, 'port: far above range'),
+            ({'port': 'eighty-eighty'}, 'port: not a number'),
+            ({'threads': 'x'}, 'threads: not a number'),
+            ({'sampling.temp': 'hot'}, 'temp: not a number'),
+            ({'sampling.top_k': '1.5'}, 'top_k: float for an int field'),
+            ({'chat_template_kwargs': '{not json'}, 'chat_template_kwargs: broken JSON'),
+            ({'alias': ''}, 'str field: empty unquoted value cannot be spliced'),
+            ({'alias': 'a b'}, 'str field: whitespace would re-tokenize'),
+        ]
+        for changes, label in cases:
+            self._expect_invalid(changes, label)
+
+    def test_valid_values_still_plan(self):
+        cases = [
+            ({'ctx': '32768'}, 'ctx'),
+            ({'port': '8087'}, 'port'),
+            ({'port': '1'}, 'port lower bound'),
+            ({'port': '65535'}, 'port upper bound'),
+            ({'sampling.temp': '0.7'}, 'temp'),
+            ({'chat_template_kwargs': '{"enable_thinking": true}'}, 'json'),
+            ({'alias': 'qwen3.6-coding-b'}, 'alias'),
+        ]
+        for changes, label in cases:
+            edits = roundhouse.plan_edits(self.unit, changes)
+            self.assertEqual(len(edits), 1, label)
+
+    def test_unquoted_value_regex_is_non_empty(self):
+        """§3.2.3: `+`, not `*` — an empty value would delete the token entirely."""
+        with self.assertRaises(roundhouse.EditError) as ctx:
+            roundhouse.plan_edits(self.unit, {'cache_type_k': ''})
+        self.assertEqual(ctx.exception.reason, 'invalid_value')
+
+    def test_unquoted_value_rejects_a_trailing_newline(self):
+        """`$` matches before a trailing newline; a value ending in \\n splits the token."""
+        with self.assertRaises(roundhouse.EditError):
+            roundhouse.plan_edits(self.unit, {'cache_type_k': 'q4_0\n'})
+
+    def test_preflight_port_survives_a_non_numeric_port(self):
+        """S1 tail: preflight must fail cleanly, never 500, on a hand-built bad edit."""
+        edits = [roundhouse.Edit(field='port', flag='--port', old_text='8085',
+                                 new_text='abc', span=(0, 4), quote='')]
+        watcher = MagicMock()
+        watcher.snapshot.return_value = {'units': []}
+        result = roundhouse.preflight_port(self.unit, edits, watcher, 8090)
+        self.assertFalse(result['ok'])
+        self.assertEqual(result['check'], 'port')
+
+
+class TestVerifyStrength(unittest.TestCase):
+    """S2(ii)/(iii): the checks verify_splice used to skip."""
+
+    def setUp(self):
+        self.unit = load_fixture('llama-server-gemma4.service')
+        self.edits = roundhouse.plan_edits(self.unit, {'ctx': '8192'})
+        self.prov = roundhouse.provenance_line(self.edits,
+                                               datetime(2026, 8, 13, tzinfo=timezone.utc))
+        self.new_raw = roundhouse.splice(self.unit.raw, self.edits, self.prov)
+
+    def test_baseline_verifies(self):
+        self.assertIsNotNone(roundhouse.verify_splice(
+            self.unit, self.new_raw, self.edits, self.prov))
+
+    def test_unparseable_execstart_is_a_verify_error(self):
+        """S2(ii): check (a) was guarded by `and new_unit.exec_start` — a destroyed
+        ExecStart, the worst outcome a splice can have, SKIPPED the whole check."""
+        broken = self.new_raw.replace(b'ExecStart=', b'#ExecStart=')
+        parsed = roundhouse.parse_unit(self.unit.path, broken)
+        self.assertIsNone(parsed.exec_start, "fixture does not exercise the case")
+        with self.assertRaises(roundhouse.VerifyError) as ctx:
+            roundhouse.verify_splice(self.unit, broken, self.edits, self.prov)
+        self.assertEqual(ctx.exception.reason, 'execstart_unparseable')
+
+    def test_byte_mutation_outside_the_spans_is_a_verify_error(self):
+        """S2(iii): the §3.5(c) replay check, as a runtime assertion."""
+        i = self.new_raw.find(b'Description=')
+        self.assertGreater(i, -1)
+        mutated = self.new_raw[:i + 12] + b'X' + self.new_raw[i + 13:]
+        self.assertEqual(len(mutated), len(self.new_raw))
+        with self.assertRaises(roundhouse.VerifyError) as ctx:
+            roundhouse.verify_splice(self.unit, mutated, self.edits, self.prov)
+        self.assertEqual(ctx.exception.reason, 'outside_span_mutation')
+
+    def test_mutation_no_other_check_can_see_is_caught(self):
+        """The binary path is inside ExecStart but outside every profile span, and
+        `raw_argv` is excluded from check (a) — only the replay catches this."""
+        j = self.new_raw.find(b'llama-server ')
+        self.assertGreater(j, -1)
+        mutated = self.new_raw[:j] + b'llama-serveX' + self.new_raw[j + 12:]
+        with self.assertRaises(roundhouse.VerifyError) as ctx:
+            roundhouse.verify_splice(self.unit, mutated, self.edits, self.prov)
+        self.assertEqual(ctx.exception.reason, 'outside_span_mutation')
+
+    def test_extra_appended_line_is_a_verify_error(self):
+        """Only the provenance line may follow the body."""
+        with self.assertRaises(roundhouse.VerifyError):
+            roundhouse.verify_splice(self.unit, self.new_raw + b'Restart=always\n',
+                                     self.edits, self.prov)
+
+    def test_replay_check_is_independent_of_span_invariants(self):
+        """assert_span_invariants passes on the mutated file; the replay must not."""
+        i = self.new_raw.find(b'Description=')
+        mutated = self.new_raw[:i + 12] + b'X' + self.new_raw[i + 13:]
+        roundhouse.assert_span_invariants(roundhouse.parse_unit(self.unit.path, mutated))
+        with self.assertRaises(roundhouse.VerifyError):
+            roundhouse.assert_outside_spans_unchanged(
+                self.unit.raw, mutated, self.edits, self.prov)
+
+
+class TestApplyStaleness(_EngineHarness):
+    """S3/E5: an external edit between preview and apply must not be clobbered."""
+
+    def test_disk_change_fails_the_rollout_and_touches_nothing(self):
+        unit = copy_fixture('llama-server-gemma4.service', self.temp_dir)
+        engine = self._engine(unit, rung='OFF')
+        # `threads`, not `ctx`: a memory-relevant field would drag the host's real
+        # /proc/meminfo into a test about staleness.
+        edits = roundhouse.plan_edits(unit, {'threads': '4'})
+        confirm = roundhouse.compute_confirm(unit.name, unit.raw, edits)
+
+        # Somebody edits the file by hand after the preview was taken.
+        external = unit.raw.replace(b'RestartSec=', b'RestartSec=') + b'# hand edit\n'
+        with open(unit.path, 'wb') as f:
+            f.write(external)
+
+        with patch.object(roundhouse, 'run_actuate', self._stub_run_actuate()), \
+             patch.object(roundhouse, 'run_git', self._stub_run_git()):
+            rec = engine.start_rollout(unit.name, edits, confirm)
+            deadline = time.time() + 10
+            while time.time() < deadline and rec['phase'] not in ('done', 'failed'):
+                time.sleep(0.02)
+
+        self.assertEqual(rec['phase'], 'failed')
+        self.assertEqual(rec['failure']['reason'], 'preview_stale')
+        with open(unit.path, 'rb') as f:
+            self.assertEqual(f.read(), external, "the hand edit was clobbered")
+        self.assertEqual(self.actuate_calls, [], "nothing may be actuated")
+        self.assertNotIn('commit', [c[0] for c in self.git_calls])
+        self.assertTrue(roundhouse._slot_free(engine.current))
+
+    def test_unchanged_disk_applies_normally(self):
+        """The staleness gate must not reject the ordinary case."""
+        unit = copy_fixture('llama-server-gemma4.service', self.temp_dir)
+        engine = self._engine(unit, rung='OFF')
+        rec = self._drive(engine, unit, {'threads': '4'})
+        self.assertEqual(rec['phase'], 'done', rec['detail'])
+        with open(unit.path, 'rb') as f:
+            self.assertIn(b'-t 4', f.read())
+
+
+class TestStalenessRoute(unittest.TestCase):
+    """S3/B1 at the route layer: 409, never a 500."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.temp_dir = tempfile.mkdtemp()
+        cls.watcher = MagicMock(spec=roundhouse.Watcher)
+        cls.watcher.snapshot.return_value = {'host': 't', 'kernel': '6.1', 'now': 0.0,
+                                             'mem': {}, 'units': [], 'sources': {}}
+        cls.watcher.units = {}
+        cls.event_bus = roundhouse.EventBus()
+        sock = socket.socket()
+        sock.bind(('127.0.0.1', 0))
+        cls.port = sock.getsockname()[1]
+        sock.close()
+        roundhouse.ACTUATE_ARMED = False
+        cls.server = roundhouse.ThreadingHTTPServer(
+            ('127.0.0.1', cls.port), roundhouse.RoundhouseRequestHandler,
+            cls.watcher, cls.event_bus, cls.port)
+        cls.thread = threading.Thread(target=cls.server.serve_forever, daemon=True)
+        cls.thread.start()
+        time.sleep(0.1)
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.server.shutdown()
+        cls.server.server_close()
+        shutil.rmtree(cls.temp_dir, ignore_errors=True)
+
+    def post(self, path, data):
+        conn = http.client.HTTPConnection('127.0.0.1', self.port, timeout=5)
+        try:
+            conn.request('POST', path, json.dumps(data).encode('utf-8'),
+                         {'Authorization': 'Bearer test-token',
+                          'Content-Type': 'application/json'})
+            resp = conn.getresponse()
+            return resp.status, resp.read()
+        finally:
+            conn.close()
+
+    def test_rollout_with_changed_disk_bytes_is_409_preview_stale(self):
+        unit = copy_fixture('llama-server-gemma4.service', self.temp_dir)
+        edits = roundhouse.plan_edits(unit, {'ctx': '8192'})
+        confirm = roundhouse.compute_confirm(unit.name, unit.raw, edits)
+        with open(unit.path, 'ab') as f:
+            f.write(b'# hand edit\n')
+
+        self.watcher.units = {unit.name: unit}
+        roundhouse.ACTUATE_ARMED = True
+        roundhouse.TOKEN = 'test-token'
+        self.server.rollout_engine = MagicMock()
+        try:
+            status, body = self.post(f'/api/units/{unit.name}/rollout',
+                                     {'edits': {'ctx': '8192'}, 'confirm': confirm})
+        finally:
+            roundhouse.ACTUATE_ARMED = False
+            roundhouse.TOKEN = None
+            self.watcher.units = {}
+            self.server.rollout_engine = None
+        self.assertEqual(status, 409)
+        self.assertEqual(json.loads(body)['error'], 'preview_stale')
+        self.server.rollout_engine = None
+
+    def test_preview_refreshes_from_disk_so_the_stale_apply_can_recover(self):
+        """§7.5: the UI re-previews once after a 409 — that only works if the preview
+        picks up the new bytes. Units are parsed once at startup, so without this the
+        409 would repeat forever and the unit would be un-editable until a restart."""
+        unit = copy_fixture('llama-server-gemma4.service', self.temp_dir)
+        with open(unit.path, 'wb') as f:
+            f.write(unit.raw.replace(b'-c 4096', b'-c 2048'))
+
+        self.watcher.units = {unit.name: unit}
+        roundhouse.ACTUATE_ARMED = True
+        roundhouse.TOKEN = 'test-token'
+        self.server.rollout_engine = None
+
+        def stub_git(args, unit_dir, timeout=30, bootstrap=False, units=None):
+            return subprocess.CompletedProcess(args, 0, '', '')
+
+        try:
+            with patch.object(roundhouse, 'run_git', stub_git), \
+                 patch.object(roundhouse, 'preflight_memory',
+                              lambda *a, **k: {'ok': True, 'check': 'memory'}):
+                status, body = self.post(f'/api/units/{unit.name}/edit',
+                                         {'edits': {'ctx': '8192'}})
+            payload = json.loads(body)
+            self.assertEqual(status, 200, payload)
+            # The echoed old value comes from DISK (2048), not from the startup parse.
+            self.assertEqual(payload['edits'][0]['old'], '2048')
+            refreshed = self.watcher.units[unit.name]
+            self.assertIn(b'-c 2048', refreshed.raw)
+
+            # ...and the confirm from that preview now applies without a 409.
+            edits = roundhouse.plan_edits(refreshed, {'ctx': '8192'})
+            self.assertEqual(payload['confirm'],
+                             roundhouse.compute_confirm(unit.name, refreshed.raw, edits))
+        finally:
+            roundhouse.ACTUATE_ARMED = False
+            roundhouse.TOKEN = None
+            self.watcher.units = {}
+
+    def test_rollback_route_with_null_rollback_is_409_not_500(self):
+        """B1 at the route: `.get('rollback', {}).get('offered')` raised AttributeError."""
+        engine = MagicMock()
+        engine.rollouts = {'ro-1-1': {
+            'rollout_id': 'ro-1-1', 'unit': 'x.service', 'phase': 'failed',
+            'detail': 'boom', 'edits': [], 'was_active': True, 'commit': None,
+            'restored': False, 'failure': {'reason': 'stop_error', 'detail': 'boom'},
+            'rollback': None, 'started_at': 1.0, 'updated_at': 2.0, 'old_raw': b'',
+        }}
+        roundhouse.ACTUATE_ARMED = True
+        roundhouse.TOKEN = 'test-token'
+        self.server.rollout_engine = engine
+        try:
+            for route, err in (('rollback', 'not_rollbackable'), ('dismiss', 'not_dismissable')):
+                status, body = self.post(f'/api/rollouts/ro-1-1/{route}', {})
+                self.assertEqual(status, 409, route)
+                self.assertEqual(json.loads(body)['error'], err)
+        finally:
+            roundhouse.ACTUATE_ARMED = False
+            roundhouse.TOKEN = None
+            self.server.rollout_engine = None
+
+
+class TestRunGitArgs(unittest.TestCase):
+    """S7: revert-sha validation was a tautology; add took any basename."""
+
+    def setUp(self):
+        roundhouse.ACTUATE_ARMED = True
+        self.addCleanup(setattr, roundhouse, 'ACTUATE_ARMED', False)
+
+    def _run(self, args, **kwargs):
+        with patch('roundhouse.subprocess.run') as mock_run:
+            mock_run.return_value = subprocess.CompletedProcess(args, 0, '', '')
+            return roundhouse.run_git(args, '/tmp', **kwargs)
+
+    def test_revert_rejects_non_sha_arguments(self):
+        for bad in ('HEAD~5..HEAD', '--all', 'main', 'HEAD', 'abc123',
+                    'ABC1234', 'g' * 8, 'a' * 65, '', '-f'):
+            with self.assertRaises(roundhouse.ActuationError, msg=bad):
+                self._run(['revert', '--no-edit', bad])
+
+    def test_revert_accepts_a_sha(self):
+        for good in ('a1b2c3d', '0' * 40, 'f' * 64):
+            self._run(['revert', '--no-edit', good])
+
+    def test_revert_abort_is_allowed(self):
+        self._run(['revert', '--abort'])
+
+    def test_revert_shape_is_exact(self):
+        for bad_args in (['revert', 'a1b2c3d'],
+                         ['revert', '--no-edit', 'a1b2c3d', 'extra'],
+                         ['revert', '--no-edit'],
+                         ['revert', '--abort', 'a1b2c3d']):
+            with self.assertRaises(roundhouse.ActuationError, msg=str(bad_args)):
+                self._run(bad_args)
+
+    def test_add_requires_a_selected_unit(self):
+        units = {'llama-task.service': MagicMock()}
+        self._run(['add', '--', 'llama-task.service'], units=units)
+        for bad in ('other.service', '../evil.service', 'sub/dir.service',
+                    '-rf', 'notaunit', '.gitignore'):
+            with self.assertRaises(roundhouse.ActuationError, msg=bad):
+                self._run(['add', '--', bad], units=units)
+
+    def test_add_without_a_unit_set_still_requires_a_unit_filename(self):
+        self._run(['add', '--', 'anything.service'])
+        for bad in ('../evil.service', 'sub/dir.service', '-rf', 'passwd'):
+            with self.assertRaises(roundhouse.ActuationError, msg=bad):
+                self._run(['add', '--', bad])
+
+
+class TestFreedMemoryTerm(unittest.TestCase):
+    """S4/E9: only a resident unit frees memory, and it frees what the cgroup says."""
+
+    def setUp(self):
+        self.unit = load_fixture('qwen3.6-coding.service')
+        self.edits = [roundhouse.Edit(field='ctx', flag='-c', old_text='65536',
+                                      new_text='131072', span=(0, 5), quote='')]
+
+    def _watcher(self, rung, cgroup=None, mem=None):
+        watcher = MagicMock()
+        watcher.mem_store = None
+        watcher._cgroup_cache = {self.unit.name: cgroup} if cgroup else {}
+        watcher.snapshot.return_value = {'units': [
+            {'unit': self.unit.name, 'rung': rung, 'retired': False,
+             'mem': mem or {}, 'port': 8085},
+        ]}
+        return watcher
+
+    def _run(self, watcher, mem_available_kb=1024):
+        return roundhouse.preflight_memory(
+            self.unit, self.edits, watcher,
+            meminfo_reader=lambda: {'MemAvailable': mem_available_kb})
+
+    def test_stopped_unit_frees_nothing(self):
+        """Regression: the snapshot `mem` row is an ESTIMATE for units that are OFF —
+        crediting it invented a budget nobody is holding."""
+        watcher = self._watcher('OFF', mem={'bytes': 20 * 1024 ** 3, 'source': 'measured'})
+        result = self._run(watcher)
+        self.assertFalse(result['ok'])
+        self.assertEqual(result['freed_bytes'], 0)
+        self.assertIn('not active', result['freed_source'])
+
+    def test_active_unit_frees_cgroup_current(self):
+        watcher = self._watcher('READY', cgroup={'current': 7 * 1024 ** 3,
+                                                 'last_peak': 9 * 1024 ** 3},
+                                mem={'bytes': 20 * 1024 ** 3, 'source': 'measured'})
+        result = self._run(watcher)
+        self.assertEqual(result['freed_bytes'], 7 * 1024 ** 3)
+        self.assertEqual(result['freed_source'], 'cgroup memory.current')
+
+    def test_active_unit_falls_back_to_last_peak_then_measured_row(self):
+        watcher = self._watcher('LOADING', cgroup={'current': None,
+                                                   'last_peak': 9 * 1024 ** 3})
+        self.assertEqual(self._run(watcher)['freed_bytes'], 9 * 1024 ** 3)
+
+        watcher = self._watcher('BUSY', cgroup={'current': None, 'last_peak': None},
+                                mem={'bytes': 3 * 1024 ** 3, 'source': 'measured'})
+        result = self._run(watcher)
+        self.assertEqual(result['freed_bytes'], 3 * 1024 ** 3)
+        self.assertEqual(result['freed_source'], 'measured peak row')
+
+    def test_failure_detail_keeps_the_labelled_numbers(self):
+        watcher = self._watcher('READY', cgroup={'current': 2 * 1024 ** 3})
+        result = self._run(watcher)
+        self.assertFalse(result['ok'])
+        for key in ('estimate_bytes', 'estimate_source', 'mem_available_bytes',
+                    'freed_bytes', 'freed_source', 'headroom_bytes', 'budget_bytes'):
+            self.assertIn(key, result)
+        self.assertIn('freed by stopping', result['detail'])
+        self.assertIn(self.unit.name, result['detail'])
+
+
+class TestTokenFilePermissions(unittest.TestCase):
+    """S6: the token must never exist world-readable, not even for an instant."""
+
+    def test_token_tmp_file_is_600_before_the_replace(self):
+        import stat as stat_mod
+        temp_dir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, temp_dir, True)
+        old_token_path = roundhouse.TOKEN_PATH
+        old_umask = os.umask(0o022)
+        captured = {}
+        real_replace = os.replace
+
+        def spy_replace(src, dst):
+            captured['mode'] = stat_mod.S_IMODE(os.stat(src).st_mode)
+            return real_replace(src, dst)
+
+        try:
+            roundhouse.TOKEN_PATH = os.path.join(temp_dir, 'token')
+            with patch('roundhouse.os.replace', spy_replace):
+                roundhouse.ensure_token()
+        finally:
+            roundhouse.TOKEN_PATH = old_token_path
+            roundhouse.TOKEN = None
+            os.umask(old_umask)
+
+        self.assertEqual(captured.get('mode'), 0o600,
+                         "tmp file was world-readable until the post-replace chmod")
+
+
 if __name__ == '__main__':
     unittest.main()
