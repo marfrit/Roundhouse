@@ -550,8 +550,11 @@
                 }
             }
 
-            // Add 8090 for self
-            portMap[8090] = [];
+            // Roundhouse's own port. MERGE, never assign: overwriting would erase a real
+            // unit's claim on the same port and hide the very collision this board exists
+            // to show (boltzmann: deepseek-coder declares :8090).
+            const selfPort = state.self_port || 8090;
+            if (!portMap[selfPort]) portMap[selfPort] = [];
 
             // Render ports
             for (const port of Object.keys(portMap).sort((a, b) => parseInt(a) - parseInt(b))) {
@@ -561,32 +564,48 @@
                 const cell = document.createElement('div');
                 cell.className = 'port-cell';
 
-                if (portNum === 8090) {
-                    cell.classList.add('self');
-                    cell.textContent = '8090 roundhouse (self) ✓';
-                } else if (claims.length === 0) {
-                    cell.classList.add('latent');
-                    cell.textContent = port + ' ◌';
+                const isSelf = portNum === selfPort;
+                const selfTag = isSelf ? ' roundhouse (self)' : '';
+                if (isSelf) cell.classList.add('self');
+
+                if (claims.length === 0) {
+                    cell.textContent = port + selfTag + ' ✓';
                 } else if (claims.length === 1) {
-                    cell.textContent = port + ' ✓';
+                    cell.textContent = port + selfTag + ' ✓';
                 } else {
                     // Determine class
                     const activeRungs = ['STARTING', 'LOADING', 'READY', 'BUSY'];
                     const activeCount = claims.filter(c => activeRungs.includes(c.rung)).length;
+                    const armedCount = claims.filter(c => (c.enabled && !c.retired) || c.gate).length;
 
+                    let glyph = ' ◌ ', note = '';
                     if (activeCount >= 2) {
                         cell.classList.add('active');
-                        cell.textContent = port + ' ✗ (' + claims.length + ' claims)';
+                        glyph = ' ✗ ';
+                        note = 'two claimants are live on this port right now';
+                    } else if (armedCount >= 2) {
+                        cell.classList.add('armed');
+                        glyph = ' ⚠ ';
+                        note = 'armed: harmless only while BOTH the disable and the kernel gate hold';
                     } else {
-                        const enabledOrGated = claims.filter(c => c.enabled || (c.gate && !c.enabled)).length;
-                        if (enabledOrGated >= 2) {
-                            cell.classList.add('armed');
-                            cell.textContent = port + ' ⚠ (' + claims.length + ' claims)';
-                        } else {
-                            cell.classList.add('latent');
-                            cell.textContent = port + ' ◌ (' + claims.length + ' claims)';
-                        }
+                        cell.classList.add('latent');
                     }
+                    cell.textContent = port + selfTag + glyph + '(' + claims.length + ' claims)';
+
+                    // Click to expand, per §5.7
+                    const expansion = document.createElement('div');
+                    expansion.className = 'port-expansion';
+                    expansion.style.display = 'none';
+                    expansion.textContent = port + ' — ' + claims.map(c =>
+                        c.unit.replace(/\.service$/, '') + ' (' +
+                        (c.enabled ? 'enabled' : 'disabled') +
+                        (c.gate ? ', kernel-gated' : '') + ', ' + c.rung + ')'
+                    ).join(' + ') + (note ? ' — ' + note : '');
+                    cell.appendChild(expansion);
+                    cell.style.cursor = 'pointer';
+                    cell.addEventListener('click', () => {
+                        expansion.style.display = expansion.style.display === 'none' ? 'block' : 'none';
+                    });
                 }
 
                 container.appendChild(cell);

@@ -7,10 +7,12 @@ Uses real captured journal samples and systemctl output.
 
 import sys
 import os
+import ast
 import unittest
 import json
 import sqlite3
 import tempfile
+import shutil
 import socket
 from pathlib import Path
 from unittest.mock import patch, MagicMock
@@ -65,6 +67,66 @@ class TestSubprocessGates(unittest.TestCase):
             result = roundhouse.run_ro(["journalctl", "--user", "-f"])
             self.assertEqual(result, '')
             mock_run.assert_called_once()
+
+
+class TestZeroWritePath(unittest.TestCase):
+    """SPEC §8 'Zero write path': the guard has to be a test, not a review habit.
+
+    run_ro's allowlist stops a write verb at runtime; these stop one from being written.
+    """
+
+    SOURCE = Path(__file__).resolve().parents[1] / 'roundhouse.py'
+    WRITE_VERBS = {'start', 'stop', 'enable', 'disable', 'restart', 'reload',
+                   'daemon-reload', 'kill', 'reset-failed', 'set-property', 'edit'}
+
+    def test_no_write_verb_reaches_a_subprocess_call(self):
+        """No literal write verb appears in any run_ro/spawn_ro_stream argument list."""
+        tree = ast.parse(self.SOURCE.read_text())
+        offenders = []
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            fn = node.func
+            name = fn.id if isinstance(fn, ast.Name) else getattr(fn, 'attr', None)
+            if name not in ('run_ro', 'spawn_ro_stream'):
+                continue
+            for arg in node.args:
+                for sub in ast.walk(arg):
+                    if isinstance(sub, ast.Constant) and sub.value in self.WRITE_VERBS:
+                        offenders.append((node.lineno, sub.value))
+        self.assertEqual(offenders, [], f'write verb passed to a subprocess call: {offenders}')
+
+    def test_daemon_reload_never_appears_in_source(self):
+        self.assertNotIn('daemon-reload', self.SOURCE.read_text())
+
+    def test_readonly_verb_allowlist_is_readonly(self):
+        self.assertEqual(roundhouse.READONLY_SYSTEMCTL_VERBS & self.WRITE_VERBS, set())
+
+    def test_only_the_subprocess_gateway_spawns_processes(self):
+        """subprocess.* is reachable only from run_ro / spawn_ro_stream."""
+        tree = ast.parse(self.SOURCE.read_text())
+        gateways = {'run_ro', 'spawn_ro_stream'}
+        offenders = []
+        for fn in ast.walk(tree):
+            if not isinstance(fn, ast.FunctionDef) or fn.name in gateways:
+                continue
+            for sub in ast.walk(fn):
+                if (isinstance(sub, ast.Attribute) and isinstance(sub.value, ast.Name)
+                        and sub.value.id == 'subprocess'):
+                    offenders.append((fn.name, sub.lineno))
+        self.assertEqual(offenders, [], f'subprocess used outside the gateway: {offenders}')
+
+    def test_module_imports_are_stdlib_only(self):
+        """'Runs without a build step' means no third-party import can creep in."""
+        tree = ast.parse(self.SOURCE.read_text())
+        imported = set()
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                imported.update(a.name.split('.')[0] for a in node.names)
+            elif isinstance(node, ast.ImportFrom) and node.level == 0 and node.module:
+                imported.add(node.module.split('.')[0])
+        non_stdlib = imported - sys.stdlib_module_names - {'roundhouse'}
+        self.assertEqual(non_stdlib, set(), f'non-stdlib imports: {non_stdlib}')
 
 
 class TestParseShowBlocks(unittest.TestCase):
@@ -607,6 +669,84 @@ class TestRegexPatterns(unittest.TestCase):
         self.assertIsNotNone(__import__('re').search(pattern, "slot      release: id 0"))
         self.assertIsNotNone(__import__('re').search(pattern, "slot\t\trelease: id 0"))
         self.assertIsNotNone(__import__('re').search(pattern, "slot release: id 0"))
+
+
+class TestMeasuredLoadSeconds(unittest.TestCase):
+    """A measured peak must be recorded once per process lifetime, and load_seconds must
+    be the model's load time -- not the delay before Roundhouse noticed."""
+
+    def setUp(self):
+        repo_root = Path(__file__).resolve().parents[2]
+        path = repo_root / "docs" / "fixtures" / "qwen3.6-coding.service"
+        self.unit = roundhouse.parse_unit(str(path), path.read_bytes())
+        self.tmpdir = tempfile.mkdtemp()
+        self.store = roundhouse.MemStore(os.path.join(self.tmpdir, 'rh.sqlite'))
+
+    def tearDown(self):
+        if self.store._conn:
+            self.store._conn.close()
+        shutil.rmtree(self.tmpdir, ignore_errors=True)
+
+    def _watcher(self, now):
+        w = roundhouse.Watcher({self.unit.name: self.unit}, "6.12.0", self.store,
+                               now=lambda: now[0])
+        st = w._state[self.unit.name]
+        st['active_state'] = 'active'
+        st['sub_state'] = 'running'
+        st['exec_main_start_ts'] = 1000.0
+        w._compute_rung(self.unit.name)
+        return w
+
+    def test_ready_peak_is_recorded_after_the_journal_marked_ready(self):
+        """READY arrives on the journal thread, so the next cgroup tick sees no
+        *transition* -- the record must still happen (this is what used to be lost)."""
+        now = [1072.0]
+        w = self._watcher(now)
+        w.apply_journal_line({'_SYSTEMD_USER_UNIT': self.unit.name,
+                              'MESSAGE': 'llama_server: model loaded',
+                              '__REALTIME_TIMESTAMP': str(int(1072.0 * 1e6))})
+        self.assertEqual(w._compute_rung(self.unit.name), 'READY')
+
+        now[0] = 1075.0
+        events = w.apply_cgroup_sample(self.unit.name, 19_110_000_000, 18_000_000_000)
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0]['phase'], 'ready')
+        self.assertEqual(events[0]['peak_bytes'], 19_110_000_000)
+
+        rows = self.store.history(self.unit.name)
+        self.assertEqual(len(rows), 1)
+        self.assertAlmostEqual(rows[0]['load_seconds'], 72.0, places=3)
+
+        # once per lifetime, not once per tick
+        now[0] = 1078.0
+        self.assertEqual(w.apply_cgroup_sample(self.unit.name, 19_200_000_000, 1), [])
+
+    def test_backfilled_ready_line_does_not_inflate_load_seconds(self):
+        """Roundhouse starting 10 minutes after the model loaded must still report ~72 s."""
+        now = [1672.0]                       # 10 min after the model actually loaded
+        w = self._watcher(now)
+        w.apply_journal_line({'_SYSTEMD_USER_UNIT': self.unit.name,
+                              'MESSAGE': 'llama_server: model loaded',
+                              '__REALTIME_TIMESTAMP': str(int(1072.0 * 1e6))})
+        w.apply_cgroup_sample(self.unit.name, 19_110_000_000, 1)
+
+        rows = self.store.history(self.unit.name)
+        self.assertAlmostEqual(rows[0]['load_seconds'], 72.0, places=3)
+
+    def test_stop_records_an_exit_row_from_the_cached_peak(self):
+        now = [1072.0]
+        w = self._watcher(now)
+        w.apply_journal_line({'_SYSTEMD_USER_UNIT': self.unit.name,
+                              'MESSAGE': 'llama_server: model loaded',
+                              '__REALTIME_TIMESTAMP': str(int(1072.0 * 1e6))})
+        w.apply_cgroup_sample(self.unit.name, 19_110_000_000, 1)
+
+        now[0] = 2000.0
+        w.apply_systemctl_show({self.unit.name: {
+            'ActiveState': 'inactive', 'SubState': 'dead', 'NRestarts': '0',
+            'ExecMainStartTimestampMonotonic': '0'}})
+        phases = {r['phase'] for r in self.store.history(self.unit.name)}
+        self.assertEqual(phases, {'ready', 'exit'})
 
 
 if __name__ == '__main__':

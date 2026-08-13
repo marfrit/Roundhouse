@@ -1017,6 +1017,10 @@ def quant_hint(filename: str) -> Optional[str]:
     return None
 
 
+# Any URL scheme except file: means the thing being launched or loaded is not on this box.
+REMOTE_SCHEME_RE = re.compile(r'(?!file://)\b[a-zA-Z][a-zA-Z0-9+.\-]*://')
+
+
 def assert_no_paid_offload(dep: Dict) -> None:
     """Assert that no paid offloading is configured.
 
@@ -1028,16 +1032,20 @@ def assert_no_paid_offload(dep: Dict) -> None:
         "openrouter.ai",
         "api.anthropic.com",
         "googleapis.com",
-        "://"
     ]
 
-    # Check exec_start
+    # Check exec_start: the argv is what actually launches something, so a *remote* scheme
+    # here would mean the artifact or engine is not local. file:// is local by definition.
     if 'exec_start' in dep and dep['exec_start']:
         for token in dep['exec_start'].tokens:
             for domain in paid_domains:
                 assert domain not in token.text, f"Paid offloading detected: {domain}"
+            m = REMOTE_SCHEME_RE.search(token.text)
+            assert m is None, f"Non-local artifact/engine detected: {m.group(0) if m else ''}"
 
-    # Check known fields
+    # Check known fields for paid endpoints only. A bare '://' must NOT be rejected here:
+    # Documentation=file:///... is a real directive on two of this host's units, and an
+    # operator's doc link is not an offload path.
     if 'known' in dep:
         known_str = str(dep['known'])
         for domain in paid_domains:
@@ -1158,6 +1166,29 @@ def parse_show_blocks(text: str, unit_order: List[str]) -> Dict[str, Dict[str, s
     return result
 
 
+def classify_port_claims(claims: List[Dict]) -> tuple:
+    """Classify a port's claim list per §4.4(c). Returns (class, note).
+
+    Single claim -> (None, None). Otherwise:
+      active = >=2 claimants actually occupying the port (STARTING/LOADING/READY/BUSY)
+      armed  = >=2 claimants that are enabled, or held back only by an unsatisfied gate
+      latent = anything else (e.g. the retired mixperten claim on :8085)
+    """
+    if len(claims) < 2:
+        return (None, None)
+
+    ACTIVE_RUNGS = {'STARTING', 'LOADING', 'READY', 'BUSY'}
+    if sum(1 for c in claims if c.get('rung') in ACTIVE_RUNGS) >= 2:
+        return ('active', 'two claimants are live on this port right now')
+
+    armed = sum(1 for c in claims
+                if (c.get('enabled') and not c.get('retired')) or c.get('gate'))
+    if armed >= 2:
+        return ('armed', 'harmless only while BOTH the disable and the kernel gate hold')
+
+    return ('latent', None)
+
+
 @dataclass
 class Watcher:
     """State machine for tracking llama-server/llamafile units.
@@ -1196,6 +1227,8 @@ class Watcher:
                 'busy_since': None,
                 'last_marker': None,
                 'unit_file_state': None,
+                'ready_at': None,
+                'mem_recorded': False,
                 'sensed_at': self.now()
             }
             self._cgroup_cache[unit_name] = {
@@ -1229,6 +1262,8 @@ class Watcher:
                 self._state[unit_name]['busy'] = False
                 self._state[unit_name]['busy_since'] = None
                 self._state[unit_name]['last_marker'] = None
+                self._state[unit_name]['ready_at'] = None
+                self._state[unit_name]['mem_recorded'] = False
 
             # Parse timestamp
             ts_str = unit_props.get('ExecMainStartTimestamp', '')
@@ -1248,11 +1283,16 @@ class Watcher:
             old_active = self._state[unit_name]['active_state']
             new_active = unit_props.get('ActiveState', '')
             if old_active == 'active' and new_active != 'active':
-                # Leaving active; reset journal state
+                # Leaving active: record the 'exit' peak row (§6 write moment 2) from the
+                # last cached tick sample -- the cgroup itself may already be gone -- then
+                # reset journal state.
+                self._record_mem(unit_name, 'exit')
                 self._state[unit_name]['ready'] = False
                 self._state[unit_name]['busy'] = False
                 self._state[unit_name]['busy_since'] = None
                 self._state[unit_name]['last_marker'] = None
+                self._state[unit_name]['ready_at'] = None
+                self._state[unit_name]['mem_recorded'] = False
 
             # Update state
             self._state[unit_name]['active_state'] = new_active
@@ -1297,6 +1337,14 @@ class Watcher:
         if not message:
             return events
 
+        # When the line was written, not when we read it. Backfilled lines can be minutes
+        # old at startup; timing a load from self.now() there invents a load_seconds that
+        # measures Roundhouse's own start-up delay instead of the model's load.
+        try:
+            line_ts = int(rec['__REALTIME_TIMESTAMP']) / 1e6
+        except (KeyError, TypeError, ValueError):
+            line_ts = self.now()
+
         unit = self.units.get(unit_name)
         if not unit or not unit.exec_start:
             return events
@@ -1337,7 +1385,7 @@ class Watcher:
         elif any(re.search(p, message) for p in busy_start_patterns):
             self._state[unit_name]['busy'] = True
             self._state[unit_name]['ready'] = True
-            self._state[unit_name]['busy_since'] = self.now()
+            self._state[unit_name]['busy_since'] = line_ts
             self._state[unit_name]['last_marker'] = message
         # Rule 4: REQ_DONE match
         elif req_done_patterns and any(re.search(p, message) for p in req_done_patterns):
@@ -1347,6 +1395,11 @@ class Watcher:
         # Rule 5: no match - no state change
         else:
             return events
+
+        # Stamp the moment the model first became ready; load_seconds (§6) is measured
+        # from ExecMainStartTimestamp to here, NOT to the next cgroup tick.
+        if self._state[unit_name]['ready'] and not self._state[unit_name].get('ready_at'):
+            self._state[unit_name]['ready_at'] = line_ts
 
         self._state[unit_name]['sensed_at'] = self.now()
 
@@ -1378,48 +1431,72 @@ class Watcher:
         if current is not None:
             self._cgroup_cache[unit_name]['current'] = current
 
-        # Emit mem event for ready transitions
-        old_rung = self._get_rung(unit_name)
-        new_rung = self._compute_rung(unit_name)
-
+        # Record the measured peak once per process lifetime, on the first tick that
+        # observes the unit at READY.
+        #
+        # This deliberately does NOT test for a rung *transition* here: READY is reached
+        # by the journal thread (apply_journal_line caches _rung='READY'), so by the time
+        # the next 3 s tick arrives the transition is already spent and an
+        # old_rung != 'READY' test never fires -- which is why no row was ever written.
+        # The 'mem_recorded' latch (reset on restart and on leaving active) gives the
+        # once-per-lifecycle guarantee instead.
         events = []
-        if old_rung != 'READY' and new_rung == 'READY':
-            # Ready transition; record to sqlite if available
-            if peak is not None and self.mem_store and unit_name in self.units:
-                unit = self.units[unit_name]
-                if unit.exec_start:
-                    profile = extract_param_profile(unit.exec_start.engine_argv)
-                    model_path = profile.get('model_path')
-                    ctx = profile.get('ctx')
-                    ctk = profile.get('cache_type_k')
-                    ctv = profile.get('cache_type_v')
-
-                    if model_path:
-                        file_id = self._compute_file_id(model_path)
-                        load_seconds = None
-                        if self._state[unit_name]['exec_main_start_ts']:
-                            load_seconds = self.now() - self._state[unit_name]['exec_main_start_ts']
-
-                        self.mem_store.record(
-                            unit=unit_name,
-                            model_path=model_path,
-                            file_id=file_id,
-                            ctx=ctx,
-                            ctk=ctk,
-                            ctv=ctv,
-                            phase='ready',
-                            peak_bytes=peak,
-                            load_seconds=load_seconds
-                        )
-
-                        events.append({
-                            'unit': unit_name,
-                            'peak_bytes': peak,
-                            'phase': 'ready',
-                            'source': 'measured'
-                        })
+        if self._compute_rung(unit_name) == 'READY' and not self._state[unit_name].get('mem_recorded'):
+            ev = self._record_mem(unit_name, 'ready')
+            if ev:
+                events.append(ev)
 
         return events
+
+    def _record_mem(self, unit_name: str, phase: str) -> Optional[Dict]:
+        """Record a measured cgroup peak to sqlite (§6 write moments).
+
+        Uses the last cached tick sample, so it still works at 'exit' time when the
+        cgroup has already been torn down. Returns the `mem` SSE payload, or None when
+        nothing was recorded (no store, no sample, no model path).
+        """
+        if not self.mem_store or unit_name not in self.units:
+            return None
+
+        peak = self._cgroup_cache.get(unit_name, {}).get('last_peak')
+        if not peak:
+            return None
+
+        unit = self.units[unit_name]
+        if not unit.exec_start:
+            return None
+
+        profile = extract_param_profile(unit.exec_start.engine_argv)
+        model_path = profile.get('model_path')
+        if not model_path:
+            return None
+
+        state = self._state[unit_name]
+        load_seconds = None
+        if phase == 'ready' and state.get('exec_main_start_ts'):
+            ready_at = state.get('ready_at') or self.now()
+            load_seconds = ready_at - state['exec_main_start_ts']
+
+        self.mem_store.record(
+            unit=unit_name,
+            model_path=model_path,
+            file_id=self._compute_file_id(model_path),
+            ctx=profile.get('ctx'),
+            ctk=profile.get('cache_type_k'),
+            ctv=profile.get('cache_type_v'),
+            phase=phase,
+            peak_bytes=peak,
+            load_seconds=load_seconds,
+        )
+        if phase == 'ready':
+            state['mem_recorded'] = True
+
+        return {
+            'unit': unit_name,
+            'peak_bytes': peak,
+            'phase': phase,
+            'source': 'measured',
+        }
 
     def snapshot(self) -> Dict:
         """Return a complete snapshot of the current state.
@@ -1480,10 +1557,26 @@ class Watcher:
                 'quant_hint': quant,
                 'ctx': profile.get('ctx'),
                 'mem': mem_info,
-                'port_conflict': None  # TODO: compute port conflicts
+                'port_conflict': None  # filled in below, once every claim is known
             }
 
             units_list.append(unit_dict)
+
+        # Second pass: a unit cannot know it shares a port until every unit is rendered.
+        claims_by_port = {}
+        for row in units_list:
+            if row['port']:
+                claims_by_port.setdefault(row['port'], []).append(row)
+        for port, rows in claims_by_port.items():
+            if len(rows) < 2:
+                continue
+            cls, note = classify_port_claims(rows)
+            for row in rows:
+                row['port_conflict'] = {
+                    'class': cls,
+                    'note': note,
+                    'with': [o['unit'] for o in rows if o['unit'] != row['unit']],
+                }
 
         return {
             'host': os.uname()[1],  # hostname
@@ -1607,13 +1700,24 @@ class Watcher:
             if ts:
                 elapsed = int(self.now() - ts)
                 detail = f"elapsed {elapsed}s"
-                # TODO: add last load time from sqlite
+                last = self._last_load_seconds(unit_name)
+                if last:
+                    detail += f" (last load: {int(last)}s)"
                 return detail
         elif rung == 'BUSY':
             busy_since = state.get('busy_since')
             if busy_since:
                 elapsed = int(self.now() - busy_since)
                 return f"since {elapsed}s"
+        elif rung == 'STANDBY':
+            # The whole point of the STANDBY rung: say what it is waiting for, neutrally.
+            gate = (self.units.get(unit_name).gate if self.units.get(unit_name) else None) or {}
+            if gate.get('kind') == 'kernel':
+                return (f"waiting for kernel {gate.get('wants')} "
+                        f"(running: {self.running_kernel})")
+            return f"gated (condition unverified): {gate.get('raw', '')}"
+        elif rung == 'OFF' and state.get('active_state') == 'deactivating':
+            return 'stopping'
 
         return ''
 
@@ -1645,6 +1749,15 @@ class Watcher:
             {'artifact': {'path': profile.get('model_path')}},
             self.mem_store
         )
+
+    def _last_load_seconds(self, unit_name: str) -> Optional[float]:
+        """Newest recorded load_seconds for this unit, for the LOADING detail line."""
+        if not self.mem_store:
+            return None
+        for row in self.mem_store.history(unit_name):
+            if row.get('load_seconds'):
+                return row['load_seconds']
+        return None
 
     def _compute_file_id(self, model_path: str) -> str:
         """Compute file_id (sz<size>:mt<mtime>) for a model file."""
@@ -1906,6 +2019,16 @@ class EventBus:
             self.unsubscribe(q)
 
 
+def _wrapper_json(unit: 'UnitFile') -> Optional[Dict]:
+    """JSON-safe view of exec_start.wrapper (drops the Token objects it carries)."""
+    if not unit.exec_start or not unit.exec_start.wrapper:
+        return None
+    w = unit.exec_start.wrapper
+    out = {k: v for k, v in w.items() if k != 'tokens'}
+    out['text'] = ' '.join(t.text for t in w.get('tokens', []))
+    return out
+
+
 class RoundhouseRequestHandler(http.server.BaseHTTPRequestHandler):
     """HTTP request handler for Roundhouse server."""
 
@@ -1980,148 +2103,104 @@ class RoundhouseRequestHandler(http.server.BaseHTTPRequestHandler):
         self.send_json(snapshot)
 
     def serve_unit_detail(self, unit_name):
-        """Serve /api/units/<name> detail."""
-        snapshot = self.server.watcher.snapshot()
+        """Serve /api/units/<name>: the list row (a) plus the parsed-file detail (b)."""
+        watcher = self.server.watcher
+        snapshot = watcher.snapshot()
 
-        # Find unit in snapshot
-        for unit in snapshot.get('units', []):
-            if unit['unit'] == unit_name:
-                # Fetch full detail (in real impl, this would include extra fields)
-                self.send_json(unit)
-                return
+        row = next((u for u in snapshot.get('units', []) if u['unit'] == unit_name), None)
+        if row is None:
+            self.error_404()
+            return
 
-        self.error_404()
+        unit = getattr(watcher, 'units', {}).get(unit_name)
+        if unit is None:
+            # Watcher without parsed files (stub / degraded): the list row is all there is.
+            self.send_json(row)
+            return
+
+        profile = extract_param_profile(unit.exec_start.engine_argv) if unit.exec_start else {}
+        store = getattr(watcher, 'mem_store', None)
+
+        self.send_json({
+            **row,
+            'path': unit.path,
+            'param_profile': profile,
+            'engine': unit.exec_start.engine if unit.exec_start else {},
+            'wrapper': _wrapper_json(unit),
+            # Verbatim, byte-faithful: the UI assigns these via textContent, never innerHTML.
+            'comments': unit.comments,
+            'other_directives': [
+                {'section': d.section, 'key': d.key, 'value': _decode_value(d.value_raw),
+                 'span': list(d.value_span)}
+                for d in unit.other_directives
+            ],
+            'lines': [
+                {'kind': l.kind, 'start': l.start, 'end': l.end, 'lineno': l.lineno}
+                for l in unit.lines
+            ],
+            'warnings': list(unit.warnings),
+            'raw_size': len(unit.raw),
+            'known': dict(unit.known),
+            'history_mem': store.history(unit_name) if store else [],
+        })
 
     def serve_ports(self):
         """Serve /api/ports (port board)."""
-        snapshot = self.server.watcher.snapshot()
-        units = snapshot.get('units', [])
-
-        port_claims = {}
-        for unit in units:
-            port = unit.get('port')
-            if port:
-                if port not in port_claims:
-                    port_claims[port] = []
-                port_claims[port].append({
-                    'unit': unit['unit'],
-                    'enabled': unit.get('enabled', False),
-                    'rung': unit.get('rung', 'OFF'),
-                    'retired': unit.get('retired', False),
-                    'gate': unit.get('gate')
-                })
-
-        # Add self port
-        port_claims[self.server.port] = []
-
-        # Build port board response
-        ports = []
-        for port in sorted(port_claims.keys()):
-            claims = port_claims[port]
-            if port == self.server.port:
-                # Self
-                ports.append({
-                    'port': port,
-                    'claims': [],
-                    'class': None,
-                    'note': 'roundhouse (self)'
-                })
-            elif len(claims) == 0:
-                # No claims (shouldn't happen)
-                pass
-            elif len(claims) == 1:
-                # Single claim
-                claim = claims[0]
-                ports.append({
-                    'port': port,
-                    'claims': [claim],
-                    'class': None,
-                    'note': None
-                })
-            else:
-                # Multiple claims - determine class
-                active_rungs = {'STARTING', 'LOADING', 'READY', 'BUSY'}
-                active_count = sum(1 for c in claims if c['rung'] in active_rungs)
-
-                if active_count >= 2:
-                    port_class = 'active'
-                else:
-                    # Check if armed: >=2 claims that are enabled OR whose only blocker is unsatisfied gate
-                    enabled_or_gated = sum(1 for c in claims if c['enabled'] or (c['gate'] and not c['enabled']))
-                    if enabled_or_gated >= 2:
-                        port_class = 'armed'
-                        note = 'harmless only while BOTH the disable and the kernel gate hold'
-                    else:
-                        port_class = 'latent'
-                        note = None
-
-                ports.append({
-                    'port': port,
-                    'claims': claims,
-                    'class': port_class if active_count < 2 else 'active',
-                    'note': note if active_count < 2 else None
-                })
-
-        response = {
-            'ports': ports,
-            'self': {'port': self.server.port, 'claims_by_units': []}
-        }
-        self.send_json(response)
+        self.send_json(_build_port_board(self.server.watcher.snapshot()))
 
     def serve_deployments(self):
-        """Serve /api/deployments."""
-        snapshot = self.server.watcher.snapshot()
-        units = snapshot.get('units', [])
+        """Serve /api/deployments (§4.4d).
+
+        The record body comes from build_deployment() -- the parser owns the spine shape.
+        Only the live half (enable state, roster, memory) is layered on from the snapshot.
+        RETIRED units still emit a record with retired:true and roster.state null;
+        consumers filter on `retired` (they are never placement targets).
+        """
+        watcher = self.server.watcher
+        snapshot = watcher.snapshot()
+        host = snapshot.get('host', '?')
 
         deployments = []
-        for unit in units:
-            if not unit.get('retired', False):
-                dep = {
-                    'deployment_id': f"{snapshot.get('host', '?')}/{unit['unit']}",
-                    'unit': unit['unit'],
-                    'artifact': {
-                        'model': None,
-                        'path': unit.get('model_path'),
-                        'filename': unit.get('model_file'),
-                        'format': 'gguf',
-                        'quant_hint': unit.get('quant_hint'),
-                        'sha256': None,
-                        'file_id': None
-                    },
-                    'host_artifact': {
-                        'host': snapshot.get('host', '?'),
-                        'path': unit.get('model_path'),
-                        'exists': False,
-                        'size_bytes': None,
-                        'mtime': None
-                    },
-                    'engine': unit.get('engine', {}),
-                    'param_profile': unit.get('param_profile', {}),
-                    'load_strategy': {
-                        'kind': 'on-boot' if unit.get('enabled') else 'manual',
-                        'enabled': unit.get('enabled', False),
-                        'gate': unit.get('gate')
-                    },
-                    'roster': {
-                        'rung': unit.get('rung', 'OFF'),
-                        'state': unit.get('roster', None),
-                        'since': unit.get('since')
-                    },
-                    'memory': unit.get('mem', {'bytes': None, 'source': 'unknown'}),
-                    'retired': False
-                }
-                deployments.append(dep)
+        parsed = getattr(watcher, 'units', {})
+        for row in snapshot.get('units', []):
+            unit = parsed.get(row['unit'])
+            if unit is None:
+                continue
+            dep = build_deployment(unit, host)
+            dep['load_strategy'] = {
+                'kind': 'on-boot' if row.get('enabled') else 'manual',
+                'enabled': row.get('enabled', False),
+                'gate': unit.gate,
+            }
+            dep['roster'] = {
+                'rung': row.get('rung', 'OFF'),
+                'state': row.get('roster'),
+                'since': row.get('since'),
+            }
+            dep['memory'] = row.get('mem') or dep['memory']
+            deployments.append(dep)
 
-        response = {
-            'host': snapshot.get('host', '?'),
-            'deployments': deployments
-        }
-        self.send_json(response)
+        self.send_json({'host': host, 'deployments': deployments})
 
     def serve_mem(self):
-        """Serve /api/mem (memory history)."""
-        # Simplified: return empty list for now
-        self.send_json({'rows': []})
+        """Serve /api/mem: measured peak rows (§6 schema) plus the current per-unit
+        number the UI shows, so a caller can tell measurement from estimate."""
+        watcher = self.server.watcher
+        snapshot = watcher.snapshot()
+        store = getattr(watcher, 'mem_store', None)
+
+        rows = []
+        for unit in snapshot.get('units', []):
+            for row in (store.history(unit['unit']) if store else []):
+                rows.append(dict(row, unit=unit['unit']))
+
+        self.send_json({
+            'rows': rows,
+            'current': [
+                {'unit': u['unit'], **(u.get('mem') or {})}
+                for u in snapshot.get('units', [])
+            ],
+        })
 
     def serve_events(self):
         """Serve /api/events (Server-Sent Events)."""
@@ -2231,7 +2310,12 @@ def cmd_scan(args):
 
     # Select units
     unit_paths = select_units(unit_dir)
-    print(f"Selected {len(unit_paths)} units:")
+    selected = {os.path.basename(p) for p in unit_paths}
+    considered = sorted(f for f in os.listdir(unit_dir) if f.endswith('.service'))
+
+    print(f"Unit dir: {unit_dir}")
+    print(f"{len(considered)} .service files, {len(selected)} selected as ours "
+          f"(D1: ExecStart basename matches ^llama-server or contains llamafile)")
 
     # Parse and report
     units = {}
@@ -2243,56 +2327,53 @@ def cmd_scan(args):
                 raw = f.read()
             unit = parse_unit(fpath, raw)
             units[unit.name] = unit
-            print(f"  {unit.name}")
+            flags = []
+            if unit.retired:
+                flags.append('RETIRED')
+            if unit.gate:
+                flags.append(f"gated:{unit.gate.get('wants') or unit.gate.get('kind')}")
+            if unit.warnings:
+                flags.append(f"{len(unit.warnings)} warning(s)")
+            print(f"  {unit.name}" + (f"   [{', '.join(flags)}]" if flags else ''))
 
             # Track port claims
             if unit.exec_start and unit.exec_start.engine_argv:
                 profile = extract_param_profile(unit.exec_start.engine_argv)
                 port = profile.get('port', 8080)
-                alias = profile.get('alias', unit.name)
-
-                if port not in port_claims:
-                    port_claims[port] = []
-                port_claims[port].append({
+                port_claims.setdefault(port, []).append({
                     'unit': unit.name,
-                    'alias': alias,
-                    'enabled': True,  # We don't have systemd state here
+                    'alias': profile.get('alias') or unit.name,
+                    # A static scan cannot see enable state; treat every non-retired unit
+                    # as a live claimant so nothing is quietly downgraded to 'latent'.
+                    'enabled': not unit.retired,
+                    'rung': None,          # nothing is running from the file's point of view
                     'retired': unit.retired,
-                    'gate': unit.gate
+                    'gate': unit.gate,
                 })
         except Exception as e:
             print(f"  Error parsing {fpath}: {e}", file=sys.stderr)
             return 1
 
-    # Print port board
+    # Not-ours files are listed explicitly: a count that differs from the known fleet size
+    # must be explainable from this output alone, not investigated by hand.
+    skipped = [f for f in considered if f not in selected]
+    if skipped:
+        print(f"\nNot ours ({len(skipped)}):")
+        for name in skipped:
+            print(f"  {name}   [no llama-server/llamafile in ExecStart]")
+
     print("\nPort board:")
     for port in sorted(port_claims.keys()):
         claims = port_claims[port]
-        if len(claims) == 1:
-            claim = claims[0]
-            status = '✓' if not claim['retired'] else '◌'
-            print(f"  {port} {status} {claim['alias']}")
-        else:
-            # Collision
-            enabled_active = sum(1 for c in claims if c['enabled'] and not c['retired'])
-            if enabled_active >= 2:
-                cls = 'active'
-                icon = '✗'
-            else:
-                # Check if gated
-                has_gate = any(c['gate'] for c in claims)
-                if has_gate and not enabled_active:
-                    cls = 'armed'
-                    icon = '⚠'
-                else:
-                    cls = 'latent'
-                    icon = '◌'
-
-            claim_names = ', '.join(f"{c['alias']}" for c in claims)
-            print(f"  {port} {icon} {cls}: {claim_names}")
+        cls, note = classify_port_claims(claims)
+        icon = {'active': '✗', 'armed': '⚠', 'latent': '◌'}.get(cls, '✓')
+        names = ', '.join(c['alias'] + (' [RETIRED]' if c['retired'] else '')
+                          + (' [gated]' if c['gate'] else '') for c in claims)
+        label = f"{cls}: " if cls else ''
+        print(f"  {port} {icon} {label}{names}")
 
     print("\nDeployment records: (not printed in --scan mode)")
-    print(f"Exit: 0")
+    print("Exit: 0")
     return 0
 
 
@@ -2352,6 +2433,7 @@ def cmd_serve(args):
 
     # Track journal source state
     journal_state = {'down_since': None, 'proc': None}
+    last_board = {'board': None}
     systemctl_state = {'down_since': None}
     backoff_journal = 1
 
@@ -2416,9 +2498,13 @@ def cmd_serve(args):
                                 for event in events:
                                     event_bus.publish('mem', event)
 
-                    # Rebuild port board and emit if changed
-                    # (simplified: emit every cycle)
-                    event_bus.publish('ports', _build_port_board(watcher.snapshot()))
+                    # Rebuild the port board; emit only when a claim's class actually
+                    # changed (§4). Re-emitting every 3 s makes every connected browser
+                    # rebuild the board for nothing.
+                    board = _build_port_board(watcher.snapshot())
+                    if board != last_board['board']:
+                        last_board['board'] = board
+                        event_bus.publish('ports', board)
 
                 # Sleep 3 seconds
                 shutdown_event.wait(3)
@@ -2595,14 +2681,18 @@ def cmd_serve(args):
                     journal_state['proc'].terminate()
                 except Exception:
                     pass
-            server.shutdown()
-            sys.exit(0)
+            # server.shutdown() blocks until serve_forever() returns -- and serve_forever()
+            # runs in THIS thread, so calling it from the handler deadlocks the process:
+            # it stops accepting but never exits, and systemd has to SIGKILL it at the stop
+            # timeout. Ask for shutdown from a helper thread and let serve_forever() unwind.
+            threading.Thread(target=server.shutdown, daemon=True).start()
 
         signal.signal(signal.SIGTERM, signal_handler)
         signal.signal(signal.SIGINT, signal_handler)
 
         # Serve forever
         server.serve_forever()
+        server.server_close()
     except Exception as e:
         print(f"Error starting server: {e}", file=sys.stderr)
         shutdown_event.set()
@@ -2612,14 +2702,15 @@ def cmd_serve(args):
 
 
 def _build_port_board(snapshot: Dict) -> Dict:
-    """Build port board from snapshot."""
+    """Build the port board (§4.4c) from a snapshot. The single implementation:
+    /api/ports and the SSE `ports` event both go through here."""
+    self_port = snapshot.get('self_port', 8090)
+
     ports = {}
     for unit in snapshot.get('units', []):
         port = unit.get('port')
         if port:
-            if port not in ports:
-                ports[port] = []
-            ports[port].append({
+            ports.setdefault(port, []).append({
                 'unit': unit['unit'],
                 'enabled': unit.get('enabled', False),
                 'rung': unit.get('rung', 'OFF'),
@@ -2627,53 +2718,31 @@ def _build_port_board(snapshot: Dict) -> Dict:
                 'gate': unit.get('gate')
             })
 
-    ports[8090] = []
+    # Roundhouse's own port is a claim too -- but it must be MERGED, never assigned:
+    # overwriting the entry would erase a real unit's claim on the same port and hide
+    # exactly the collision this board exists to show.
+    ports.setdefault(self_port, [])
 
     port_list = []
     for port in sorted(ports.keys()):
         claims = ports[port]
-        if port == 8090:
-            port_list.append({
-                'port': port,
-                'claims': [],
-                'class': None,
-                'note': 'roundhouse (self)'
-            })
-        elif len(claims) == 0:
-            pass
-        elif len(claims) == 1:
-            port_list.append({
-                'port': port,
-                'claims': [claims[0]],
-                'class': None,
-                'note': None
-            })
-        else:
-            active_rungs = {'STARTING', 'LOADING', 'READY', 'BUSY'}
-            active_count = sum(1 for c in claims if c['rung'] in active_rungs)
-
-            if active_count >= 2:
-                port_class = 'active'
-                note = None
-            else:
-                enabled_or_gated = sum(1 for c in claims if c['enabled'] or (c['gate'] and not c['enabled']))
-                if enabled_or_gated >= 2:
-                    port_class = 'armed'
-                    note = 'harmless only while BOTH the disable and the kernel gate hold'
-                else:
-                    port_class = 'latent'
-                    note = None
-
-            port_list.append({
-                'port': port,
-                'claims': claims,
-                'class': port_class,
-                'note': note
-            })
+        cls, note = classify_port_claims(claims)
+        if port == self_port:
+            note = 'roundhouse (self)' + (f' — also claimed by {len(claims)} unit(s)' if claims else '')
+        port_list.append({
+            'port': port,
+            'claims': claims,
+            'class': cls,
+            'note': note,
+            'self': port == self_port,
+        })
 
     return {
         'ports': port_list,
-        'self': {'port': 8090, 'claims_by_units': []}
+        'self': {
+            'port': self_port,
+            'claims_by_units': [c['unit'] for c in ports.get(self_port, [])],
+        },
     }
 
 

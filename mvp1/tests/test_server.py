@@ -378,5 +378,151 @@ class TestServerEventBus(unittest.TestCase):
         self.assertEqual(len(bus.subscribers), initial_count - 1)
 
 
+class ParsedStubWatcher(StubWatcher):
+    """StubWatcher that additionally carries the parsed UnitFiles a real Watcher holds,
+    so the detail (§4.4b) and deployment-spine (§4.4d) endpoints can be exercised."""
+
+    def __init__(self):
+        super().__init__()
+        fixtures = Path(__file__).resolve().parents[2] / 'docs' / 'fixtures'
+        self.units = {}
+        for name in ('qwen3.6-coding.service', 'llama-server-qwen35-npu.service',
+                     'llama-task.service'):
+            path = fixtures / name
+            self.units[name] = roundhouse.parse_unit(str(path), path.read_bytes())
+        self.mem_store = StubMemStore()
+
+
+class TestServerDetailAndSpine(unittest.TestCase):
+    """/api/units/<name> detail and /api/deployments against parsed real fixtures."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.watcher = ParsedStubWatcher()
+        sock = socket.socket()
+        sock.bind(('127.0.0.1', 0))
+        cls.port = sock.getsockname()[1]
+        sock.close()
+        cls.server = roundhouse.ThreadingHTTPServer(
+            ('127.0.0.1', cls.port), roundhouse.RoundhouseRequestHandler,
+            cls.watcher, roundhouse.EventBus(), cls.port)
+        cls.thread = threading.Thread(target=cls.server.serve_forever, daemon=True)
+        cls.thread.start()
+        time.sleep(0.1)
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.server.shutdown()
+        cls.server.server_close()
+
+    def get_json(self, path):
+        conn = http.client.HTTPConnection('127.0.0.1', self.port, timeout=5)
+        try:
+            conn.request('GET', path)
+            resp = conn.getresponse()
+            return resp.status, json.loads(resp.read())
+        finally:
+            conn.close()
+
+    def test_detail_carries_parsed_file(self):
+        """Detail adds the §4.4(b) fields on top of the list row."""
+        status, data = self.get_json('/api/units/qwen3.6-coding.service')
+        self.assertEqual(status, 200)
+        for key in ('path', 'param_profile', 'engine', 'comments', 'other_directives',
+                    'lines', 'warnings', 'raw_size', 'known', 'history_mem'):
+            self.assertIn(key, data, f'detail is missing {key}')
+        self.assertEqual(data['param_profile']['port'], 8085)
+        self.assertEqual(data['param_profile']['ctx'], 65536)
+
+    def test_detail_comments_are_verbatim_and_complete(self):
+        """Every '#' line of the file reaches the operator's-notes payload byte-identically."""
+        raw = self.watcher.units['qwen3.6-coding.service'].raw
+        _, data = self.get_json('/api/units/qwen3.6-coding.service')
+        served = [c['text'] for c in data['comments']]
+        expected = [l.decode('utf-8', 'replace')
+                    for l in raw.split(b'\n')
+                    if l.strip().startswith(b'#') or l.strip().startswith(b';')]
+        self.assertEqual(served, expected)
+        self.assertTrue(served, 'fixture has comments; none were served')
+
+    def test_detail_is_json_serialisable_for_every_fixture(self):
+        """No Token/bytes leak into the payload (wrapper carries Tokens internally)."""
+        for name in self.watcher.units:
+            status, data = self.get_json('/api/units/' + name)
+            self.assertEqual(status, 200, name)
+            json.dumps(data)
+
+    def test_deployments_have_the_full_spine(self):
+        """Artifact -> HostArtifact -> Engine + ParamProfile + Host + LoadStrategy."""
+        status, data = self.get_json('/api/deployments')
+        self.assertEqual(status, 200)
+        self.assertEqual(len(data['deployments']), 3)
+        dep = next(d for d in data['deployments'] if d['unit'] == 'qwen3.6-coding.service')
+        for key in ('deployment_id', 'artifact', 'host_artifact', 'engine', 'param_profile',
+                    'load_strategy', 'roster', 'memory', 'retired'):
+            self.assertIn(key, dep)
+        self.assertEqual(dep['artifact']['format'], 'gguf')
+        self.assertEqual(dep['artifact']['quant_hint'], 'Q4_K_M')
+        self.assertEqual(dep['engine']['kind'], 'llama-server')
+        # live half comes from the snapshot row, not from the (unset) unit file state
+        self.assertTrue(dep['load_strategy']['enabled'])
+        self.assertEqual(dep['roster']['rung'], 'READY')
+
+    def test_mem_endpoint_reports_rows_and_current(self):
+        status, data = self.get_json('/api/mem')
+        self.assertEqual(status, 200)
+        self.assertIn('rows', data)
+        self.assertIn('current', data)
+        self.assertEqual({c['unit'] for c in data['current']}, set(self.watcher.units))
+
+
+class TestPortClassification(unittest.TestCase):
+    """§4.4(c) class rules, exercised directly on claim lists."""
+
+    def test_single_claim_has_no_class(self):
+        self.assertEqual(roundhouse.classify_port_claims(
+            [{'unit': 'a', 'enabled': True, 'rung': 'READY'}]), (None, None))
+
+    def test_enabled_plus_gated_is_armed(self):
+        """The real :8086 pair: llama-task live, qwen35-npu disabled behind a kernel gate."""
+        cls, note = roundhouse.classify_port_claims([
+            {'unit': 'llama-task.service', 'enabled': True, 'rung': 'READY', 'retired': False,
+             'gate': None},
+            {'unit': 'llama-server-qwen35-npu.service', 'enabled': False, 'rung': 'STANDBY',
+             'retired': False, 'gate': {'kind': 'kernel', 'wants': '6.1.75-npu-port'}},
+        ])
+        self.assertEqual(cls, 'armed')
+        self.assertIn('kernel gate', note)
+
+    def test_retired_second_claim_is_latent(self):
+        """The real :8085 pair: qwen3.6-coding live, mixperten disabled and RETIRED."""
+        cls, _ = roundhouse.classify_port_claims([
+            {'unit': 'qwen3.6-coding.service', 'enabled': True, 'rung': 'READY',
+             'retired': False, 'gate': None},
+            {'unit': 'mixperten.service', 'enabled': False, 'rung': 'RETIRED',
+             'retired': True, 'gate': None},
+        ])
+        self.assertEqual(cls, 'latent')
+
+    def test_two_live_claims_are_active(self):
+        cls, _ = roundhouse.classify_port_claims([
+            {'unit': 'a', 'enabled': True, 'rung': 'READY', 'retired': False, 'gate': None},
+            {'unit': 'b', 'enabled': True, 'rung': 'LOADING', 'retired': False, 'gate': None},
+        ])
+        self.assertEqual(cls, 'active')
+
+    def test_self_port_does_not_erase_a_unit_claim(self):
+        """Roundhouse's own port is merged into the board, never assigned over."""
+        snapshot = {
+            'self_port': 8090,
+            'units': [{'unit': 'deepseek-coder.service', 'port': 8090, 'enabled': False,
+                       'rung': 'OFF', 'retired': False, 'gate': None}],
+        }
+        board = roundhouse._build_port_board(snapshot)
+        cell = next(p for p in board['ports'] if p['port'] == 8090)
+        self.assertEqual([c['unit'] for c in cell['claims']], ['deepseek-coder.service'])
+        self.assertEqual(board['self']['claims_by_units'], ['deepseek-coder.service'])
+
+
 if __name__ == '__main__':
     unittest.main()

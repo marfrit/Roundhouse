@@ -1,91 +1,132 @@
 #!/bin/bash
-# Container setup for testing Roundhouse
-# Pushes mvp1 tree + docs/fixtures to container, sets up fake units
-# Usage: container-setup.sh [CONTAINER_NAME]
+# Roundhouse MVP1 — throwaway-container fixture install.
+#
+# Runs ON the incus host (boltzmann), from a checkout of this repo:
+#     mvp1/scripts/container-setup.sh [CONTAINER_NAME]
+#
+# Builds the ladder scenarios of SPEC.md §8 inside a Debian container:
+#   qwen3.6-coding              normal start, 15 s fake load   -> LOADING -> READY
+#   llama-server-qwen35-npu     ExecCondition kernel gate kept -> STANDBY (never FAILED)
+#   llama-task                  enabled + started, shares :8086 with the gated unit -> armed
+#   llama-server-gemma4-q4km    FAKE_EXIT_1 + Restart=on-failure -> FAILED, NRestarts climbing
+#   mixperten                   installed byte-for-byte, NEVER enabled/started -> RETIRED
+#
+# Each unit is a *copy* of the real fixture with only its engine binary token spliced out
+# for the fake server; comments, ExecCondition, flags and ports stay byte-identical, so the
+# parser sees the real thing. Byte offsets differ from the pristine fixtures — that is fine,
+# the offset invariants are proven against docs/fixtures/ by the unit tests.
 
-set -eu
+set -euo pipefail
 
 CONTAINER="${1:-roundhouse-test}"
-ROUNDHOUSE_HOME="/home/roundhouse/roundhouse"
+CUSER=roundhouse
+CHOME="/home/$CUSER"
+DEST="$CHOME/roundhouse"
+REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 
-echo "Setting up Roundhouse in container $CONTAINER..."
+echo "== Roundhouse container setup: $CONTAINER (repo: $REPO) =="
 
-# Ensure container exists (user must have created it)
-if ! incus list | grep -q "^| $CONTAINER"; then
-    echo "Error: container $CONTAINER does not exist"
+if ! incus info "$CONTAINER" >/dev/null 2>&1; then
+    echo "Error: container $CONTAINER does not exist" >&2
     exit 1
 fi
 
-# Push mvp1 tree
-echo "Pushing mvp1 tree..."
-incus file push --create-dirs -r . "$CONTAINER$ROUNDHOUSE_HOME/" 2>/dev/null || {
-    echo "Error: failed to push files to container"
-    exit 1
-}
+echo "-- pushing tree to $DEST"
+incus exec "$CONTAINER" -- rm -rf "$DEST/mvp1" "$DEST/docs"
+incus file push --create-dirs -rq "$REPO/mvp1" "$CONTAINER$DEST/"
+incus file push --create-dirs -rq "$REPO/docs" "$CONTAINER$DEST/"
+incus exec "$CONTAINER" -- chown -R "$CUSER:$CUSER" "$DEST"
 
-# Create systemd user unit directory
-incus exec "$CONTAINER" -- su -l roundhouse -c 'mkdir -p ~/.config/systemd/user'
+# The fake engine must be reachable under a name that starts with "llama-server":
+# unit selection (D1) and engine detection both key off the ExecStart basename, so a
+# script called fake-llama-server.py would be parsed as "not ours" / unknown engine.
+echo "-- installing fake engine as llama-server-fake"
+incus exec "$CONTAINER" -- install -m 0755 -o "$CUSER" -g "$CUSER" \
+    "$DEST/mvp1/scripts/fake-llama-server.py" "$DEST/mvp1/scripts/llama-server-fake"
 
-# Copy fixtures and rewrite ExecStart to use fake-llama-server.py
-echo "Installing fixture units..."
-FIXTURES_DIR="docs/fixtures"
+echo "-- generating fixture-copy units"
+incus exec "$CONTAINER" --env "DEST=$DEST" --env "CHOME=$CHOME" --env "CUSER=$CUSER" \
+    -- python3 - <<'PYEOF'
+import os, shutil, sys
 
-if [ ! -d "$FIXTURES_DIR" ]; then
-    echo "Error: $FIXTURES_DIR directory not found"
-    exit 1
-fi
+DEST  = os.environ['DEST']
+CHOME = os.environ['CHOME']
+CUSER = os.environ['CUSER']
+sys.path.insert(0, DEST + '/mvp1')
+import roundhouse
 
-# Copy a few representative fixtures for testing
-for fixture in qwen3.6-coding.service llama-server-gemma4-q4km.service llama-task.service; do
-    if [ -f "$FIXTURES_DIR/$fixture" ]; then
-        # Read the fixture
-        FIXTURE_PATH="$FIXTURES_DIR/$fixture"
+FIX   = DEST + '/docs/fixtures'
+UNITS = CHOME + '/.config/systemd/user'
+FAKE  = DEST + '/mvp1/scripts/llama-server-fake'
 
-        # Create unit on container with modified ExecStart
-        incus exec "$CONTAINER" -- su -l roundhouse -c "cat > ~/.config/systemd/user/$fixture" << 'UNITEOF'
-[Unit]
-Description=Test llama-server (via fake)
-After=network.target
+# (fixture, Environment= to inject, extra [Service] directives)
+SCENARIOS = [
+    ('qwen3.6-coding.service',           {'FAKE_LOAD_SECONDS': '15'}, []),
+    ('llama-server-qwen35-npu.service',  {'FAKE_LOAD_SECONDS': '5'},  []),
+    ('llama-task.service',               {'FAKE_LOAD_SECONDS': '3'},  []),
+    ('llama-server-gemma4-q4km.service', {'FAKE_EXIT_1': '1'},
+     ['Restart=on-failure', 'RestartSec=2']),
+]
+VERBATIM = ['mixperten.service']          # RETIRED render; never enabled, never started
 
-[Service]
-Type=simple
-ExecStart=/usr/bin/python3 ROUNDHOUSE_PATH/mvp1/scripts/fake-llama-server.py -m test.gguf --port PORT
-Restart=on-failure
-RestartSec=5
+os.makedirs(UNITS, exist_ok=True)
+model_paths, workdirs = set(), set()
 
-[Install]
-WantedBy=default.target
-UNITEOF
+for name, env, extra in SCENARIOS:
+    src = os.path.join(FIX, name)
+    raw = open(src, 'rb').read()
+    unit = roundhouse.parse_unit(src, raw)
 
-        # This is a simplified version; a real implementation would parse and properly rewrite
-        echo "  Installed $fixture (simplified)"
-    fi
-done
+    tok = unit.exec_start.engine_argv[0]
+    out = raw[:tok.start] + FAKE.encode() + raw[tok.end:]
 
-# Daemon reload and install roundhouse.service
-echo "Installing roundhouse.service..."
-incus exec "$CONTAINER" -- su -l roundhouse -c "mkdir -p ~/.config/systemd/user"
-incus exec "$CONTAINER" -- su -l roundhouse -c "cat > ~/.config/systemd/user/roundhouse.service" << 'SERVICEEOF'
-[Unit]
-Description=Roundhouse — read-only roster server
-Documentation=https://docs.boltzmann.local/roundhouse
-After=network.target
+    inject = [f'Environment={k}={v}' for k, v in env.items()] + list(extra)
+    marker = b'[Service]\n'
+    i = out.index(marker) + len(marker)
+    out = out[:i] + ('\n'.join(inject) + '\n').encode() + out[i:]
 
-[Service]
-Type=simple
-ExecStart=/usr/bin/python3 ROUNDHOUSE_PATH/mvp1/roundhouse.py --serve --unit-dir %h/.config/systemd/user
-Restart=on-failure
-RestartSec=5
+    open(os.path.join(UNITS, name), 'wb').write(out)
+    print(f'  {name}: engine -> llama-server-fake, {" ".join(inject) or "no extra env"}')
 
-[Install]
-WantedBy=default.target
-SERVICEEOF
+    profile = roundhouse.extract_param_profile(unit.exec_start.engine_argv)
+    if profile.get('model_path'):
+        model_paths.add(profile['model_path'])
+    if unit.known.get('workingdirectory'):
+        workdirs.add(unit.known['workingdirectory'])
 
-# Reload and start
-echo "Starting roundhouse service..."
-incus exec "$CONTAINER" -- su -l roundhouse -c 'systemctl --user daemon-reload'
-incus exec "$CONTAINER" -- su -l roundhouse -c 'systemctl --user enable roundhouse.service'
-incus exec "$CONTAINER" -- su -l roundhouse -c 'systemctl --user start roundhouse.service'
+for name in VERBATIM:
+    shutil.copyfile(os.path.join(FIX, name), os.path.join(UNITS, name))
+    print(f'  {name}: installed verbatim (never enabled, never started)')
 
-echo "Setup complete. Roundhouse should be running on the container."
-echo "Access at: http://<container-ip>:8090"
+# Stand-in model files so host_artifact.exists / file_id are real, and the
+# WorkingDirectory= paths the fixtures declare, so the units can actually start.
+for d in workdirs:
+    os.makedirs(d, exist_ok=True)
+for p in model_paths:
+    os.makedirs(os.path.dirname(p), exist_ok=True)
+    if not os.path.exists(p):
+        with open(p, 'wb') as f:
+            f.truncate(1 << 20)
+    print(f'  stand-in model: {p}')
+
+for root, dirs, files in os.walk(CHOME + '/.config'):
+    for n in dirs + files:
+        shutil.chown(os.path.join(root, n), CUSER, CUSER)
+PYEOF
+
+echo "-- reloading and arming the :8086 pair"
+incus exec "$CONTAINER" -- su -l "$CUSER" -c 'systemctl --user daemon-reload'
+# llama-task enabled + running is one half of the :8086 collision; the other half
+# (llama-server-qwen35-npu) stays disabled behind its kernel gate. Nothing else is
+# enabled: qwen3.6-coding is started by hand during the drill, gemma4-q4km is the
+# crash-loop scenario, mixperten must never run.
+incus exec "$CONTAINER" -- su -l "$CUSER" -c 'systemctl --user enable --now llama-task.service'
+
+echo
+echo "-- installed units"
+incus exec "$CONTAINER" -- su -l "$CUSER" -c 'systemctl --user list-unit-files --no-pager | grep -E "llama|qwen|mixpert" || true'
+echo
+echo "Setup complete. Start Roundhouse in the container with:"
+echo "  incus exec $CONTAINER -- su -l $CUSER -c \\"
+echo "    'nohup python3 $DEST/mvp1/roundhouse.py --serve --port 8090 >/tmp/roundhouse.log 2>&1 &'"
+echo "Then, from the host: curl http://127.0.0.1:8090/api/units"
