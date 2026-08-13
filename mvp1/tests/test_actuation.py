@@ -3981,12 +3981,17 @@ class TestEnablementRoutes(unittest.TestCase):
 
     def test_enablement_422_enable_collision(self):
         """POST with port collision returns 422 enable_collision."""
+        # The mock must mirror what enablement_preflight ACTUALLY returns (G3): the frozen
+        # fail string lives on the failing check row, NOT at the top level. A mock carrying
+        # a top-level 'detail' let the handler ship `"detail": ""` to real clients while
+        # this test stayed green.
+        collision_detail = 'port 8085 is already a boot claim of: other.service (enabled, READY)'
         with patch.object(roundhouse, 'enablement_preflight') as mock_pf:
             mock_pf.return_value = {
                 'ok': False,
+                'checks': [{'ok': False, 'check': 'retired', 'detail': collision_detail}],
                 'port': 8085,
                 'claimants': [{'unit': 'other.service', 'enabled': True, 'rung': 'READY', 'port': 8085, 'gate': None}],
-                'detail': 'port 8085 is already a boot claim of: other.service (enabled, READY)'
             }
 
             status, body = self.post_http(
@@ -3998,13 +4003,65 @@ class TestEnablementRoutes(unittest.TestCase):
             payload = json.loads(body)
             self.assertEqual(payload.get('error'), 'enable_collision')
             self.assertIn('claimants', payload)
+            self.assertEqual(payload.get('port'), 8085)
+            self.assertEqual(payload.get('detail'), collision_detail,
+                             'the frozen G3 fail string must reach the client — the UI toast '
+                             'renders it and an empty detail names no claimant')
+
+    def test_enablement_422_detail_from_real_preflight(self):
+        """End-to-end: the REAL preflight's frozen G3 fail string reaches the client.
+
+        The mocked-preflight legs above cannot catch a handler that reads the detail off
+        the wrong key — they assert against a shape the mock itself supplies. This one
+        runs enablement_preflight for real, which is how the empty-`detail` bug survived
+        a green suite and surfaced only in the container drill.
+        """
+        import copy
+        base = self.watcher.snapshot.return_value
+
+        # Leg 1 — collision: another enabled, non-retired unit already claims :8085.
+        colliding = copy.deepcopy(base)
+        colliding['units'].append({
+            'unit': 'other.service', 'rung': 'READY', 'retired': False, 'enabled': True,
+            'port': 8085, 'mem': {}, 'badges': [], 'strategy_note': None, 'gate': None,
+        })
+        self.watcher.snapshot.return_value = colliding
+        try:
+            status, body = self.post_http(
+                '/api/units/qwen3.6-coding.service/enablement',
+                {'enabled': True},
+                {'Authorization': 'Bearer test-token'})
+            self.assertEqual(status, 422)
+            payload = json.loads(body)
+            self.assertEqual(payload.get('error'), 'enable_collision')
+            self.assertEqual(payload.get('port'), 8085)
+            self.assertTrue(
+                payload.get('detail', '').startswith('port 8085 is already a boot claim of:'),
+                f"detail must carry the frozen G3 string, got {payload.get('detail')!r}")
+            self.assertIn('other.service', payload['detail'])
+
+            # Leg 2 — retired target: the other 422 branch, same detail plumbing.
+            retired = copy.deepcopy(base)
+            retired['units'][0]['retired'] = True
+            self.watcher.snapshot.return_value = retired
+            status, body = self.post_http(
+                '/api/units/qwen3.6-coding.service/enablement',
+                {'enabled': True},
+                {'Authorization': 'Bearer test-token'})
+            self.assertEqual(status, 422)
+            payload = json.loads(body)
+            self.assertEqual(payload.get('error'), 'preflight_failed')
+            self.assertIn('RETIRED', payload.get('detail', ''))
+        finally:
+            self.watcher.snapshot.return_value = base
 
     def test_enablement_422_retired(self):
         """POST on retired unit returns 422 preflight_failed."""
+        retired_detail = 'unit is [RETIRED] — structurally excluded from every actuation path'
         with patch.object(roundhouse, 'enablement_preflight') as mock_pf:
             mock_pf.return_value = {
                 'ok': False,
-                'detail': 'unit is [RETIRED]'
+                'checks': [{'ok': False, 'check': 'retired', 'detail': retired_detail}],
             }
 
             status, body = self.post_http(
@@ -4015,6 +4072,7 @@ class TestEnablementRoutes(unittest.TestCase):
             self.assertEqual(status, 422)
             payload = json.loads(body)
             self.assertEqual(payload.get('error'), 'preflight_failed')
+            self.assertEqual(payload.get('detail'), retired_detail)
 
 
 class TestEnablementSlotless(unittest.TestCase):

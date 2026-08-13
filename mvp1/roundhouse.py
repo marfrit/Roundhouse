@@ -2464,22 +2464,27 @@ class RoundhouseRequestHandler(http.server.BaseHTTPRequestHandler):
         snap = locked_snapshot(watcher)
         pf = enablement_preflight(unit_name, enabled, snap, watcher.units, self.server.port)
         if not pf['ok']:
+            # G3 puts the frozen fail string on the failing CHECK ROW (the edit route's
+            # shape), not at the top level — reading only pf['detail'] shipped an empty
+            # `detail` to the client and an explanation-less toast to the UI.
+            detail = pf.get('detail') or next(
+                (c.get('detail', '') for c in pf.get('checks', []) if not c.get('ok')), '')
             self.send_response(422)
             self.send_header('Content-Type', 'application/json; charset=utf-8')
             self.end_headers()
-            if pf.get('port'):
+            if pf.get('claimants'):
                 # enable_collision
                 response = {
                     'error': 'enable_collision',
-                    'port': pf['port'],
-                    'claimants': pf.get('claimants', []),
-                    'detail': pf.get('detail', '')
+                    'port': pf.get('port'),
+                    'claimants': pf['claimants'],
+                    'detail': detail
                 }
             else:
                 # preflight_failed (e.g., retired)
                 response = {
                     'error': 'preflight_failed',
-                    'detail': pf.get('detail', '')
+                    'detail': detail
                 }
             self.wfile.write(json.dumps(response).encode('utf-8'))
             return
@@ -3324,7 +3329,12 @@ Roundhouse never runs `git init` itself. Initialize it as the operator, once:
   git init
   printf '%s\\n' '*.bak*' '*.roundhouse-tmp' > .gitignore
   git add .gitignore {unit_names}
-  git commit -m "roundhouse baseline: {len(units)} managed units"
+  git -c user.name=roundhouse -c user.email="roundhouse@$(hostname)" \\
+      commit -m "roundhouse baseline: {len(units)} managed units"
+
+(The -c identity flags matter on a fresh host: without a configured user.email
+git refuses to commit, and --actuate can never arm. Roundhouse's own commits
+carry the same identity via GIT_AUTHOR_*/GIT_COMMITTER_*.)
 
 Then relaunch with --actuate.""", file=sys.stderr)
 

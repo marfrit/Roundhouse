@@ -170,9 +170,15 @@ echo "Setup complete."
 echo
 echo "FOR MVP4 DRILLS (with --actuate enabled by default):"
 echo "1. Initialize the git repo in the container (execute as $CUSER in the container unit dir):"
-echo "   incus exec $CONTAINER -- su -l $CUSER -c 'cd ~/.config/systemd/user && git init && printf \"%s\\n\" \"*.bak*\" \"*.roundhouse-tmp\" > .gitignore && git add .gitignore qwen3.6-coding.service llama-server-qwen35-npu.service llama-task.service llama-server-gemma4-q4km.service mixperten.service roundhouse.service && git commit -m \"roundhouse baseline: 5 managed units + self\"'"
+echo "   incus exec $CONTAINER -- su -l $CUSER -c 'cd ~/.config/systemd/user && git init && printf \"%s\\n\" \"*.bak*\" \"*.roundhouse-tmp\" > .gitignore && git add .gitignore qwen3.6-coding.service llama-server-qwen35-npu.service llama-task.service llama-server-gemma4-q4km.service mixperten.service roundhouse.service && git -c user.name=roundhouse -c user.email=roundhouse@\$(hostname) commit -m \"roundhouse baseline: 5 managed units + self\"'"
+echo "   (the -c identity flags are load-bearing: a fresh container has no git identity,"
+echo "    git refuses the commit, and --actuate then never arms)"
 echo
-echo "2. Start roundhouse.service and daemon-reload:"
+echo "2. Retire any hand-started process, then enable the unit (it owns :8090 from now on):"
+echo "   incus exec $CONTAINER -- su -l $CUSER -c \\"
+echo "     \"pkill -u $CUSER -f '[r]oundhouse.py --serve' || true\""
+echo "   (the [r] bracket is load-bearing: a plain -f 'roundhouse.py --serve' pattern also"
+echo "    matches the su/bash wrapper carrying it, so pkill SIGTERMs its own shell)"
 echo "   incus exec $CONTAINER -- su -l $CUSER -c \\"
 echo "     'systemctl --user daemon-reload && systemctl --user enable --now roundhouse.service'"
 echo
