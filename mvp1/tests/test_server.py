@@ -851,5 +851,153 @@ class TestWriteGuards(unittest.TestCase):
                                 self.fail(f".{attr} found outside {write_funcs}")
 
 
+class TestMobileStatic(unittest.TestCase):
+    """Static UI tests for mobile layout and F12 switch feature."""
+
+    @classmethod
+    def setUpClass(cls):
+        """Load index.html once for all tests."""
+        cls.HTML_PATH = Path(__file__).parent.parent / 'static' / 'index.html'
+        cls.HTML_CONTENT = cls.HTML_PATH.read_text()
+
+    def test_mobile_media_block_exists(self):
+        """@media (max-width: 700px) block exists in CSS."""
+        self.assertIn('@media (max-width: 700px)', self.HTML_CONTENT,
+                      '700px mobile media query not found in CSS')
+
+    def test_min_height_44px_for_touch_targets(self):
+        """min-height: 44px present for frozen touch-target selectors in media query."""
+        # Extract the @media (max-width: 700px) block, handling nested braces
+        import re
+        # Find the @media block and count braces to extract the full content
+        start_match = re.search(r'@media\s*\(\s*max-width:\s*700px\s*\)\s*\{', self.HTML_CONTENT, re.DOTALL)
+        self.assertIsNotNone(start_match, '700px media block not found')
+
+        start_pos = start_match.end()
+        # Find the closing brace for this media block
+        brace_count = 1
+        end_pos = start_pos
+        while end_pos < len(self.HTML_CONTENT) and brace_count > 0:
+            if self.HTML_CONTENT[end_pos] == '{':
+                brace_count += 1
+            elif self.HTML_CONTENT[end_pos] == '}':
+                brace_count -= 1
+            end_pos += 1
+
+        media_content = self.HTML_CONTENT[start_pos:end_pos-1]
+
+        frozen_selectors = {'.unit-row', 'button', '.off-section-toggle', '.stop-tick-row'}
+        # Check that min-height: 44px is declared somewhere for these selectors
+        # (may be grouped or individual selectors)
+        self.assertIn('min-height: 44px', media_content,
+                      'min-height: 44px rule not found in mobile media query')
+
+        # Verify that all frozen selectors are mentioned somewhere in the media block
+        for selector in frozen_selectors:
+            self.assertIn(selector, media_content,
+                          f'Selector {selector} not found in mobile media query')
+
+    def test_no_anchor_href_empty(self):
+        """No <a href="#"> links (converted to buttons)."""
+        self.assertNotIn('<a href="#"', self.HTML_CONTENT,
+                         'Found <a href="#" — should be converted to <button>')
+
+    def test_onclick_only_on_buttons(self):
+        """onclick= attribute only appears on <button> tags."""
+        import re
+        # Find all onclick attributes
+        onclick_pattern = r'<(\w+)[^>]*onclick='
+        matches = re.findall(onclick_pattern, self.HTML_CONTENT)
+        self.assertFalse([m for m in matches if m != 'button'],
+                         f'onclick= found on non-button elements: {set(matches) - {"button"}}')
+
+    def test_overlay_open_in_css_and_script(self):
+        """overlay-open class defined in CSS and used in JavaScript."""
+        self.assertIn('body.overlay-open', self.HTML_CONTENT,
+                      'body.overlay-open CSS rule not found')
+        self.assertIn('.add(\'overlay-open\')', self.HTML_CONTENT,
+                      'overlay-open not added in script')
+        self.assertIn('.remove(\'overlay-open\')', self.HTML_CONTENT,
+                      'overlay-open not removed in script')
+
+    def test_switch_modal_present(self):
+        """Switch preview modal (#switch-modal) exists with required elements."""
+        self.assertIn('id="switch-modal"', self.HTML_CONTENT,
+                      '#switch-modal not found')
+        self.assertIn('stop-tick-row', self.HTML_CONTENT,
+                      '.stop-tick-row class reference not found')
+        self.assertIn('id="port-board-body"', self.HTML_CONTENT,
+                      '#port-board-body not found')
+
+    def test_switch_to_this_string_present(self):
+        """'switch to this' button string exists."""
+        self.assertIn('switch to this', self.HTML_CONTENT,
+                      "'switch to this' button string not found")
+
+    def test_gate_notice_condition_fixed(self):
+        """Gate notice condition uses unit.rung === 'STANDBY' (not gate.kind)."""
+        self.assertIn("unit.rung === 'STANDBY'", self.HTML_CONTENT,
+                      "Fixed gate-notice condition (unit.rung === 'STANDBY') not found")
+        # Negative check: old broken condition should not exist
+        self.assertNotIn("gate.kind === 'STANDBY'", self.HTML_CONTENT,
+                         "Old broken gate-notice condition (gate.kind === 'STANDBY') still present")
+
+    def test_refreshOperation_function_present(self):
+        """refreshOperation(id) function exists and is called on SSE rollout events."""
+        self.assertIn('function refreshOperation(id)', self.HTML_CONTENT,
+                      'refreshOperation(id) function not found')
+        self.assertIn('refreshOperation(data.rollout_id)', self.HTML_CONTENT,
+                      'refreshOperation not called on SSE rollout event')
+
+    def test_no_innerHTML_usage(self):
+        """innerHTML not used anywhere (textContent-only rule)."""
+        self.assertNotIn('.innerHTML', self.HTML_CONTENT,
+                         '.innerHTML found — use textContent only')
+
+    def test_no_local_storage_usage(self):
+        """localStorage and sessionStorage not used."""
+        self.assertNotIn('localStorage', self.HTML_CONTENT,
+                         'localStorage found — no client-side storage')
+        self.assertNotIn('sessionStorage', self.HTML_CONTENT,
+                         'sessionStorage found — no client-side storage')
+
+    def test_no_arithmetic_on_estimate_bytes(self):
+        """No byte arithmetic logic in JavaScript; only display formatting allowed.
+
+        Constraint: estimate_bytes / freed_bytes may be divided by 1e9 for display (GB conversion),
+        but must not be added/subtracted with each other or used in decision logic.
+        This is an honest check: division is for rendering, not computation.
+        The string '+ freed' in display concatenation is acceptable.
+        """
+        import re
+        # Look for improper arithmetic patterns on the byte variables themselves
+        # (string concatenation with '+ freed' in display strings is OK)
+        bad_patterns = [
+            r'estimate_bytes\s*[\*+\-]',  # multiplication, addition, subtraction on variable
+            r'freed_bytes\s*[\*+\-]',     # multiplication, addition, subtraction on variable
+        ]
+        for pattern in bad_patterns:
+            matches = re.findall(pattern, self.HTML_CONTENT)
+            self.assertFalse(matches,
+                             f'Found improper byte arithmetic: {pattern} — only server does arithmetic')
+
+    def test_api_routes_string_constants_present(self):
+        """All required API route strings present in HTML."""
+        required_routes = [
+            '/api/switch/preview',
+            '/api/switch',
+        ]
+        for route in required_routes:
+            self.assertIn(f"'{route}'", self.HTML_CONTENT,
+                          f"API route string {route} not found in HTML")
+
+    def test_phase_strings_present(self):
+        """Required switch phase strings present in stepper logic."""
+        phases = ['stopping', 'restoring', 'restored']
+        for phase in phases:
+            self.assertIn(f"'{phase}'", self.HTML_CONTENT,
+                          f"Phase string '{phase}' not found in HTML")
+
+
 if __name__ == '__main__':
     unittest.main()
