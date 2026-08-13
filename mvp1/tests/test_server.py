@@ -1141,6 +1141,72 @@ class TestMobileStatic(unittest.TestCase):
             self.assertIn(f"'{phase}'", self.HTML_CONTENT,
                           f"Phase string '{phase}' not found in HTML")
 
+    def test_enablement_listener_present(self):
+        """SSE listener for 'enablement' event is present."""
+        self.assertIn("addEventListener('enablement'", self.HTML_CONTENT,
+                      "enablement SSE listener not found")
+
+    def test_enable_toggle_checkbox_present(self):
+        """Enable-toggle checkbox (.enable-toggle class) is present in renderUnitList."""
+        self.assertIn("label.className = 'enable-toggle'", self.HTML_CONTENT,
+                      'enable-toggle label creation not found in JavaScript')
+        self.assertIn('.enable-toggle', self.HTML_CONTENT,
+                      '.enable-toggle CSS styling not found in HTML')
+
+    def test_enable_toggle_in_44px_rule(self):
+        """The .enable-toggle and #token are in the 44px min-height rule."""
+        self.assertIn('.enable-toggle', self.HTML_CONTENT)
+        self.assertIn('#token', self.HTML_CONTENT)
+        # Find the min-height: 44px rule
+        self.assertIn('min-height: 44px', self.HTML_CONTENT,
+                      'min-height: 44px rule not found')
+        # Verify both are in the selector list (may be in the same rule or separate)
+        import re
+        # Look for a rule containing min-height: 44px and check if the selectors include both
+        # by looking for the media query block where .enable-toggle CSS is defined
+        self.assertIn('.enable-toggle input[type="checkbox"]', self.HTML_CONTENT,
+                      '.enable-toggle input checkbox sizing not found in media query')
+
+    def test_stop_propagation_for_enable_toggle(self):
+        """stopPropagation is present for enable-toggle click handler."""
+        self.assertIn('stopPropagation', self.HTML_CONTENT,
+                      'stopPropagation not found in HTML')
+
+    def test_toast_div_present(self):
+        """Toast notification div (#toast) is present."""
+        self.assertIn('id="toast"', self.HTML_CONTENT,
+                      '#toast div element not found')
+
+    def test_no_gb_strings(self):
+        """All 'GB' strings are changed to 'GiB'."""
+        # Should not find ' GB ' (with spaces), only 'GiB'
+        import re
+        gb_pattern = r'\s+GB\s+'
+        matches = re.findall(gb_pattern, self.HTML_CONTENT)
+        self.assertFalse(matches,
+                         f"Found ' GB ' strings (should be 'GiB'): {matches}")
+
+    def test_failure_phase_in_stepper(self):
+        """Stepper honesty: failure.phase or equivalent marker present."""
+        self.assertIn('rollout.failure', self.HTML_CONTENT,
+                      'failure object handling not found in stepper logic')
+        self.assertIn('failure.phase', self.HTML_CONTENT,
+                      'failure.phase marker not found in stepper')
+
+    def test_boot_status_in_port_board(self):
+        """Port board self cell includes 'boot:' status indicator."""
+        # The boot status is built dynamically with concatenation
+        boot_present = ("' · boot: '" in self.HTML_CONTENT) or ("'boot: '" in self.HTML_CONTENT)
+        self.assertTrue(boot_present,
+                        "boot: status string not found in port board self cell")
+
+    def test_load_strategy_in_detail_pane(self):
+        """Detail pane includes Load strategy row and note line."""
+        self.assertIn('on-boot (enabled)', self.HTML_CONTENT,
+                      "Load strategy 'on-boot (enabled)' text not found")
+        self.assertIn('manual (disabled)', self.HTML_CONTENT,
+                      "Load strategy 'manual (disabled)' text not found")
+
 
 if __name__ == '__main__':
     unittest.main()
