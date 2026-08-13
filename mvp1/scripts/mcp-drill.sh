@@ -244,7 +244,7 @@ check('operation_status of an unknown id is data, not an error',
 # A typo'd unit name hits the text/plain 404 path -> the I2 `raw` fallback.
 typo, err = mcp.call('unit_detail', {'unit': 'definitely-not-a-unit.service'})
 check('unit_detail of a typo survives the text/plain 404',
-      not err and typo.get('http_status') in (404, 200), str(typo)[:120])
+      not err and typo.get('http_status') == 404 and 'raw' in typo, str(typo)[:120])
 
 # ===================== ACTION LEG =====================
 if RUN_ACTIONS:

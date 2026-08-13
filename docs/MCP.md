@@ -118,28 +118,26 @@ Or set the env var in Claude Code's `.mcp.json`:
 #### 3. `port_board`
 **Description:** Port claim board: every claimed port with claimants, conflict class, and Roundhouse's own port.
 
-**Example Result (excerpt):**
+**Example Result (excerpt — real captured shape: `ports` is a LIST; entries carry `claims` and `class`):**
 ```json
 {
   "http_status": 200,
-  "ports": {
-    "8085": {
-      "claimants": [
-        {"unit": "qwen3.6-coding.service", "enabled": true, "retired": false},
-        {"unit": "mixperten.service", "enabled": false, "retired": true}
+  "ports": [
+    {
+      "port": 8086,
+      "claims": [
+        {"unit": "llama-task.service", "enabled": true, "rung": "READY", "retired": false, "gate": null},
+        {"unit": "llama-server-qwen35-npu.service", "enabled": false, "rung": "STANDBY", "retired": false,
+         "gate": {"kind": "kernel", "wants": "6.1.75-npu-port"}}
       ],
-      "conflict": "disabled_retired"
-    },
-    "8086": {
-      "claimants": [
-        {"unit": "llama-task.service", "enabled": true, "retired": false},
-        {"unit": "llama-server-qwen35-npu.service", "enabled": false, "retired": false}
-      ],
-      "conflict": "unguarded"
+      "class": "armed",
+      "note": "harmless only while BOTH the disable and the kernel gate hold"
     }
-  }
+  ],
+  "self": {"port": 8090, "claims_by_units": []}
 }
 ```
+`class` is one of `active` (≥2 runtime-active claimants — red), `armed` (enabled or gate-blocked pair), `latent` (everything else).
 
 #### 4. `deployments`
 **Description:** Deployment records: artifact, engine, param profile, load strategy, roster state, memory, per unit.
@@ -270,7 +268,7 @@ Or set the env var in Claude Code's `.mcp.json`:
 }
 ```
 
-**Note:** `requester` defaults to `mcp:<client name from initialize>`.
+**Note:** `requester` defaults to `mcp-<client name from initialize>`.
 
 #### 14. `warm_cancel`
 **Description:** Cancel the parked warm request, if any.
@@ -333,10 +331,10 @@ When an action hits a preflight guard, Roundhouse returns a **structured refusal
   "error": "enable_collision",
   "port": 8086,
   "claimants": [
-    {"unit": "llama-task.service", "enabled": true, "rung": "READY", "alias": "llama-task"},
-    {"unit": "llama-server-qwen35-npu.service", "enabled": false, "rung": "STANDBY", "gate": "kernel 6.1.75-npu-port"}
+    {"unit": "llama-task.service", "alias": "task-qwen2.5-3b", "port": 8086,
+     "rung": "READY", "enabled": true, "gate": null}
   ],
-  "detail": "port 8086 is held by a running unit; disable llama-task.service first or choose a different port"
+  "detail": "port 8086 is already a boot claim of: llama-task.service (enabled, READY)"
 }
 ```
 
@@ -487,3 +485,13 @@ Two fixture rules the drill cannot check for you:
 - `--warm-unit` must be marked on-demand and inactive. The drill fires it while the
   switch still holds the operation slot, so the request parks (202 `queued`) instead of
   starting a second switch — that park is what `warm_state` and `warm_cancel` then act on.
+
+## Error Taxonomy (the isError line)
+
+| situation | isError | result content |
+|---|---|---|
+| HTTP 2xx and 4xx (including 401/403/422 refusals) | `false` | the response body as JSON with `http_status` injected — refusals are DATA for the agent to reason about |
+| HTTP 5xx | `true` | the body (or `{"http_status", "raw"}` for non-JSON) |
+| transport failure (connection refused, timeout, DNS) | `true` | `{"error": "roundhouse_unreachable", "url": "...", "detail": "..."}` |
+| no token + action tool | `false` | `{"http_status": null, "error": "no_token", "hint": "..."}` — decided client-side, no HTTP request is made |
+

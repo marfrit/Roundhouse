@@ -780,14 +780,23 @@ class TestZeroWriteGuard(unittest.TestCase):
                 self.assertIn(node.module, allowed, f"Disallowed import: {node.module}")
 
     def test_no_os_destructive_calls(self):
-        """os.remove/rename/mkdir/etc. don't appear."""
-        forbidden_attrs = {'remove', 'rename', 'unlink', 'mkdir', 'makedirs', 'rmdir', 'chmod', 'replace'}
+        """I9(b) in full: no destructive/process/write-capable os attributes.
+
+        MVP6 review F1: the original set covered filesystem mutation only —
+        os.system/os.popen/os.exec*/os.spawn*/os.open/os.fdopen all slipped
+        every guard (os is on the import allowlist and the open-counter only
+        sees bare open() Names)."""
+        forbidden_attrs = {'remove', 'rename', 'unlink', 'mkdir', 'makedirs', 'rmdir',
+                           'chmod', 'replace', 'system', 'popen', 'open', 'fdopen'}
+        forbidden_prefixes = ('exec', 'spawn')
         with open(Path(__file__).resolve().parent.parent / 'roundhouse_mcp.py', 'r') as f:
             tree = ast.parse(f.read())
         for node in ast.walk(tree):
             if isinstance(node, ast.Attribute):
                 if isinstance(node.value, ast.Name) and node.value.id == 'os':
                     self.assertNotIn(node.attr, forbidden_attrs, f"Forbidden os.{node.attr}")
+                    self.assertFalse(node.attr.startswith(forbidden_prefixes),
+                                     f"Forbidden os.{node.attr}")
 
     def test_only_one_open_call(self):
         """Only one open() call (token file read)."""
@@ -1009,10 +1018,32 @@ class TestRefusalFidelity(unittest.TestCase):
     Tests that each refusal class surfaces the COMPLETE response body in the tool result,
     field-for-field equal to a direct HTTP call, plus injected http_status.
     isError is asserted false for refusals (they are structured returns, not crashes).
+
+    MVP6 review F7: every test here targets a PRE-actuation refusal, but if a
+    refusal ever regresses, the request would fall through to real systemctl on
+    the build box before the assertion reds. setUp arms forbidding gateways so
+    a regression fails loudly instead of actuating.
     """
 
     HOST = 'testhost'
     ADVERTISE = 'advertise.example'
+
+    def setUp(self):
+        import roundhouse as _rh
+        self._gw_patches = [
+            unittest.mock.patch.object(
+                _rh, 'run_actuate',
+                side_effect=AssertionError('refusal regressed: run_actuate reached')),
+            unittest.mock.patch.object(
+                _rh, 'run_git',
+                side_effect=AssertionError('refusal regressed: run_git reached')),
+            unittest.mock.patch.object(
+                _rh, '_atomic_write',
+                side_effect=AssertionError('refusal regressed: _atomic_write reached')),
+        ]
+        for p in self._gw_patches:
+            p.start()
+            self.addCleanup(p.stop)
 
     @classmethod
     def setUpClass(cls):

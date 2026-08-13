@@ -581,6 +581,13 @@ def handle_message(msg, conn_state) -> dict or None:
 
     msg_id = msg.get('id')
     method = msg.get('method')
+    # JSON-RPC 2.0: a request without an id is a NOTIFICATION and must never be
+    # answered — for KNOWN methods too, not just the notifications/* namespace
+    # (MVP6 review F6: known-method notifications were answered with id: null).
+    if 'id' not in msg:
+        # Still honor side effects that matter (none today: initialize without
+        # an id is not something real MCP clients send; state capture is skipped).
+        return None
     # `params: null` is legal JSON-RPC; `.get('params', {})` returns None for it, and
     # every downstream membership test would then raise -> -32603. I11 says tolerate.
     params = msg.get('params') or {}
