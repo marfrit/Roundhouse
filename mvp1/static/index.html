@@ -659,6 +659,13 @@
             margin-left: 0.5em;
         }
 
+        .origin-tag {
+            display: inline-block;
+            font-size: 0.8em;
+            color: var(--neutral);
+            margin-left: 0.5em;
+        }
+
         .kernel-wrap {
             display: contents;
         }
@@ -1121,6 +1128,9 @@
                 if (unit.strategy_note) {
                     detail += ' · ' + unit.strategy_note;
                 }
+                if (unit.on_demand) {
+                    detail += ' · on-demand';
+                }
                 detailSpan.textContent = detail;
                 leftDiv.appendChild(detailSpan);
 
@@ -1448,6 +1458,17 @@
                 row.appendChild(th);
                 td = document.createElement('td');
                 td.textContent = unit.enabled ? 'on-boot (enabled)' : 'manual (disabled)';
+                row.appendChild(td);
+                tbody1.appendChild(row);
+            }
+
+            if (unit.on_demand) {
+                row = document.createElement('tr');
+                th = document.createElement('th');
+                th.textContent = 'Warm-up';
+                row.appendChild(th);
+                td = document.createElement('td');
+                td.textContent = 'on-demand (marker present)';
                 row.appendChild(td);
                 tbody1.appendChild(row);
             }
@@ -1965,6 +1986,14 @@
                 restoringChip.appendChild(icon);
                 restoringChip.appendChild(label);
                 phasesDiv.appendChild(restoringChip);
+            }
+
+            // Add origin tag if warm
+            if (rollout.origin === 'warm') {
+                const originTag = document.createElement('span');
+                originTag.className = 'origin-tag';
+                originTag.textContent = '· warm (' + (rollout.requester || 'token') + ')';
+                phasesDiv.appendChild(originTag);
             }
 
             const detailDiv = document.getElementById('stepper-detail');

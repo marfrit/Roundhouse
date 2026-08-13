@@ -60,14 +60,14 @@ FIX   = DEST + '/docs/fixtures'
 UNITS = CHOME + '/.config/systemd/user'
 FAKE  = DEST + '/mvp1/scripts/llama-server-fake'
 
-# (fixture, Environment= to inject, extra [Service] directives, output_name, port_override)
+# (fixture, Environment= to inject, extra [Service] directives, output_name, port_override, on_demand_marker)
 SCENARIOS = [
-    ('qwen3.6-coding.service',           {'FAKE_LOAD_SECONDS': '15'}, [], None, None),
-    ('llama-server-qwen35-npu.service',  {'FAKE_LOAD_SECONDS': '5'},  [], None, None),
-    ('llama-task.service',               {'FAKE_LOAD_SECONDS': '3'},  [], None, None),
+    ('qwen3.6-coding.service',           {'FAKE_LOAD_SECONDS': '15'}, [], None, None, True),
+    ('llama-server-qwen35-npu.service',  {'FAKE_LOAD_SECONDS': '5'},  [], None, None, False),
+    ('llama-task.service',               {'FAKE_LOAD_SECONDS': '3'},  [], None, None, False),
     ('llama-server-gemma4-q4km.service', {'FAKE_EXIT_1': '1'},
-     ['Restart=on-failure', 'RestartSec=2'], None, None),
-    ('llama-server-gemma4-q4km.service', {'FAKE_LOAD_SECONDS': '10'}, [], 'llama-server-fake-b.service', 8093),
+     ['Restart=on-failure', 'RestartSec=2'], None, None, False),
+    ('llama-server-gemma4-q4km.service', {'FAKE_LOAD_SECONDS': '10'}, [], 'llama-server-fake-b.service', 8093, True),
 ]
 VERBATIM = ['mixperten.service']          # RETIRED render; never enabled, never started
 
@@ -78,6 +78,7 @@ for scenario in SCENARIOS:
     name, env, extra = scenario[0], scenario[1], scenario[2]
     output_name = scenario[3] if len(scenario) > 3 else None
     port_override = scenario[4] if len(scenario) > 4 else None
+    on_demand = scenario[5] if len(scenario) > 5 else False
 
     src = os.path.join(FIX, name)
     raw = open(src, 'rb').read()
@@ -104,12 +105,16 @@ for scenario in SCENARIOS:
     inject = [f'Environment={k}={v}' for k, v in env.items()] + list(extra)
     marker = b'[Service]\n'
     i = out.index(marker) + len(marker)
-    out = out[:i] + ('\n'.join(inject) + '\n').encode() + out[i:]
+
+    # Inject on-demand marker if needed
+    on_demand_line = '# roundhouse: on-demand\n' if on_demand else ''
+    out = out[:i] + (on_demand_line + '\n'.join(inject) + '\n').encode() + out[i:]
 
     unit_file_name = output_name if output_name else name
     open(os.path.join(UNITS, unit_file_name), 'wb').write(out)
     print(f'  {unit_file_name}: engine -> llama-server-fake' +
           (f', port -> {port_override}' if port_override else '') +
+          (', on-demand' if on_demand else '') +
           f', {" ".join(inject) or "no extra env"}')
 
     profile = roundhouse.extract_param_profile(unit.exec_start.engine_argv)
