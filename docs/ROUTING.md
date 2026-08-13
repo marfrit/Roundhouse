@@ -133,7 +133,8 @@ Either `logical` or `unit`, not both. See section 4.5 of the MVP5 spec for the f
 | 200 | `already_queued` | This unit is already pending warm (idempotent) |
 | 202 | `{"rollout_id"}` | Warm-up started; monitor `/api/rollouts/{id}` for progress |
 | 202 | `{"queued": true}` | Queued behind another operation; will fire when slot frees (≤ 3 s) |
-| 404 | `unknown_unit` / `unknown_alias` | Unit/alias does not exist or is retired |
+| 404 | `unknown_unit` / `unknown_alias` | Unit/alias does not exist |
+| 422 | `preflight_failed` | Unit exists but is `[RETIRED]` |
 | 409 | `warm_queue_full` | Different warm already queued; retry after cancel |
 | 422 | `not_on_demand` | Unit is not marked `# roundhouse: on-demand` — consent denied |
 | 422 | `consent_unfittable` | Warming would require stopping unmarked (non-consenting) units |
@@ -156,33 +157,35 @@ def call_model(model_name, request):
         return error_403('Model not available and not marked for warm-up')
     
     # Try to warm
-    while True:
-        warm_resp = POST /api/warm with logical=model_name
-        
-        if warm_resp.status == 200 and warm_resp['status'] == 'already_warm':
-            # Now ready; call it
-            break
-        elif warm_resp.status == 202:
-            # Warming started; poll the rollout or /api/warm until READY
-            while True:
-                state = GET /api/warm
-                if state['pending']['rung'] == 'READY':  # or poll rollout
-                    break
-                sleep(0.1)
-            break
-        elif warm_resp.status == 202 and warm_resp.get('queued'):
-            # Parked; poll until it fires (or GET /api/warm shows it started)
-            while True:
-                state = GET /api/warm
-                if not state.get('pending'):  # Queue fired and cleared
-                    break
-                sleep(0.1)
-            break
-        elif warm_resp.status == 409 or warm_resp.status == 422:
-            # Queue full, not marked, or unfittable: surface to caller
-            return error_service_unavailable(f'Cannot warm {model_name}: {warm_resp}')
-        else:
-            return error_500(f'Unexpected warm response: {warm_resp}')
+    warm_resp = POST /api/warm with logical=model_name
+
+    if warm_resp.status == 200:
+        pass                        # already_warm — fall through and call it
+    elif warm_resp.status == 202 and warm_resp.get('rollout_id'):
+        # Warm switch started: poll the OPERATION, not GET /api/warm
+        # (pending is null once a warm has STARTED; records carry phase, not rung)
+        while True:
+            op = GET /api/rollouts/<warm_resp['rollout_id']>
+            if op['phase'] == 'done': break
+            if op['phase'] in ('failed', 'restore_failed'): return error_503(op)
+            sleep(1)
+    elif warm_resp.status == 202 and warm_resp.get('queued'):
+        # Parked (depth-1 queue). Poll GET /api/warm: when 'pending' clears,
+        # check 'last' — disposition 'started' means it fired (then poll the
+        # model endpoint until it answers); any other disposition (dropped,
+        # cancelled, consent_unfittable) means it will NOT run: surface it.
+        while True:
+            state = GET /api/warm
+            if state['pending'] is None:
+                if state['last'] and state['last'].get('disposition') not in (None, 'started'):
+                    return error_503(state['last'])
+                break
+            sleep(1)
+    elif warm_resp.status in (409, 422):
+        # Queue full / not marked / unfittable: DATA — surface it to the caller
+        return error_service_unavailable(warm_resp.body)
+    else:
+        return error_500(warm_resp.body)
     
     # Now forward the original request
     return forward_to_api_base(model['litellm_params']['api_base'], request)
@@ -263,7 +266,7 @@ The marker means both:
 - **May be started autonomously** by warm requests (no human intervention needed)
 - **May be stopped autonomously** to free memory for other models (symmetric consent)
 
-The always-on trio (`llama-server`, `llama-embed`, `llama-task`) should **remain unmarked** — they are never stopped, and warm requests are forbidden for them.
+The always-on trio (`llama-embed`, `qwen3.6-coding`, `llama-task`) should **remain unmarked** — they are never stopped, and warm requests are forbidden for them.
 
 ### Alternative Syntaxes
 
@@ -281,7 +284,7 @@ The marker can appear on any line, any position (though convention places it nea
 ### Queue Semantics
 
 The warm queue has **depth 1**:
-- While a warm is pending, all new warm requests for any unit go to the queue (not the slot)
+- While a warm is pending, a duplicate request for the SAME unit answers `200 already_queued`; a request for a DIFFERENT unit answers `409 warm_queue_full` — depth is exactly 1, nothing else queues
 - The parked warm fires within ≤ 3 seconds after the slot becomes free
 - A restart clears the queue (in-memory only; no persistence)
 
@@ -290,6 +293,15 @@ The warm queue has **depth 1**:
 If a human initiates a switch while a warm is queued:
 - The human switch claims the slot immediately
 - The queued warm remains parked and fires after the human switch completes
+
+### Failed Warms — two different situations
+
+- **Fire-time drop** (unfittable / cancelled / preflight fail at fire): the queue is
+  cleared, NO slot is held, the disposition lands in `GET /api/warm`'s `last`.
+- **A warm switch that STARTED and then failed**: this is a normal failed switch —
+  it HOLDS the operation slot until a human restores or dismisses it in the UI
+  (or via the operations API). `POST /api/warm/cancel` cancels only a PARKED
+  warm; it can never free a held slot.
 - No cancellation; queues are FIFO (human ops always get priority, but queue survives)
 
 If a warm is queued and a human initiates a *different* warm (different target), use `POST /api/warm/cancel` first:
@@ -328,7 +340,7 @@ Pass `--advertise-host` to override:
 ExecStart=/usr/bin/python3 roundhouse.py --serve --actuate --port 8090 --advertise-host boltzmann.fritz.box
 ```
 
-This affects the `warm-hook` header and all URLs in `model_info.host`/`litellm_params.api_base`.
+This affects the `warm-hook` header and `litellm_params.api_base` URLs only; `model_info.host` is the machine's own hostname regardless.
 
 ### Monitoring
 

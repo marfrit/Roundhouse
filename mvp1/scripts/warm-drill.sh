@@ -38,7 +38,7 @@ TOKEN="${ROUNDHOUSE_TOKEN:-}"
 UNIT_A="qwen3.6-coding.service"
 UNIT_B="llama-server-fake-b.service"
 UNIT_UNMARKED="llama-task.service"
-LOGICAL_B="llama-server-fake-b"
+LOGICAL_B="fake-b"
 
 # Try to read token from file if not set
 if [ -z "$TOKEN" ] && [ -f ~/.config/roundhouse/token ]; then

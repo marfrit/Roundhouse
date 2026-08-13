@@ -5637,3 +5637,32 @@ def _parse_routing_fragment(text):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class TestWarmSlotStealPreservesQueue(unittest.TestCase):
+    """MVP5 review blocker 2 regression: a human slot-claim during the fire
+    window must leave the parked warm PARKED (retry next tick), not silently
+    popped. start_switch's slot check must precede the warm-branch pop."""
+
+    def test_slot_stolen_during_fire_leaves_pending_intact(self):
+        import roundhouse as rh
+        from unittest.mock import MagicMock, patch
+        watcher = MagicMock(spec=rh.Watcher)
+        watcher.lock = threading.Lock()
+        marked = MagicMock()
+        marked.on_demand = True
+        marked.retired = False
+        units = {'b.service': marked}
+        engine = rh.RolloutEngine(watcher, units, '/tmp', 8090,
+                                  rh.EventBus(), watcher.lock)
+        engine.pending_warm = {'seq': 7, 'unit': 'b.service', 'stops': []}
+        engine.warm_seq = 7
+        # a human operation holds the slot
+        engine.current = {'phase': 'watching', 'kind': 'switch', 'rollout': None}
+        with self.assertRaises(rh.ActuationError) as ctx:
+            engine.start_switch('b.service', [], 'confirm', origin='warm',
+                                requester='q', warm_seq=7)
+        self.assertIn('operation_in_progress', str(ctx.exception))
+        # THE assertion: the parked warm survived the refused claim.
+        self.assertIsNotNone(engine.pending_warm)
+        self.assertEqual(engine.pending_warm.get('seq'), 7)

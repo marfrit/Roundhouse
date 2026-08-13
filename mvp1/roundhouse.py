@@ -3209,35 +3209,25 @@ class RoundhouseRequestHandler(http.server.BaseHTTPRequestHandler):
             }).encode('utf-8'))
             return
 
-        # Step 8: Queue gate under lock
+        # Step 8: Queue gate — state transitions under the lock, RESPONSE
+        # WRITES OUTSIDE IT (MVP5 review blocker 1: wfile.write can block on a
+        # slow client; blocking while holding the global lock wedges the server).
+        queue_response = None  # (status, body) decided under the lock
         with watcher.lock:
             if engine.pending_warm is not None:
-                # There's already a pending warm
                 pending_unit = engine.pending_warm.get('unit')
                 if pending_unit == target:
-                    # Dup request
-                    self.send_response(200)
-                    self.send_header('Content-Type', 'application/json; charset=utf-8')
-                    self.end_headers()
-                    self.wfile.write(json.dumps({
+                    queue_response = (200, {
                         'status': 'already_queued',
                         'unit': target,
                         'pending': dict(engine.pending_warm)
-                    }).encode('utf-8'))
-                    return
+                    })
                 else:
-                    # Queue full
-                    self.send_response(409)
-                    self.send_header('Content-Type', 'application/json; charset=utf-8')
-                    self.end_headers()
-                    self.wfile.write(json.dumps({
+                    queue_response = (409, {
                         'error': 'warm_queue_full',
                         'pending': dict(engine.pending_warm)
-                    }).encode('utf-8'))
-                    return
-
-            # Check if slot is free
-            if not _slot_free(engine.current):
+                    })
+            elif not _slot_free(engine.current):
                 # Park the request
                 engine.warm_seq += 1
                 engine.pending_warm = {
@@ -3247,14 +3237,14 @@ class RoundhouseRequestHandler(http.server.BaseHTTPRequestHandler):
                     'requester': requester,
                     'requested_at': time.time()
                 }
-                self.send_response(202)
-                self.send_header('Content-Type', 'application/json; charset=utf-8')
-                self.end_headers()
-                self.wfile.write(json.dumps({
-                    'queued': True,
-                    'unit': target
-                }).encode('utf-8'))
-                return
+                queue_response = (202, {'queued': True, 'unit': target})
+        if queue_response is not None:
+            status, body = queue_response
+            self.send_response(status)
+            self.send_header('Content-Type', 'application/json; charset=utf-8')
+            self.end_headers()
+            self.wfile.write(json.dumps(body).encode('utf-8'))
+            return
 
         # Step 9: Plan warm (slot is free, no pending)
         cgroup_cache = getattr(watcher, '_cgroup_cache', None) or {}
@@ -3326,28 +3316,18 @@ class RoundhouseRequestHandler(http.server.BaseHTTPRequestHandler):
             if 'operation_in_progress' in error_str:
                 # A human claimed the slot between step 8 and here: re-enter step 8's
                 # locked block exactly once (park / dup / full).
+                # State transition under the lock; RESPONSE WRITE OUTSIDE
+                # (MVP5 review blocker 1 — same rule as step 8).
+                reentry = None
                 with watcher.lock:
                     if engine.pending_warm is not None:
                         pending = dict(engine.pending_warm)
                         if pending.get('unit') == target:
-                            self.send_response(200)
-                            self.send_header('Content-Type',
-                                             'application/json; charset=utf-8')
-                            self.end_headers()
-                            self.wfile.write(json.dumps({
-                                'status': 'already_queued',
-                                'unit': target,
-                                'pending': pending
-                            }).encode('utf-8'))
+                            reentry = (200, {'status': 'already_queued',
+                                             'unit': target, 'pending': pending})
                         else:
-                            self.send_response(409)
-                            self.send_header('Content-Type',
-                                             'application/json; charset=utf-8')
-                            self.end_headers()
-                            self.wfile.write(json.dumps({
-                                'error': 'warm_queue_full',
-                                'pending': pending
-                            }).encode('utf-8'))
+                            reentry = (409, {'error': 'warm_queue_full',
+                                             'pending': pending})
                     else:
                         engine.warm_seq += 1
                         engine.pending_warm = {
@@ -3357,13 +3337,12 @@ class RoundhouseRequestHandler(http.server.BaseHTTPRequestHandler):
                             'requester': requester,
                             'requested_at': time.time()
                         }
-                        self.send_response(202)
-                        self.send_header('Content-Type', 'application/json; charset=utf-8')
-                        self.end_headers()
-                        self.wfile.write(json.dumps({
-                            'queued': True,
-                            'unit': target
-                        }).encode('utf-8'))
+                        reentry = (202, {'queued': True, 'unit': target})
+                status, body = reentry
+                self.send_response(status)
+                self.send_header('Content-Type', 'application/json; charset=utf-8')
+                self.end_headers()
+                self.wfile.write(json.dumps(body).encode('utf-8'))
             elif 'warm_consent' in error_str:
                 self.send_json_error(422, 'not_on_demand', str(e))
             else:
@@ -3379,30 +3358,32 @@ class RoundhouseRequestHandler(http.server.BaseHTTPRequestHandler):
 
         watcher = self.server.watcher
 
-        # Cancel under lock
+        # Cancel: state transition under the lock, RESPONSE WRITE OUTSIDE
+        # (MVP5 review blocker 1 — a blocked write here held the global lock).
+        cancelled_unit = None
+        had_pending = False
         with watcher.lock:
-            if engine.pending_warm is None:
-                self.send_json_error(404, 'no_pending', 'no pending warm request')
-                return
-
-            unit = engine.pending_warm.get('unit')
-            requester = engine.pending_warm.get('requester')
-
-            engine.pending_warm = None
-            engine.last_warm = {
-                'unit': unit,
-                'requester': requester,
-                'disposition': 'cancelled',
-                'at': time.time()
-            }
-
-            self.send_response(200)
-            self.send_header('Content-Type', 'application/json; charset=utf-8')
-            self.end_headers()
-            self.wfile.write(json.dumps({
-                'cancelled': True,
-                'unit': unit
-            }).encode('utf-8'))
+            if engine.pending_warm is not None:
+                had_pending = True
+                cancelled_unit = engine.pending_warm.get('unit')
+                requester = engine.pending_warm.get('requester')
+                engine.pending_warm = None
+                engine.last_warm = {
+                    'unit': cancelled_unit,
+                    'requester': requester,
+                    'disposition': 'cancelled',
+                    'at': time.time()
+                }
+        if not had_pending:
+            self.send_json_error(404, 'no_pending', 'no pending warm request')
+            return
+        self.send_response(200)
+        self.send_header('Content-Type', 'application/json; charset=utf-8')
+        self.end_headers()
+        self.wfile.write(json.dumps({
+            'cancelled': True,
+            'unit': cancelled_unit
+        }).encode('utf-8'))
 
     def log_message(self, format, *args):
         """Suppress log messages."""
@@ -4973,14 +4954,24 @@ class RolloutEngine:
         match the pending warm being fired (else warm_cancelled error).
         """
         with self.watcher_lock:
+            # SLOT CHECK FIRST (SPEC §4.4, MVP5 review blocker 2): if the warm
+            # branch ran first, its pending_warm pop would execute before an
+            # operation_in_progress raise — a human slot-claim during the fire
+            # window would silently destroy the parked warm with no disposition.
+            # Order here: slot, then consent, then pop — one lock hold.
+            if not _slot_free(self.current):
+                if self.current and self.current.get('kind') == 'switch':
+                    raise ActuationError("operation_in_progress")
+                elif self.current and self.current.get('phase') == 'failed' and _rollback_offered(self.current):
+                    raise ActuationError("operation_in_progress")
+                raise ActuationError("operation_in_progress")
+
             # Consent fence layer 2 (engine): re-validate when origin='warm'
             if origin == 'warm':
-                # Target must be marked
                 unit = self.units.get(target)
                 if not unit or not unit.on_demand:
                     raise ActuationError(f"warm_consent: target {target} is not marked on-demand")
 
-                # All stops must be marked
                 for stop_unit in stops:
                     stop_unit_obj = self.units.get(stop_unit)
                     if not stop_unit_obj or not stop_unit_obj.on_demand:
@@ -4994,13 +4985,6 @@ class RolloutEngine:
                     if self.pending_warm is None or self.pending_warm.get('seq') != warm_seq:
                         raise ActuationError("warm_cancelled")
                     self.pending_warm = None
-
-            if not _slot_free(self.current):
-                if self.current and self.current.get('kind') == 'switch':
-                    raise ActuationError("operation_in_progress")
-                elif self.current and self.current.get('phase') == 'failed' and _rollback_offered(self.current):
-                    raise ActuationError("operation_in_progress")
-                raise ActuationError("operation_in_progress")
 
             unit = self.units.get(target)
             if not unit:
