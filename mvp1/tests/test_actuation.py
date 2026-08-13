@@ -3345,5 +3345,410 @@ class TestSwitchRoutes(unittest.TestCase):
         self.assertEqual(status, 405)
 
 
+class TestEnablementPreflight(unittest.TestCase):
+    """Test enablement_preflight per MVP4 G3 matrix."""
+
+    def setUp(self):
+        """Set up a basic snapshot with configurable rows."""
+        self.base_time = time.time()
+
+    def _make_row(self, unit_name, rung='OFF', enabled=False, port=8080, port_source='default',
+                  retired=False, alias=None, gate=None):
+        """Build a snapshot row dict."""
+        return {
+            'unit': unit_name,
+            'rung': rung,
+            'enabled': enabled,
+            'port': port,
+            'port_source': port_source,
+            'retired': retired,
+            'alias': alias or unit_name,
+            'gate': gate,
+            'sensed_at': self.base_time
+        }
+
+    def _make_snapshot(self, rows):
+        """Build a complete snapshot from rows."""
+        return {
+            'host': 'test',
+            'kernel': '6.1.0',
+            'now': self.base_time,
+            'mem': {},
+            'sources': {},
+            'self_port': 8090,
+            'units': rows
+        }
+
+    def test_no_claimant_enable_ok(self):
+        """No claimant for target port: enable succeeds."""
+        rows = [
+            self._make_row('a.service', rung='OFF', enabled=False, port=8080),
+            self._make_row('b.service', rung='OFF', enabled=False, port=8081),
+        ]
+        snap = self._make_snapshot(rows)
+        result = roundhouse.enablement_preflight('a.service', True, snap, {}, 8090)
+        self.assertTrue(result['ok'])
+        self.assertEqual(result['port'], 8080)
+        self.assertEqual(result['claimants'], [])
+
+    def test_enabled_non_retired_same_port_claimant_fails(self):
+        """Enabled non-retired claimant on same port: enable fails, names claimant with rung."""
+        rows = [
+            self._make_row('a.service', rung='OFF', enabled=False, port=8080),
+            self._make_row('b.service', rung='READY', enabled=True, port=8080),
+        ]
+        snap = self._make_snapshot(rows)
+        result = roundhouse.enablement_preflight('a.service', True, snap, {}, 8090)
+        self.assertFalse(result['ok'])
+        self.assertEqual(len(result['claimants']), 1)
+        claimant = result['claimants'][0]
+        self.assertEqual(claimant['unit'], 'b.service')
+        self.assertEqual(claimant['rung'], 'READY')
+        self.assertTrue('b.service (enabled, READY)' in result['checks'][0]['detail'])
+
+    def test_disabled_claimant_ok(self):
+        """Disabled claimant (enabled=False) on same port: enable succeeds."""
+        rows = [
+            self._make_row('a.service', rung='OFF', enabled=False, port=8080),
+            self._make_row('b.service', rung='READY', enabled=False, port=8080),
+        ]
+        snap = self._make_snapshot(rows)
+        result = roundhouse.enablement_preflight('a.service', True, snap, {}, 8090)
+        self.assertTrue(result['ok'])
+
+    def test_retired_claimant_ok(self):
+        """Retired claimant: does not block enable."""
+        rows = [
+            self._make_row('a.service', rung='OFF', enabled=False, port=8080),
+            self._make_row('b.service', rung='READY', enabled=True, port=8080, retired=True),
+        ]
+        snap = self._make_snapshot(rows)
+        result = roundhouse.enablement_preflight('a.service', True, snap, {}, 8090)
+        self.assertTrue(result['ok'])
+
+    def test_gated_enabled_claimant_fails(self):
+        """Gated enabled claimant: gate does NOT exempt, detail has ', kernel-gated'."""
+        rows = [
+            self._make_row('a.service', rung='OFF', enabled=False, port=8080),
+            self._make_row('b.service', rung='STANDBY', enabled=True, port=8080, gate='ExecCondition=/bin/test'),
+        ]
+        snap = self._make_snapshot(rows)
+        result = roundhouse.enablement_preflight('a.service', True, snap, {}, 8090)
+        self.assertFalse(result['ok'])
+        self.assertEqual(len(result['claimants']), 1)
+        claimant = result['claimants'][0]
+        self.assertIsNotNone(claimant['gate'])
+        self.assertIn('kernel-gated', result['checks'][0]['detail'])
+
+    def test_two_defaulted_8080_units_first_ok_second_fails(self):
+        """Two units both defaulting :8080: first enable ok, second after first enabled fails."""
+        rows = [
+            self._make_row('a.service', rung='OFF', enabled=False, port=8080, port_source='default'),
+            self._make_row('b.service', rung='OFF', enabled=False, port=8080, port_source='default'),
+        ]
+        snap = self._make_snapshot(rows)
+
+        # First enable a.service: ok
+        result1 = roundhouse.enablement_preflight('a.service', True, snap, {}, 8090)
+        self.assertTrue(result1['ok'])
+
+        # Now mark a.service as enabled in the snapshot
+        snap['units'][0]['enabled'] = True
+
+        # Second enable b.service: fails because a.service (now enabled) is a claimant
+        result2 = roundhouse.enablement_preflight('b.service', True, snap, {}, 8090)
+        self.assertFalse(result2['ok'])
+        self.assertEqual(len(result2['claimants']), 1)
+        self.assertEqual(result2['claimants'][0]['unit'], 'a.service')
+
+    def test_self_port_target_fails_with_roundhouse_pseudo_claimant(self):
+        """Enabling on Roundhouse's own port fails with 'roundhouse (self)' pseudo-claimant."""
+        rows = [
+            self._make_row('a.service', rung='OFF', enabled=False, port=8090),
+        ]
+        snap = self._make_snapshot(rows)
+        result = roundhouse.enablement_preflight('a.service', True, snap, {}, 8090)
+        self.assertFalse(result['ok'])
+        self.assertEqual(result['port'], 8090)
+        self.assertIn('roundhouse (self)', [c['unit'] for c in result['claimants']])
+        self.assertIn('roundhouse', result['checks'][0]['detail'])
+
+    def test_claimant_rung_irrelevance_off_but_enabled_still_fails(self):
+        """Claimant OFF but enabled still fails: rung is ignored."""
+        rows = [
+            self._make_row('a.service', rung='OFF', enabled=False, port=8080),
+            self._make_row('b.service', rung='OFF', enabled=True, port=8080),
+        ]
+        snap = self._make_snapshot(rows)
+        result = roundhouse.enablement_preflight('a.service', True, snap, {}, 8090)
+        self.assertFalse(result['ok'])
+        self.assertEqual(result['claimants'][0]['rung'], 'OFF')
+
+    def test_target_rung_irrelevance_failed_target_toggles_freely(self):
+        """Target FAILED or any rung: enable/disable toggle freely."""
+        rows = [
+            self._make_row('a.service', rung='FAILED', enabled=False, port=8080),
+        ]
+        snap = self._make_snapshot(rows)
+        result = roundhouse.enablement_preflight('a.service', True, snap, {}, 8090)
+        self.assertTrue(result['ok'], 'FAILED target should enable ok')
+
+        result = roundhouse.enablement_preflight('a.service', False, snap, {}, 8090)
+        self.assertTrue(result['ok'], 'FAILED target should disable ok')
+
+    def test_disable_always_ok_even_amid_collisions(self):
+        """Disable always passes, even with collisions."""
+        rows = [
+            self._make_row('a.service', rung='OFF', enabled=True, port=8080),
+            self._make_row('b.service', rung='READY', enabled=True, port=8080),
+        ]
+        snap = self._make_snapshot(rows)
+        result = roundhouse.enablement_preflight('a.service', False, snap, {}, 8090)
+        self.assertTrue(result['ok'])
+
+    def test_retired_target_fails_both_directions(self):
+        """Retired target fails enable AND disable."""
+        rows = [
+            self._make_row('a.service', rung='OFF', enabled=False, port=8080, retired=True),
+        ]
+        snap = self._make_snapshot(rows)
+        result_en = roundhouse.enablement_preflight('a.service', True, snap, {}, 8090)
+        result_dis = roundhouse.enablement_preflight('a.service', False, snap, {}, 8090)
+        self.assertFalse(result_en['ok'])
+        self.assertFalse(result_dis['ok'])
+        self.assertEqual(result_en['checks'][0]['check'], 'retired')
+        self.assertEqual(result_dis['checks'][0]['check'], 'retired')
+
+    def test_mixperten_double_refusal_retired_leg(self):
+        """Mixperten retired: leg 1 retired fail."""
+        rows = [
+            self._make_row('mixperten.service', rung='OFF', enabled=False, port=8085, retired=True),
+            self._make_row('qwen3.6-coding.service', rung='READY', enabled=True, port=8085),
+        ]
+        snap = self._make_snapshot(rows)
+        result = roundhouse.enablement_preflight('mixperten.service', True, snap, {}, 8090)
+        self.assertFalse(result['ok'])
+        self.assertEqual(result['checks'][0]['check'], 'retired')
+        self.assertIn('RETIRED', result['checks'][0]['detail'])
+
+    def test_mixperten_double_refusal_non_retired_leg(self):
+        """Mixperten non-retired on :8085 with qwen3.6-coding enabled: leg 2 collision fail naming it."""
+        rows = [
+            self._make_row('mixperten.service', rung='OFF', enabled=False, port=8085),
+            self._make_row('qwen3.6-coding.service', rung='READY', enabled=True, port=8085),
+        ]
+        snap = self._make_snapshot(rows)
+        result = roundhouse.enablement_preflight('mixperten.service', True, snap, {}, 8090)
+        self.assertFalse(result['ok'])
+        # This is a collision, not a retired check
+        self.assertEqual(len(result['claimants']), 1)
+        self.assertEqual(result['claimants'][0]['unit'], 'qwen3.6-coding.service')
+        # Verify the collision is described in detail
+        self.assertIn('qwen3.6-coding.service', result['checks'][0]['detail'])
+
+
+class TestEnablementGateway(unittest.TestCase):
+    """Test run_actuate with enable/disable verbs per MVP4 G2."""
+
+    def setUp(self):
+        roundhouse.ACTUATE_ARMED = True
+        self.unit_mock = MagicMock(spec=roundhouse.UnitFile)
+        self.unit_mock.retired = False
+        self.units = {'a.service': self.unit_mock}
+
+    def tearDown(self):
+        roundhouse.ACTUATE_ARMED = False
+
+    def test_enable_verb_exact_shape_accepted(self):
+        """run_actuate accepts ["systemctl","--user","enable","--",unit] exactly."""
+        with patch('subprocess.run') as mock_run:
+            mock_run.return_value.returncode = 0
+            mock_run.return_value.stdout = ''
+            roundhouse.run_actuate(['systemctl', '--user', 'enable', '--', 'a.service'], self.units)
+            mock_run.assert_called_once()
+
+    def test_disable_verb_exact_shape_accepted(self):
+        """run_actuate accepts ["systemctl","--user","disable","--",unit] exactly."""
+        with patch('subprocess.run') as mock_run:
+            mock_run.return_value.returncode = 0
+            mock_run.return_value.stdout = ''
+            roundhouse.run_actuate(['systemctl', '--user', 'disable', '--', 'a.service'], self.units)
+            mock_run.assert_called_once()
+
+    def test_enable_with_now_len_6_rejected(self):
+        """run_actuate rejects --now (len 6)."""
+        with self.assertRaises(roundhouse.ActuationError) as ctx:
+            roundhouse.run_actuate(['systemctl', '--user', 'enable', '--now', '--', 'a.service'], self.units)
+        self.assertIn('invalid shape', str(ctx.exception))
+
+    def test_two_units_len_gt_5_rejected(self):
+        """run_actuate rejects argv len > 5."""
+        with self.assertRaises(roundhouse.ActuationError) as ctx:
+            roundhouse.run_actuate(['systemctl', '--user', 'enable', '--', 'a.service', 'b.service'], self.units)
+        self.assertIn('invalid shape', str(ctx.exception))
+
+    def test_missing_dashes_rejected(self):
+        """run_actuate rejects missing '--'."""
+        with self.assertRaises(roundhouse.ActuationError) as ctx:
+            roundhouse.run_actuate(['systemctl', '--user', 'enable', 'a.service'], self.units)
+        self.assertIn('invalid shape', str(ctx.exception))
+
+    def test_non_selected_unit_rejected(self):
+        """run_actuate rejects unit not in units dict."""
+        with self.assertRaises(roundhouse.ActuationError) as ctx:
+            roundhouse.run_actuate(['systemctl', '--user', 'enable', '--', 'unknown.service'], self.units)
+        self.assertIn('not in selected units', str(ctx.exception))
+
+    def test_retired_unit_rejected(self):
+        """run_actuate rejects retired unit."""
+        retired_unit = MagicMock(spec=roundhouse.UnitFile)
+        retired_unit.retired = True
+        retired_units = {'a.service': retired_unit}
+        with self.assertRaises(roundhouse.ActuationError) as ctx:
+            roundhouse.run_actuate(['systemctl', '--user', 'enable', '--', 'a.service'], retired_units)
+        self.assertIn('RETIRED', str(ctx.exception))
+
+    def test_daemon_reload_without_unit_still_accepted(self):
+        """["systemctl","--user","daemon-reload"] still accepted."""
+        with patch('subprocess.run') as mock_run:
+            mock_run.return_value.returncode = 0
+            mock_run.return_value.stdout = ''
+            roundhouse.run_actuate(['systemctl', '--user', 'daemon-reload'], self.units)
+            mock_run.assert_called_once()
+
+    def test_daemon_reload_with_unit_now_rejected_regression_pin(self):
+        """["systemctl","--user","daemon-reload","--",unit] now REJECTED (regression pin)."""
+        with self.assertRaises(roundhouse.ActuationError) as ctx:
+            roundhouse.run_actuate(['systemctl', '--user', 'daemon-reload', '--', 'a.service'], self.units)
+        # The error can be "invalid shape" or "invalid verb daemon-reload"
+        error_str = str(ctx.exception)
+        self.assertTrue('invalid shape' in error_str or 'invalid verb' in error_str)
+
+    def test_enablement_verbs_constant_correct(self):
+        """ENABLEMENT_VERBS == {"enable","disable"}."""
+        self.assertEqual(roundhouse.ENABLEMENT_VERBS, {"enable", "disable"})
+
+    def test_enablement_verbs_disjoint_from_actuate_systemctl_verbs(self):
+        """ENABLEMENT_VERBS disjoint from ACTUATE_SYSTEMCTL_VERBS."""
+        self.assertEqual(roundhouse.ACTUATE_SYSTEMCTL_VERBS, {"stop", "start", "daemon-reload"})
+        self.assertEqual(roundhouse.ENABLEMENT_VERBS & roundhouse.ACTUATE_SYSTEMCTL_VERBS, set())
+
+
+class TestEnablementEngine(unittest.TestCase):
+    """Test RolloutEngine._set_enablement per MVP4."""
+
+    def setUp(self):
+        """Set up engine with scripted fleet."""
+        self.temp_dir = tempfile.mkdtemp()
+        roundhouse.ACTUATE_ARMED = True
+        self.fleet = _ScriptedFleet({'a.service': {'rung': 'OFF', 'retired': False, 'port': 8080,
+                                                    'since': 1.0, 'start_ts_mono': '0',
+                                                    'badges': [], 'mem': {}, 'enabled': False}})
+        unit_mock = MagicMock(spec=roundhouse.UnitFile)
+        unit_mock.retired = False
+        self.fleet.units = {'a.service': unit_mock}
+        self.engine = roundhouse.RolloutEngine(self.fleet, self.fleet.units, self.temp_dir,
+                                              8090, roundhouse.EventBus(), threading.Lock())
+        self.initial_current = self.engine.current
+
+    def tearDown(self):
+        roundhouse.ACTUATE_ARMED = False
+        shutil.rmtree(self.temp_dir, ignore_errors=True)
+
+    def test_set_enablement_one_actuate_call_enable(self):
+        """_set_enablement enable: exactly ONE run_actuate with correct argv."""
+        actuate_calls = []
+        def stub_actuate(argv, units, timeout=90):
+            actuate_calls.append(list(argv))
+            return ''
+        with patch('roundhouse.run_actuate', stub_actuate):
+            self.engine._set_enablement('a.service', True)
+        self.assertEqual(len(actuate_calls), 1)
+        self.assertEqual(actuate_calls[0], ['systemctl', '--user', 'enable', '--', 'a.service'])
+
+    def test_set_enablement_one_actuate_call_disable(self):
+        """_set_enablement disable: exactly ONE run_actuate with correct argv."""
+        actuate_calls = []
+        def stub_actuate(argv, units, timeout=90):
+            actuate_calls.append(list(argv))
+            return ''
+        with patch('roundhouse.run_actuate', stub_actuate):
+            self.engine._set_enablement('a.service', False)
+        self.assertEqual(len(actuate_calls), 1)
+        self.assertEqual(actuate_calls[0], ['systemctl', '--user', 'disable', '--', 'a.service'])
+
+    def test_engine_current_identity_preserved_enable(self):
+        """engine.current unchanged (identical object) after _set_enablement enable."""
+        def stub_actuate(argv, units, timeout=90):
+            return ''
+        with patch('roundhouse.run_actuate', stub_actuate):
+            self.engine._set_enablement('a.service', True)
+        self.assertIs(self.engine.current, self.initial_current)
+
+    def test_engine_current_identity_preserved_disable(self):
+        """engine.current unchanged (identical object) after _set_enablement disable."""
+        def stub_actuate(argv, units, timeout=90):
+            return ''
+        with patch('roundhouse.run_actuate', stub_actuate):
+            self.engine._set_enablement('a.service', False)
+        self.assertIs(self.engine.current, self.initial_current)
+
+    def test_no_lock_held_during_actuate_enable(self):
+        """No lock held during run_actuate (can acquire non-blocking) — enable."""
+        def lock_probe_actuate(argv, units, timeout=90):
+            # Try to acquire the lock non-blocking; should succeed if not held
+            acquired = self.fleet.lock.acquire(blocking=False)
+            self.assertTrue(acquired, "Lock was held during run_actuate (enable)")
+            if acquired:
+                self.fleet.lock.release()
+            return ''
+        with patch('roundhouse.run_actuate', lock_probe_actuate):
+            self.engine._set_enablement('a.service', True)
+
+    def test_no_lock_held_during_actuate_disable(self):
+        """No lock held during run_actuate (can acquire non-blocking) — disable."""
+        def lock_probe_actuate(argv, units, timeout=90):
+            acquired = self.fleet.lock.acquire(blocking=False)
+            self.assertTrue(acquired, "Lock was held during run_actuate (disable)")
+            if acquired:
+                self.fleet.lock.release()
+            return ''
+        with patch('roundhouse.run_actuate', lock_probe_actuate):
+            self.engine._set_enablement('a.service', False)
+
+    def test_completes_when_run_git_raises_enable(self):
+        """_set_enablement enable completes even if run_git raises."""
+        def stub_actuate(argv, units, timeout=90):
+            return ''
+        with patch('roundhouse.run_actuate', stub_actuate), \
+             patch('roundhouse.run_git', side_effect=AssertionError('run_git must not be called')):
+            # Should not raise
+            self.engine._set_enablement('a.service', True)
+
+    def test_completes_when_run_git_raises_disable(self):
+        """_set_enablement disable completes even if run_git raises."""
+        def stub_actuate(argv, units, timeout=90):
+            return ''
+        with patch('roundhouse.run_actuate', stub_actuate), \
+             patch('roundhouse.run_git', side_effect=AssertionError('run_git must not be called')):
+            self.engine._set_enablement('a.service', False)
+
+    def test_completes_when_atomic_write_raises_enable(self):
+        """_set_enablement enable completes even if _atomic_write raises."""
+        def stub_actuate(argv, units, timeout=90):
+            return ''
+        with patch('roundhouse.run_actuate', stub_actuate), \
+             patch('roundhouse._atomic_write', side_effect=AssertionError('_atomic_write must not be called')):
+            self.engine._set_enablement('a.service', True)
+
+    def test_completes_when_atomic_write_raises_disable(self):
+        """_set_enablement disable completes even if _atomic_write raises."""
+        def stub_actuate(argv, units, timeout=90):
+            return ''
+        with patch('roundhouse.run_actuate', stub_actuate), \
+             patch('roundhouse._atomic_write', side_effect=AssertionError('_atomic_write must not be called')):
+            self.engine._set_enablement('a.service', False)
+
+
 if __name__ == '__main__':
     unittest.main()
