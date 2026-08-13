@@ -12,6 +12,10 @@ import tempfile
 import shutil
 import subprocess
 import json
+import time
+import socket
+import threading
+import http.client
 from pathlib import Path
 from datetime import datetime, timezone
 from unittest.mock import patch, MagicMock
@@ -497,6 +501,209 @@ class TestToken(unittest.TestCase):
 
             status = roundhouse.check_bearer(handler)
             self.assertIsNone(status)
+        finally:
+            roundhouse.ACTUATE_ARMED = False
+            roundhouse.TOKEN = None
+
+
+class TestPreflight(unittest.TestCase):
+    """Preflight checks per MVP2-SPEC §5."""
+
+    def setUp(self):
+        self.fixtures = Path(__file__).resolve().parents[2] / 'docs' / 'fixtures'
+        self.temp_dir = tempfile.mkdtemp()
+
+    def tearDown(self):
+        shutil.rmtree(self.temp_dir, ignore_errors=True)
+
+    def _load_fixture(self, name: str) -> roundhouse.UnitFile:
+        """Load a fixture unit file."""
+        path = self.fixtures / name
+        raw = path.read_bytes()
+        return roundhouse.parse_unit(str(path), raw)
+
+    def test_preflight_retired_fails(self):
+        """Preflight fails for RETIRED units."""
+        unit = self._load_fixture('mixperten.service')  # A RETIRED fixture
+        if not unit.retired:
+            self.skipTest("fixture is not retired")
+
+        edits = []
+        watcher = MagicMock()
+        result = roundhouse.preflight_retired(unit)
+        self.assertFalse(result['ok'])
+        self.assertIn('RETIRED', result['detail'])
+
+    def test_preflight_port_collision_fails(self):
+        """Preflight fails when new port collides with active unit."""
+        unit = self._load_fixture('qwen3.6-coding.service')
+
+        # Create an edit that changes port
+        edits = [roundhouse.Edit(
+            field='port', flag='--port', old_text='8085', new_text='8086',
+            span=(0, 4), quote=''
+        )]
+
+        # Mock watcher with a conflicting claim
+        watcher = MagicMock()
+        watcher.snapshot.return_value = {
+            'units': [
+                {'unit': 'other.service', 'port': 8086, 'retired': False, 'enabled': True, 'rung': 'READY'}
+            ]
+        }
+
+        result = roundhouse.preflight_port(unit, edits, watcher, 8090)
+        self.assertFalse(result['ok'])
+        self.assertIn('8086', result['detail'])
+
+    def test_preflight_memory_over_budget_fails(self):
+        """Preflight fails when ctx edit causes memory to exceed budget."""
+        unit = self._load_fixture('qwen3.6-coding.service')
+
+        edits = [roundhouse.Edit(
+            field='ctx', flag='-c', old_text='65536', new_text='131072',
+            span=(0, 5), quote=''
+        )]
+
+        watcher = MagicMock()
+        watcher.snapshot.return_value = {'units': []}
+        watcher.mem_store = None
+
+        # Mock meminfo_reader to return low memory
+        def low_meminfo():
+            return {'MemAvailable': 1 * 1024 * 1024}  # 1 MiB
+
+        result = roundhouse.preflight_memory(unit, edits, watcher, meminfo_reader=low_meminfo)
+        self.assertFalse(result['ok'])
+
+
+class TestRolloutMachine(unittest.TestCase):
+    """RolloutEngine state machine per MVP2-SPEC §4."""
+
+    def setUp(self):
+        self.fixtures = Path(__file__).resolve().parents[2] / 'docs' / 'fixtures'
+        self.temp_dir = tempfile.mkdtemp()
+        self.unit_dir = self.temp_dir
+
+    def tearDown(self):
+        shutil.rmtree(self.temp_dir, ignore_errors=True)
+
+    def _load_fixture(self, name: str) -> roundhouse.UnitFile:
+        """Load a fixture unit file."""
+        path = self.fixtures / name
+        raw = path.read_bytes()
+        return roundhouse.parse_unit(str(path), raw)
+
+    def test_rollout_engine_initialization(self):
+        """RolloutEngine initializes correctly."""
+        watcher = MagicMock()
+        event_bus = roundhouse.EventBus()
+        units = {}
+        lock = MagicMock()
+
+        engine = roundhouse.RolloutEngine(watcher, units, self.unit_dir, 8090,
+                                         event_bus, lock)
+        self.assertIsNone(engine.current)
+        self.assertEqual(len(engine.rollouts), 0)
+
+    def test_rollout_phases_frozen(self):
+        """ROLLOUT_PHASES tuple is as specified."""
+        expected = ("preflight", "applying", "reloading", "starting", "watching",
+                   "done", "failed", "rolling_back", "rolled_back", "rollback_failed")
+        self.assertEqual(roundhouse.ROLLOUT_PHASES, expected)
+
+
+class TestRoutesAuth(unittest.TestCase):
+    """API routes and authentication per MVP2-SPEC §6."""
+
+    @classmethod
+    def setUpClass(cls):
+        """Start server on an ephemeral port."""
+        cls.temp_dir = tempfile.mkdtemp()
+        cls.fixtures = Path(__file__).resolve().parents[2] / 'docs' / 'fixtures'
+
+        # Create a stub watcher
+        cls.watcher = MagicMock(spec=roundhouse.Watcher)
+        cls.watcher.snapshot.return_value = {
+            'host': 'test', 'kernel': '6.1', 'now': time.time(),
+            'mem': {}, 'units': [], 'sources': {}
+        }
+        cls.watcher.units = {}
+
+        cls.event_bus = roundhouse.EventBus()
+
+        # Find an available port
+        sock = socket.socket()
+        sock.bind(('127.0.0.1', 0))
+        cls.port = sock.getsockname()[1]
+        sock.close()
+
+        # Create server WITHOUT arming (ACTUATE_ARMED = False)
+        roundhouse.ACTUATE_ARMED = False
+        cls.server = roundhouse.ThreadingHTTPServer(
+            ('127.0.0.1', cls.port),
+            roundhouse.RoundhouseRequestHandler,
+            cls.watcher,
+            cls.event_bus,
+            cls.port
+        )
+
+        cls.server_thread = threading.Thread(target=cls.server.serve_forever, daemon=True)
+        cls.server_thread.start()
+        time.sleep(0.1)
+
+    @classmethod
+    def tearDownClass(cls):
+        """Shutdown server."""
+        cls.server.shutdown()
+        cls.server.server_close()
+        shutil.rmtree(cls.temp_dir, ignore_errors=True)
+
+    def post_http(self, path, data=None, headers=None):
+        """Make HTTP POST request."""
+        import http.client
+        conn = http.client.HTTPConnection('127.0.0.1', self.port, timeout=5)
+        try:
+            body = None
+            if data:
+                body = json.dumps(data).encode('utf-8')
+            req_headers = headers or {}
+            if body and 'Content-Type' not in req_headers:
+                req_headers['Content-Type'] = 'application/json'
+            conn.request('POST', path, body, req_headers)
+            resp = conn.getresponse()
+            resp_body = resp.read()
+            return resp.status, resp_body
+        finally:
+            conn.close()
+
+    def test_post_edit_unarmed_returns_403(self):
+        """POST /api/units/<name>/edit without --actuate returns 403."""
+        status, _ = self.post_http('/api/units/test.service/edit', {'edits': {}})
+        self.assertEqual(status, 403)
+
+    def test_post_rollout_unarmed_returns_403(self):
+        """POST /api/units/<name>/rollout without --actuate returns 403."""
+        status, _ = self.post_http('/api/units/test.service/rollout',
+                                  {'edits': {}, 'confirm': 'x'})
+        self.assertEqual(status, 403)
+
+    def test_post_edit_bad_json_returns_400(self):
+        """POST with malformed JSON returns 400."""
+        roundhouse.ACTUATE_ARMED = True
+        roundhouse.TOKEN = 'test-token'
+        try:
+            import http.client
+            conn = http.client.HTTPConnection('127.0.0.1', self.port, timeout=5)
+            try:
+                conn.request('POST', '/api/units/test.service/edit',
+                           b'not valid json',
+                           {'Authorization': 'Bearer test-token'})
+                resp = conn.getresponse()
+                status = resp.status
+            finally:
+                conn.close()
+            self.assertEqual(status, 400)
         finally:
             roundhouse.ACTUATE_ARMED = False
             roundhouse.TOKEN = None

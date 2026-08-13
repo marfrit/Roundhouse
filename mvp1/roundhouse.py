@@ -2056,7 +2056,272 @@ class RoundhouseRequestHandler(http.server.BaseHTTPRequestHandler):
             self.error_404()
 
     def do_POST(self):
-        self.error_405()
+        """Handle POST requests with authentication."""
+        # Parse URL
+        path = self.path
+        parsed = urllib.parse.urlparse(path)
+        route = parsed.path
+
+        # Determine if this is a known POST route
+        is_post_route = (
+            (route.startswith('/api/units/') and route.endswith('/edit')) or
+            (route.startswith('/api/units/') and route.endswith('/rollout')) or
+            (route.startswith('/api/rollouts/') and route.endswith('/rollback')) or
+            (route.startswith('/api/rollouts/') and route.endswith('/dismiss'))
+        )
+
+        # Determine if this is a known GET-only route
+        is_get_route = (
+            route == '/' or
+            route == '/api/units' or
+            route.startswith('/api/units/') or
+            route == '/api/ports' or
+            route == '/api/deployments' or
+            route == '/api/mem' or
+            route == '/api/events'
+        )
+
+        # If it's not a POST route but is a known GET route, return 405 immediately
+        if not is_post_route and is_get_route:
+            self.error_405()
+            return
+
+        # Step 1: Check bearer token (E8) — only for POST routes
+        auth_status = check_bearer(self)
+        if auth_status is not None:
+            if auth_status == 403:
+                self.send_json_error(403, 'read_only_mode',
+                                   'launch with --actuate to enable rollouts')
+            else:
+                self.send_response(401)
+                self.send_header('WWW-Authenticate', 'Bearer')
+                self.send_header('Content-Type', 'application/json; charset=utf-8')
+                self.end_headers()
+                self.wfile.write(json.dumps({'error': 'unauthorized'}).encode('utf-8'))
+            return
+
+        # Step 2: Route and dispatch POST routes
+        if route.startswith('/api/units/') and route.endswith('/edit'):
+            unit_name = urllib.parse.unquote(route[len('/api/units/'):-len('/edit')])
+            self.handle_edit(unit_name)
+        elif route.startswith('/api/units/') and route.endswith('/rollout'):
+            unit_name = urllib.parse.unquote(route[len('/api/units/'):-len('/rollout')])
+            self.handle_rollout(unit_name)
+        elif route.startswith('/api/rollouts/') and route.endswith('/rollback'):
+            rollout_id = urllib.parse.unquote(route[len('/api/rollouts/'):-len('/rollback')])
+            self.handle_rollback(rollout_id)
+        elif route.startswith('/api/rollouts/') and route.endswith('/dismiss'):
+            rollout_id = urllib.parse.unquote(route[len('/api/rollouts/'):-len('/dismiss')])
+            self.handle_dismiss(rollout_id)
+        else:
+            # Unknown POST route
+            self.send_response(404)
+            self.send_header('Content-Type', 'application/json')
+            self.end_headers()
+            self.wfile.write(json.dumps({'error': 'not_found'}).encode('utf-8'))
+
+    def handle_edit(self, unit_name: str):
+        """Handle POST /api/units/<name>/edit (preview mode)."""
+        # Read body
+        try:
+            content_length = int(self.headers.get('Content-Length', 0))
+            body = self.rfile.read(content_length)
+            data = json.loads(body)
+        except (ValueError, json.JSONDecodeError):
+            self.send_json_error(400, 'bad_json', 'malformed JSON body')
+            return
+
+        if not isinstance(data.get('edits'), dict):
+            self.send_json_error(400, 'bad_json', 'edits must be a dict')
+            return
+
+        # Find unit
+        watcher = self.server.watcher
+        if unit_name not in watcher.units:
+            self.send_json_error(404, 'not_found', f'unit {unit_name} not found')
+            return
+
+        unit = watcher.units[unit_name]
+
+        # Plan edits
+        try:
+            edits = plan_edits(unit, data.get('edits', {}))
+        except EditError as e:
+            self.send_json_error(400, e.reason, e.detail or e.reason)
+            return
+
+        # Run preflight
+        pf = preflight(unit, edits, watcher, self.server.port, unit.path.rsplit('/', 1)[0])
+        if not pf['ok']:
+            self.send_response(422)
+            self.send_header('Content-Type', 'application/json; charset=utf-8')
+            self.end_headers()
+            prov_line = provenance_line(edits, datetime.now(timezone.utc))
+            prov_bytes = splice(unit.raw, edits, prov_line)
+            diff_text = unified_diff_text(unit.raw, prov_bytes, unit.name)
+            response = {
+                'error': 'preflight_failed',
+                'checks': pf['checks'],
+                'diff': diff_text
+            }
+            self.wfile.write(json.dumps(response).encode('utf-8'))
+            return
+
+        # Compute confirm hash
+        confirm = compute_confirm(unit_name, unit.raw, edits)
+
+        # Build diff
+        prov_line = provenance_line(edits, datetime.now(timezone.utc))
+        prov_bytes = splice(unit.raw, edits, prov_line)
+        diff_text = unified_diff_text(unit.raw, prov_bytes, unit.name)
+
+        # Return preview
+        self.send_response(200)
+        self.send_header('Content-Type', 'application/json; charset=utf-8')
+        self.end_headers()
+        response = {
+            'unit': unit_name,
+            'edits': [{'field': e.field, 'flag': e.flag, 'old': e.old_text, 'new': e.new_text}
+                     for e in edits],
+            'diff': diff_text,
+            'confirm': confirm,
+            'preflight': pf,
+            'notices': [],
+            'provenance_preview': f"# roundhouse: {prov_line}"
+        }
+        self.wfile.write(json.dumps(response).encode('utf-8'))
+
+    def handle_rollout(self, unit_name: str):
+        """Handle POST /api/units/<name>/rollout (apply)."""
+        # Read body
+        try:
+            content_length = int(self.headers.get('Content-Length', 0))
+            body = self.rfile.read(content_length)
+            data = json.loads(body)
+        except (ValueError, json.JSONDecodeError):
+            self.send_json_error(400, 'bad_json', 'malformed JSON body')
+            return
+
+        # Get engine
+        engine = self.server.rollout_engine
+        if not engine:
+            self.send_json_error(500, 'no_engine', 'rollout engine not initialized')
+            return
+
+        # Find unit
+        watcher = self.server.watcher
+        if unit_name not in watcher.units:
+            self.send_json_error(404, 'not_found', f'unit {unit_name} not found')
+            return
+
+        unit = watcher.units[unit_name]
+
+        # Plan edits
+        try:
+            edits = plan_edits(unit, data.get('edits', {}))
+        except EditError as e:
+            self.send_json_error(400, e.reason, e.detail or e.reason)
+            return
+
+        # Check confirm matches (E5)
+        confirm = data.get('confirm', '')
+        computed = compute_confirm(unit_name, unit.raw, edits)
+        if confirm != computed:
+            self.send_response(409)
+            self.send_header('Content-Type', 'application/json; charset=utf-8')
+            self.end_headers()
+            response = {
+                'error': 'preview_stale',
+                'detail': 'unit file or edits changed since preview; re-preview'
+            }
+            self.wfile.write(json.dumps(response).encode('utf-8'))
+            return
+
+        # Start rollout
+        try:
+            rollout = engine.start_rollout(unit_name, edits, confirm)
+            self.send_response(202)
+            self.send_header('Content-Type', 'application/json; charset=utf-8')
+            self.end_headers()
+            response = {'rollout_id': rollout['rollout_id']}
+            self.wfile.write(json.dumps(response).encode('utf-8'))
+        except ActuationError as e:
+            if 'rollout_in_progress' in str(e):
+                self.send_response(409)
+                self.send_header('Content-Type', 'application/json; charset=utf-8')
+                self.end_headers()
+                response = {
+                    'error': 'rollout_in_progress',
+                    'rollout_id': engine.current.get('rollout_id') if engine.current else None
+                }
+                self.wfile.write(json.dumps(response).encode('utf-8'))
+            else:
+                self.send_json_error(400, 'rollout_error', str(e))
+
+    def handle_rollback(self, rollout_id: str):
+        """Handle POST /api/rollouts/<id>/rollback."""
+        engine = self.server.rollout_engine
+        if not engine:
+            self.send_json_error(500, 'no_engine', 'rollout engine not initialized')
+            return
+
+        rollout = engine.rollouts.get(rollout_id)
+        if not rollout:
+            self.send_json_error(404, 'not_found', f'rollout {rollout_id} not found')
+            return
+
+        if rollout.get('phase') != 'failed' or not rollout.get('rollback', {}).get('offered'):
+            self.send_response(409)
+            self.send_header('Content-Type', 'application/json; charset=utf-8')
+            self.end_headers()
+            response = {'error': 'not_rollbackable'}
+            self.wfile.write(json.dumps(response).encode('utf-8'))
+            return
+
+        try:
+            engine.rollback(rollout_id)
+            self.send_response(202)
+            self.send_header('Content-Type', 'application/json; charset=utf-8')
+            self.end_headers()
+            self.wfile.write(json.dumps({'rollout_id': rollout_id}).encode('utf-8'))
+        except ActuationError as e:
+            self.send_json_error(400, 'rollback_error', str(e))
+
+    def handle_dismiss(self, rollout_id: str):
+        """Handle POST /api/rollouts/<id>/dismiss."""
+        engine = self.server.rollout_engine
+        if not engine:
+            self.send_json_error(500, 'no_engine', 'rollout engine not initialized')
+            return
+
+        rollout = engine.rollouts.get(rollout_id)
+        if not rollout:
+            self.send_json_error(404, 'not_found', f'rollout {rollout_id} not found')
+            return
+
+        if rollout.get('phase') != 'failed' or not rollout.get('rollback', {}).get('offered'):
+            self.send_response(409)
+            self.send_header('Content-Type', 'application/json; charset=utf-8')
+            self.end_headers()
+            response = {'error': 'not_dismissable'}
+            self.wfile.write(json.dumps(response).encode('utf-8'))
+            return
+
+        engine.dismiss(rollout_id)
+        self.send_response(200)
+        self.send_header('Content-Type', 'application/json; charset=utf-8')
+        self.end_headers()
+        self.wfile.write(json.dumps({'ok': True}).encode('utf-8'))
+
+    def send_json_error(self, status: int, error: str, detail: str = None):
+        """Send a JSON error response."""
+        self.send_response(status)
+        self.send_header('Content-Type', 'application/json; charset=utf-8')
+        self.end_headers()
+        response = {'error': error}
+        if detail:
+            response['detail'] = detail
+        self.wfile.write(json.dumps(response).encode('utf-8'))
 
     def do_PUT(self):
         self.error_405()
@@ -2264,10 +2529,11 @@ class ThreadingHTTPServer(http.server.ThreadingHTTPServer):
     """HTTP server with references to watcher, event_bus, and port."""
 
     def __init__(self, host_port, handler_class, watcher, event_bus, port,
-                 watcher_lock=None):
+                 watcher_lock=None, rollout_engine=None):
         self.watcher = watcher
         self.event_bus = event_bus
         self.port = port
+        self.rollout_engine = rollout_engine
         # snapshot() reads AND writes watcher state (rung cache commit is
         # elsewhere, but _state mutates under the sensing threads), so every
         # handler read must take the same lock the threads use. Sockets are
@@ -2277,7 +2543,27 @@ class ThreadingHTTPServer(http.server.ThreadingHTTPServer):
 
     def take_snapshot(self):
         with self.watcher_lock:
-            return self.watcher.snapshot()
+            snapshot = self.watcher.snapshot()
+            snapshot['mode'] = 'actuate' if ACTUATE_ARMED else 'read-only'
+            if self.rollout_engine and self.rollout_engine.current:
+                rollout = self.rollout_engine.current
+                snapshot['rollout'] = {
+                    'rollout_id': rollout['rollout_id'],
+                    'unit': rollout['unit'],
+                    'phase': rollout['phase'],
+                    'detail': rollout['detail'],
+                    'edits': rollout['edits'],
+                    'was_active': rollout['was_active'],
+                    'commit': rollout['commit'],
+                    'restored': rollout['restored'],
+                    'failure': rollout['failure'],
+                    'rollback': rollout['rollback'],
+                    'started_at': rollout['started_at'],
+                    'updated_at': rollout['updated_at']
+                }
+            else:
+                snapshot['rollout'] = None
+            return snapshot
 
 
 # ===== SECTION E: ACTUATION (armed only by --actuate; run_actuate + run_git are the only mutation gateways) =====
@@ -2765,6 +3051,626 @@ def _atomic_write(path: str, data: bytes) -> None:
         pass
 
 
+# ===== SECTION E PART 2: PREFLIGHT & ROLLOUT ENGINE =====
+
+# Rollout phases
+ROLLOUT_PHASES = ("preflight", "applying", "reloading", "starting", "watching",
+                  "done", "failed", "rolling_back", "rolled_back", "rollback_failed")
+
+
+def preflight_retired(unit: UnitFile) -> Dict:
+    """Check if unit is retired."""
+    if unit.retired:
+        return {
+            "ok": False,
+            "check": "retired",
+            "detail": f"unit is {unit.retired_note or '[RETIRED]'} — structurally excluded from every actuation path"
+        }
+    return {"ok": True, "check": "retired"}
+
+
+def preflight_git(unit: UnitFile, unit_dir: str) -> Dict:
+    """Check if unit file is tracked in git."""
+    try:
+        result = run_git(["ls-files", "--error-unmatch", "--", unit.name], unit_dir)
+        if result.returncode == 0:
+            # Also check clean worktree for this file
+            result2 = run_git(["status", "--porcelain", "--", unit.name], unit_dir)
+            if result2.stdout.strip():
+                return {
+                    "ok": False,
+                    "check": "git",
+                    "detail": f"unit file {unit.name} has uncommitted changes"
+                }
+            return {"ok": True, "check": "git"}
+        else:
+            return {
+                "ok": False,
+                "check": "git",
+                "detail": f"unit file is not tracked in the unit-dir git repo; run: git -C {unit_dir} add {unit.name} && git commit -m 'track {unit.name}'"
+            }
+    except Exception as e:
+        return {"ok": False, "check": "git", "detail": str(e)}
+
+
+def preflight_port(unit: UnitFile, edits: List[Edit], watcher: 'Watcher', self_port: int) -> Dict:
+    """Check if new port collides with existing claims."""
+    # Find if port is being edited
+    port_edit = None
+    for edit in edits:
+        if edit.field == "port":
+            port_edit = edit
+            break
+
+    if not port_edit:
+        return {"ok": True, "check": "port"}
+
+    new_port = int(port_edit.new_text)
+
+    # Check against all other units and self
+    if new_port == self_port:
+        return {
+            "ok": False,
+            "check": "port",
+            "detail": f"port {new_port} is claimed by roundhouse (self)"
+        }
+
+    # Build list of other claimants
+    claimants = []
+    snapshot = watcher.snapshot()
+
+    for u in snapshot.get('units', []):
+        if u['unit'] == unit.name:
+            continue  # Skip self
+        if u.get('port') == new_port and not u.get('retired'):
+            enabled_str = "enabled" if u.get('enabled') else "disabled"
+            rung_str = u.get('rung', 'OFF')
+            claimants.append(f"{u['unit']} ({enabled_str}, {rung_str})")
+
+    if claimants:
+        detail = f"port {new_port} already declared by {', '.join(claimants)}"
+        return {"ok": False, "check": "port", "detail": detail}
+
+    return {"ok": True, "check": "port"}
+
+
+def preflight_memory(unit: UnitFile, edits: List[Edit], watcher: 'Watcher',
+                     meminfo_reader=None) -> Dict:
+    """Check if memory estimate fits within budget."""
+    # Determine if any memory-relevant field is being edited
+    memory_fields = {"ctx", "cache_type_k", "cache_type_v", "model_path"}
+    has_memory_edit = any(e.field in memory_fields for e in edits)
+
+    if not has_memory_edit:
+        return {"ok": True, "check": "memory"}
+
+    if not unit.exec_start:
+        return {"ok": True, "check": "memory"}
+
+    # Build new profile with edits applied
+    old_profile = extract_param_profile(unit.exec_start.engine_argv)
+    new_profile = dict(old_profile)
+
+    for edit in edits:
+        if edit.field in old_profile:
+            try:
+                if edit.field in ("ctx", "cache_type_k", "cache_type_v"):
+                    if edit.field == "ctx":
+                        new_profile[edit.field] = int(edit.new_text)
+                    else:
+                        new_profile[edit.field] = edit.new_text
+            except Exception:
+                pass
+
+    # Estimate memory
+    store = getattr(watcher, 'mem_store', None)
+    estimate_bytes = None
+    estimate_source = None
+
+    # Try exact measurement first
+    model_path = new_profile.get('model_path')
+    if model_path and unit.exec_start:
+        try:
+            file_id = f"sz{os.stat(model_path).st_size}:mt{int(os.stat(model_path).st_mtime)}"
+            mem = store.lookup(unit.name, file_id, new_profile.get('ctx')) if store else None
+            if mem:
+                estimate_bytes = mem['bytes']
+                estimate_source = "measured"
+        except Exception:
+            pass
+
+    # Fallback to formula
+    if estimate_bytes is None:
+        if model_path:
+            try:
+                size = os.path.getsize(model_path)
+                estimate_bytes = int(size * 1.10 + 1.5 * 1024**3)
+                estimate_source = "formula"
+            except Exception:
+                pass
+
+        if estimate_bytes is None:
+            estimate_bytes = int(9 * 1024**3)  # Default 9 GiB
+            estimate_source = "default"
+
+    # Check model_path exists if being edited
+    for edit in edits:
+        if edit.field == "model_path":
+            if not os.path.exists(edit.new_text):
+                return {
+                    "ok": False,
+                    "check": "memory",
+                    "detail": f"model file not found: {edit.new_text}"
+                }
+
+    # Read MemAvailable
+    mem_available = None
+    if meminfo_reader:
+        info = meminfo_reader()
+        mem_available = info.get('MemAvailable', 0) * 1024
+    else:
+        try:
+            with open('/proc/meminfo', 'r') as f:
+                for line in f:
+                    if line.startswith('MemAvailable:'):
+                        mem_available = int(line.split()[1]) * 1024
+                        break
+        except Exception:
+            pass
+
+    if mem_available is None:
+        mem_available = 0
+
+    # Freed memory from stopping this unit
+    freed_bytes = 0
+    snapshot = watcher.snapshot()
+    for u in snapshot.get('units', []):
+        if u['unit'] == unit.name:
+            mem = u.get('mem', {})
+            if mem and 'bytes' in mem:
+                freed_bytes = mem['bytes']
+            break
+
+    budget = mem_available + freed_bytes
+    headroom = HEADROOM_BYTES
+
+    if estimate_bytes + headroom > budget:
+        return {
+            "ok": False,
+            "check": "memory",
+            "detail": f"estimated {estimate_bytes/(1024**3):.1f} GiB ({estimate_source}), "
+                     f"+ {headroom/(1024**3):.1f} GiB headroom exceeds budget {budget/(1024**3):.1f} GiB "
+                     f"(MemAvailable {mem_available/(1024**3):.1f} GiB + freed {freed_bytes/(1024**3):.1f} GiB)",
+            "estimate_bytes": estimate_bytes,
+            "estimate_source": estimate_source,
+            "mem_available_bytes": mem_available,
+            "freed_bytes": freed_bytes,
+            "headroom_bytes": headroom,
+            "budget_bytes": budget
+        }
+
+    return {"ok": True, "check": "memory"}
+
+
+def preflight(unit: UnitFile, edits: List[Edit], watcher: 'Watcher',
+              self_port: int, unit_dir: str, meminfo_reader=None) -> Dict:
+    """Run all preflight checks."""
+    checks = []
+
+    # Order: retired, git, port, memory
+    retired_check = preflight_retired(unit)
+    checks.append(retired_check)
+    if not retired_check["ok"]:
+        return {"ok": False, "checks": checks}
+
+    git_check = preflight_git(unit, unit_dir)
+    checks.append(git_check)
+    if not git_check["ok"]:
+        return {"ok": False, "checks": checks}
+
+    port_check = preflight_port(unit, edits, watcher, self_port)
+    checks.append(port_check)
+    if not port_check["ok"]:
+        return {"ok": False, "checks": checks}
+
+    memory_check = preflight_memory(unit, edits, watcher, meminfo_reader)
+    checks.append(memory_check)
+
+    ok = all(c["ok"] for c in checks)
+    return {"ok": ok, "checks": checks}
+
+
+class RolloutEngine:
+    """Manages rollout state machine and worker thread."""
+
+    def __init__(self, watcher: 'Watcher', units: Dict[str, UnitFile],
+                 unit_dir: str, self_port: int, event_bus: EventBus,
+                 watcher_lock: threading.Lock):
+        self.watcher = watcher
+        self.units = units
+        self.unit_dir = unit_dir
+        self.self_port = self_port
+        self.event_bus = event_bus
+        self.watcher_lock = watcher_lock
+
+        self.current = None
+        self.rollouts = {}
+        self.counter = 0
+
+    def start_rollout(self, unit_name: str, edits: List[Edit], confirm: str) -> Dict:
+        """Start a new rollout. Returns the rollout record."""
+        with self.watcher_lock:
+            if self.current and self.current.get('phase') not in ('done', 'rolled_back', 'rollback_failed'):
+                if self.current.get('phase') == 'failed' and self.current.get('rollback', {}).get('offered'):
+                    raise ActuationError("rollout_in_progress: rollback offered")
+                raise ActuationError("rollout_in_progress")
+
+            unit = self.units.get(unit_name)
+            if not unit:
+                raise ActuationError(f"unit {unit_name} not found")
+
+            # Create rollout record
+            self.counter += 1
+            rollout_id = f"ro-{int(time.time())}-{self.counter}"
+            now = time.time()
+
+            rollout = {
+                "rollout_id": rollout_id,
+                "unit": unit_name,
+                "phase": "preflight",
+                "detail": "checking prerequisites",
+                "edits": [{"field": e.field, "flag": e.flag, "old": e.old_text, "new": e.new_text} for e in edits],
+                "was_active": None,
+                "commit": None,
+                "restored": False,
+                "failure": None,
+                "rollback": None,
+                "started_at": now,
+                "updated_at": now,
+                "old_raw": unit.raw,
+            }
+
+            self.current = rollout
+            self.rollouts[rollout_id] = rollout
+
+            # Spawn worker thread
+            threading.Thread(
+                target=self._run_rollout,
+                args=(rollout_id, unit_name, edits, confirm),
+                name="rollout",
+                daemon=True
+            ).start()
+
+            return rollout
+
+    def _run_rollout(self, rollout_id: str, unit_name: str, edits: List[Edit], confirm: str):
+        """Worker thread for rollout execution."""
+        rollout = self.rollouts.get(rollout_id)
+        if not rollout:
+            return
+
+        try:
+            unit = self.units[unit_name]
+
+            # Preflight phase
+            self._update_phase(rollout_id, "preflight", "checking prerequisites")
+            pf = preflight(unit, edits, self.watcher, self.self_port, self.unit_dir)
+            if not pf["ok"]:
+                self._fail_rollout(rollout_id, "preflight", "checks failed")
+                return
+
+            # Recompute confirm
+            computed_confirm = compute_confirm(unit_name, unit.raw, edits)
+            if computed_confirm != confirm:
+                self._fail_rollout(rollout_id, "preflight", "confirm mismatch (stale preview)")
+                return
+
+            # Capture was_active
+            snapshot = self.watcher.snapshot()
+            was_active = False
+            for u in snapshot.get('units', []):
+                if u['unit'] == unit_name:
+                    rung = u.get('rung', 'OFF')
+                    was_active = rung in ('STARTING', 'LOADING', 'READY', 'BUSY')
+                    break
+
+            with self.watcher_lock:
+                rollout['was_active'] = was_active
+                rollout['updated_at'] = time.time()
+
+            # Applying phase
+            self._update_phase(rollout_id, "applying", "stopping unit")
+
+            try:
+                if was_active:
+                    try:
+                        self._stop_unit(unit_name)
+                    except Exception as e:
+                        self._fail_rollout(rollout_id, "applying", f"stop failed: {e}")
+                        if was_active:
+                            try:
+                                self._start_unit(unit_name)
+                            except Exception:
+                                pass
+                        return
+
+                # Splice
+                self._update_phase(rollout_id, "applying", "splicing")
+                prov_line = provenance_line(edits, datetime.now(timezone.utc))
+                new_raw = splice(unit.raw, edits, prov_line)
+
+                # Write
+                self._update_phase(rollout_id, "applying", "writing")
+                _atomic_write(unit.path, new_raw)
+
+                # Verify
+                self._update_phase(rollout_id, "applying", "verifying")
+                new_unit = verify_splice(unit, new_raw, edits, prov_line)
+
+                # Commit
+                self._update_phase(rollout_id, "applying", "committing")
+                try:
+                    run_git(["add", "--", unit_name], self.unit_dir)
+                    run_git(["commit", "-m", commit_message(unit_name, edits)], self.unit_dir)
+                    result = run_git(["rev-parse", "HEAD"], self.unit_dir)
+                    commit_sha = result.stdout.strip()
+                    with self.watcher_lock:
+                        rollout['commit'] = commit_sha
+                        rollout['updated_at'] = time.time()
+                except Exception as e:
+                    # Restore and fail
+                    _atomic_write(unit.path, unit.raw)
+                    if was_active:
+                        try:
+                            self._start_unit(unit_name)
+                        except Exception:
+                            pass
+                    self._fail_rollout(rollout_id, "applying", f"commit failed: {e}")
+                    return
+
+                # Update watcher with new unit (S4)
+                with self.watcher_lock:
+                    self.units[unit_name] = new_unit
+                    self.watcher.units[unit_name] = new_unit
+
+            except Exception as e:
+                # Restore
+                try:
+                    _atomic_write(unit.path, unit.raw)
+                except Exception:
+                    pass
+                if was_active:
+                    try:
+                        self._start_unit(unit_name)
+                    except Exception:
+                        pass
+                self._fail_rollout(rollout_id, "applying", str(e))
+                return
+
+            # Reloading phase
+            self._update_phase(rollout_id, "reloading", "reloading daemon")
+            try:
+                self._daemon_reload()
+            except Exception as e:
+                self._fail_rollout(rollout_id, "reloading", str(e), offer_rollback=True)
+                return
+
+            # Starting phase (if was_active)
+            if was_active:
+                self._update_phase(rollout_id, "starting", "starting unit")
+                try:
+                    self._start_unit(unit_name)
+                except Exception as e:
+                    self._fail_rollout(rollout_id, "starting", f"start failed: {e}", offer_rollback=True)
+                    return
+
+                # Watching phase
+                self._update_phase(rollout_id, "watching", "waiting for unit to be ready")
+                self._watch_unit(rollout_id, unit_name)
+            else:
+                # Not starting
+                detail = "applied; unit was not running — not started"
+                if self._check_gate(unit_name):
+                    detail = "applied; kernel gate unsatisfied — not started"
+                self._update_phase(rollout_id, "done", detail)
+                with self.watcher_lock:
+                    rollout['restored'] = False
+                    rollout['updated_at'] = time.time()
+
+        except Exception as e:
+            self._fail_rollout(rollout_id, "preflight", str(e))
+
+    def _update_phase(self, rollout_id: str, phase: str, detail: str):
+        """Update phase and publish SSE event."""
+        with self.watcher_lock:
+            rollout = self.rollouts.get(rollout_id)
+            if rollout:
+                rollout['phase'] = phase
+                rollout['detail'] = detail
+                rollout['updated_at'] = time.time()
+
+        self.event_bus.publish('rollout', {
+            'rollout_id': rollout_id,
+            'phase': phase,
+            'detail': detail,
+            'ok': True,
+            'ts': time.time()
+        })
+
+    def _fail_rollout(self, rollout_id: str, phase: str, reason: str, offer_rollback: bool = False):
+        """Mark rollout as failed."""
+        with self.watcher_lock:
+            rollout = self.rollouts.get(rollout_id)
+            if rollout:
+                rollout['phase'] = 'failed'
+                rollout['failure'] = {'reason': reason, 'detail': reason}
+                if offer_rollback and rollout['commit']:
+                    rollout['rollback'] = {'offered': True}
+                rollout['updated_at'] = time.time()
+
+        self.event_bus.publish('rollout', {
+            'rollout_id': rollout_id,
+            'phase': 'failed',
+            'detail': reason,
+            'ok': False,
+            'ts': time.time()
+        })
+
+    def _stop_unit(self, unit_name: str):
+        """Stop a unit."""
+        run_actuate(["systemctl", "--user", "stop", "--", unit_name], self.units)
+
+    def _start_unit(self, unit_name: str):
+        """Start a unit."""
+        run_actuate(["systemctl", "--user", "start", "--", unit_name], self.units)
+
+    def _daemon_reload(self):
+        """Reload systemd daemon."""
+        run_actuate(["systemctl", "--user", "daemon-reload"], self.units)
+
+    def _watch_unit(self, rollout_id: str, unit_name: str):
+        """Watch unit for READY state (900s timeout)."""
+        start = time.time()
+        timeout = 900
+
+        while time.time() - start < timeout:
+            with self.watcher_lock:
+                snapshot = self.watcher.snapshot()
+                for u in snapshot.get('units', []):
+                    if u['unit'] == unit_name:
+                        rung = u.get('rung', 'OFF')
+                        if rung in ('READY', 'BUSY'):
+                            self._update_phase(rollout_id, 'done', f"loaded in {time.time() - start:.1f}s")
+                            with self.watcher_lock:
+                                rollout = self.rollouts.get(rollout_id)
+                                if rollout:
+                                    rollout['phase'] = 'done'
+                                    rollout['restored'] = False
+                                    rollout['updated_at'] = time.time()
+                            return
+                        elif rung == 'FAILED':
+                            self._fail_rollout(rollout_id, 'watching', 'unit reached FAILED state', offer_rollback=True)
+                            return
+
+                        # Check for no_ready_marker badge
+                        badges = u.get('badges', [])
+                        if 'no_ready_marker' in badges:
+                            self._fail_rollout(rollout_id, 'watching', 'unit timeout (no ready marker)', offer_rollback=True)
+                            return
+                        break
+
+            time.sleep(1)
+
+        self._fail_rollout(rollout_id, 'watching', 'watch timeout (900s)', offer_rollback=True)
+
+    def _check_gate(self, unit_name: str) -> bool:
+        """Check if unit has an unsatisfied kernel gate."""
+        unit = self.units.get(unit_name)
+        if not unit or not unit.gate:
+            return False
+        return True
+
+    def rollback(self, rollout_id: str):
+        """Start rollback of a failed rollout."""
+        rollout = self.rollouts.get(rollout_id)
+        if not rollout or not rollout.get('commit'):
+            raise ActuationError("not_rollbackable")
+
+        if rollout.get('phase') != 'failed' or not rollout.get('rollback', {}).get('offered'):
+            raise ActuationError("not_rollbackable")
+
+        rollout['phase'] = 'rolling_back'
+        rollout['updated_at'] = time.time()
+
+        # Spawn rollback worker
+        threading.Thread(
+            target=self._run_rollback,
+            args=(rollout_id,),
+            daemon=True
+        ).start()
+
+    def _run_rollback(self, rollout_id: str):
+        """Worker thread for rollback."""
+        rollout = self.rollouts.get(rollout_id)
+        if not rollout:
+            return
+
+        unit_name = rollout['unit']
+        was_active = rollout.get('was_active', False)
+
+        try:
+            # Stop unit
+            self._update_phase(rollout_id, 'rolling_back', 'stopping unit')
+            try:
+                self._stop_unit(unit_name)
+            except Exception:
+                pass
+
+            # Revert commit
+            self._update_phase(rollout_id, 'rolling_back', 'reverting commit')
+            try:
+                run_git(["revert", "--no-edit", rollout['commit']], self.unit_dir)
+            except Exception as e:
+                try:
+                    run_git(["revert", "--abort"], self.unit_dir)
+                except Exception:
+                    pass
+                _atomic_write(rollout.get('unit_path') or self.units[unit_name].path, rollout['old_raw'])
+                try:
+                    run_git(["add", "--", unit_name], self.unit_dir)
+                    run_git(["commit", "-m", f"roundhouse: rollback {unit_name} (byte restore; revert failed)"], self.unit_dir)
+                except Exception:
+                    pass
+
+            # Reload daemon
+            self._update_phase(rollout_id, 'rolling_back', 'reloading daemon')
+            try:
+                self._daemon_reload()
+            except Exception as e:
+                self._update_phase(rollout_id, 'rollback_failed', f"daemon reload failed: {e}")
+                with self.watcher_lock:
+                    rollout['phase'] = 'rollback_failed'
+                    rollout['failure'] = {'reason': 'daemon reload', 'detail': str(e)}
+                    rollout['updated_at'] = time.time()
+                return
+
+            # Start unit if it was active
+            if was_active:
+                self._update_phase(rollout_id, 'rolling_back', 'starting unit')
+                try:
+                    self._start_unit(unit_name)
+                except Exception as e:
+                    self._update_phase(rollout_id, 'rollback_failed', f"start failed: {e}")
+                    with self.watcher_lock:
+                        rollout['phase'] = 'rollback_failed'
+                        rollout['failure'] = {'reason': 'start', 'detail': str(e)}
+                        rollout['updated_at'] = time.time()
+                    return
+
+                # Watch old config
+                self._watch_unit(rollout_id, unit_name)
+            else:
+                self._update_phase(rollout_id, 'rolled_back', 'rollback complete')
+                with self.watcher_lock:
+                    rollout['phase'] = 'rolled_back'
+                    rollout['rollback'] = {'offered': False, 'phase': 'rolled_back'}
+                    rollout['updated_at'] = time.time()
+
+        except Exception as e:
+            self._update_phase(rollout_id, 'rollback_failed', str(e))
+            with self.watcher_lock:
+                rollout['phase'] = 'rollback_failed'
+                rollout['updated_at'] = time.time()
+
+    def dismiss(self, rollout_id: str):
+        """Dismiss a failed rollout."""
+        rollout = self.rollouts.get(rollout_id)
+        if rollout and rollout.get('rollback', {}).get('offered'):
+            with self.watcher_lock:
+                rollout['rollback'] = {'offered': False}
+                rollout['updated_at'] = time.time()
+
+
 # ===== SECTION D: MAIN / CLI =====
 
 
@@ -2777,6 +3683,7 @@ def main():
     parser.add_argument('--port', type=int, default=8090, help='HTTP port (default: 8090)')
     parser.add_argument('--db', help='SQLite database path')
     parser.add_argument('--no-db', action='store_true', help='Skip database')
+    parser.add_argument('--actuate', action='store_true', help='Enable rollouts (requires git)')
 
     args = parser.parse_args()
 
@@ -2905,6 +3812,13 @@ def cmd_serve(args):
             return 1
 
     selected_unit_names = sorted(units.keys())
+
+    # Arming sequence (§2.4) — MUST be before any thread starts
+    global ACTUATE_ARMED
+    if args.actuate:
+        git_startup_check(unit_dir)
+        ensure_token()
+        ACTUATE_ARMED = True
 
     # Create MemStore
     mem_store = MemStore(db_path) if use_db else MemStore(None)
@@ -3153,6 +4067,11 @@ def cmd_serve(args):
     journal_thread = threading.Thread(target=journal_with_backfill, daemon=True)
     journal_thread.start()
 
+    # Create RolloutEngine if armed
+    rollout_engine = None
+    if ACTUATE_ARMED:
+        rollout_engine = RolloutEngine(watcher, units, unit_dir, port, event_bus, watcher_lock)
+
     # Start HTTP server
     try:
         server = ThreadingHTTPServer(
@@ -3161,7 +4080,8 @@ def cmd_serve(args):
             watcher,
             event_bus,
             port,
-            watcher_lock=watcher_lock
+            watcher_lock=watcher_lock,
+            rollout_engine=rollout_engine
         )
         print(f"Roundhouse listening on http://0.0.0.0:{port}")
 
