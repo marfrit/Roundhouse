@@ -2148,11 +2148,17 @@ class RoundhouseRequestHandler(http.server.BaseHTTPRequestHandler):
             self.serve_mem()
         elif route == '/api/events':
             self.serve_events()
+        elif route == '/api/routing-config':
+            self.serve_routing_config()
+        elif route == '/api/routing-config.json':
+            self.serve_routing_config_json()
+        elif route == '/api/warm':
+            self.serve_warm_state()
         elif route.startswith('/api/rollouts/'):
             rollout_id = urllib.parse.unquote(route[len('/api/rollouts/'):])
             self.serve_rollout(rollout_id)
-        elif route == '/api/switch/preview' or route == '/api/switch':
-            # Switch routes are POST-only
+        elif route == '/api/switch/preview' or route == '/api/switch' or route == '/api/warm/cancel':
+            # POST-only routes
             self.error_405()
         else:
             self.error_404()
@@ -2172,7 +2178,9 @@ class RoundhouseRequestHandler(http.server.BaseHTTPRequestHandler):
             (route.startswith('/api/rollouts/') and route.endswith('/rollback')) or
             (route.startswith('/api/rollouts/') and route.endswith('/dismiss')) or
             route == '/api/switch/preview' or
-            route == '/api/switch'
+            route == '/api/switch' or
+            route == '/api/warm' or
+            route == '/api/warm/cancel'
         )
 
         # Determine if this is a known GET-only or POST-only route
@@ -2184,6 +2192,9 @@ class RoundhouseRequestHandler(http.server.BaseHTTPRequestHandler):
             route == '/api/deployments' or
             route == '/api/mem' or
             route == '/api/events' or
+            route == '/api/routing-config' or
+            route == '/api/routing-config.json' or
+            route == '/api/warm' or
             route.startswith('/api/rollouts/') or   # GET-only unless /rollback|/dismiss
             route == '/api/switch/preview' or
             route == '/api/switch'
@@ -2228,6 +2239,10 @@ class RoundhouseRequestHandler(http.server.BaseHTTPRequestHandler):
             self.handle_switch_preview()
         elif route == '/api/switch':
             self.handle_switch()
+        elif route == '/api/warm':
+            self.handle_warm()
+        elif route == '/api/warm/cancel':
+            self.handle_warm_cancel()
         else:
             # Unknown POST route
             self.send_response(404)
@@ -3045,6 +3060,356 @@ class RoundhouseRequestHandler(http.server.BaseHTTPRequestHandler):
         self.send_header('Content-Type', 'application/json; charset=utf-8')
         self.end_headers()
         self.wfile.write(json.dumps(data).encode('utf-8'))
+
+    def serve_routing_config(self):
+        """Serve GET /api/routing-config (YAML routing config)."""
+        snapshot = self.server.take_snapshot()
+        advertise_host = getattr(self.server, 'advertise_host', None) or snapshot.get('host', '?')
+        now_utc = datetime.now(timezone.utc)
+
+        entries = build_routing_entries(snapshot, advertise_host)
+        meta = routing_meta(snapshot, advertise_host, self.server.port, now_utc)
+
+        yaml_text = emit_routing_yaml(meta, entries)
+
+        self.send_response(200)
+        self.send_header('Content-Type', 'text/yaml; charset=utf-8')
+        self.end_headers()
+        self.wfile.write(yaml_text.encode('utf-8'))
+
+    def serve_routing_config_json(self):
+        """Serve GET /api/routing-config.json (JSON routing config)."""
+        snapshot = self.server.take_snapshot()
+        advertise_host = getattr(self.server, 'advertise_host', None) or snapshot.get('host', '?')
+        now_utc = datetime.now(timezone.utc)
+
+        entries = build_routing_entries(snapshot, advertise_host)
+        meta = routing_meta(snapshot, advertise_host, self.server.port, now_utc)
+
+        response = {**meta, 'model_list': entries}
+
+        self.send_response(200)
+        self.send_header('Content-Type', 'application/json; charset=utf-8')
+        self.end_headers()
+        self.wfile.write(json.dumps(response).encode('utf-8'))
+
+    def serve_warm_state(self):
+        """Serve GET /api/warm (warm queue state)."""
+        engine = self.server.rollout_engine
+        if engine:
+            state = engine.warm_state()
+        else:
+            state = {'pending': None, 'last': None}
+
+        self.send_json(state)
+
+    def handle_warm(self):
+        """Handle POST /api/warm (warm request)."""
+        # Step 1: Parse body
+        try:
+            content_length = int(self.headers.get('Content-Length', 0))
+            body = self.rfile.read(content_length)
+            data = json.loads(body)
+        except (ValueError, json.JSONDecodeError):
+            self.send_json_error(400, 'bad_json', 'malformed JSON body')
+            return
+
+        # Extract logical and unit (exactly one must be given)
+        logical = data.get('logical')
+        unit = data.get('unit')
+
+        if not isinstance(logical, (str, type(None))) or not isinstance(unit, (str, type(None))):
+            self.send_json_error(400, 'bad_body', 'logical and unit must be strings or null')
+            return
+
+        # Count non-None values
+        given_count = sum(1 for x in [logical, unit] if x is not None)
+        if given_count != 1:
+            self.send_json_error(400, 'bad_body', 'give exactly one of logical or unit')
+            return
+
+        # Step 2: Get engine
+        engine = self.server.rollout_engine
+        if not engine:
+            self.send_json_error(403, 'read_only_mode', 'launch with --actuate to enable rollouts')
+            return
+
+        # Step 3: Resolve target
+        watcher = self.server.watcher
+        snap = locked_snapshot(watcher)
+
+        result = resolve_warm_target(logical, unit, snap, watcher.units)
+        if result[0] == 'error':
+            status, error_code, extra = result[1], result[2], result[3]
+            if error_code == 'ambiguous_alias':
+                self.send_response(422)
+                self.send_header('Content-Type', 'application/json; charset=utf-8')
+                self.end_headers()
+                self.wfile.write(json.dumps({
+                    'error': error_code,
+                    'units': extra.get('units', [])
+                }).encode('utf-8'))
+            else:
+                self.send_json_error(status, error_code, f'{error_code}')
+            return
+
+        target = result[1]
+
+        # Step 4: Sanitize requester
+        requester_header = self.headers.get('X-Roundhouse-Requester', '')
+        # Strip non-allowed characters, keep only [A-Za-z0-9._@ -]
+        requester = ''.join(c for c in requester_header if c in 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789._@ -')
+        # Truncate to 64 chars
+        requester = requester[:64]
+        # If empty, use 'token' as fallback
+        if not requester:
+            requester = 'token'
+
+        # Step 5: Check if retired
+        target_row = None
+        for row in snap.get('units', []):
+            if row['unit'] == target:
+                target_row = row
+                break
+
+        if target_row and target_row.get('retired'):
+            self.send_response(422)
+            self.send_header('Content-Type', 'application/json; charset=utf-8')
+            self.end_headers()
+            self.wfile.write(json.dumps({
+                'error': 'preflight_failed',
+                'checks': [preflight_retired(watcher.units[target])]
+            }).encode('utf-8'))
+            return
+
+        # Step 6: Check if already warm
+        if target_row:
+            rung = target_row.get('rung', 'OFF')
+            if rung in ('READY', 'BUSY', 'STARTING', 'LOADING'):
+                self.send_response(200)
+                self.send_header('Content-Type', 'application/json; charset=utf-8')
+                self.end_headers()
+                self.wfile.write(json.dumps({
+                    'status': 'already_warm',
+                    'unit': target,
+                    'rung': rung
+                }).encode('utf-8'))
+                return
+
+        # Step 7: Check if on-demand
+        unit_obj = watcher.units.get(target)
+        if not unit_obj or not unit_obj.on_demand:
+            self.send_response(422)
+            self.send_header('Content-Type', 'application/json; charset=utf-8')
+            self.end_headers()
+            self.wfile.write(json.dumps({
+                'error': 'not_on_demand',
+                'unit': target,
+                'detail': "unit is not marked '# roundhouse: on-demand' — a warm request may neither start nor stop it (add the marker and restart roundhouse)"
+            }).encode('utf-8'))
+            return
+
+        # Step 8: Queue gate under lock
+        with watcher.lock:
+            if engine.pending_warm is not None:
+                # There's already a pending warm
+                pending_unit = engine.pending_warm.get('unit')
+                if pending_unit == target:
+                    # Dup request
+                    self.send_response(200)
+                    self.send_header('Content-Type', 'application/json; charset=utf-8')
+                    self.end_headers()
+                    self.wfile.write(json.dumps({
+                        'status': 'already_queued',
+                        'unit': target,
+                        'pending': dict(engine.pending_warm)
+                    }).encode('utf-8'))
+                    return
+                else:
+                    # Queue full
+                    self.send_response(409)
+                    self.send_header('Content-Type', 'application/json; charset=utf-8')
+                    self.end_headers()
+                    self.wfile.write(json.dumps({
+                        'error': 'warm_queue_full',
+                        'pending': dict(engine.pending_warm)
+                    }).encode('utf-8'))
+                    return
+
+            # Check if slot is free
+            if not _slot_free(engine.current):
+                # Park the request
+                engine.warm_seq += 1
+                engine.pending_warm = {
+                    'seq': engine.warm_seq,
+                    'unit': target,
+                    'logical': logical,
+                    'requester': requester,
+                    'requested_at': time.time()
+                }
+                self.send_response(202)
+                self.send_header('Content-Type', 'application/json; charset=utf-8')
+                self.end_headers()
+                self.wfile.write(json.dumps({
+                    'queued': True,
+                    'unit': target
+                }).encode('utf-8'))
+                return
+
+        # Step 9: Plan warm (slot is free, no pending)
+        cgroup_cache = {}
+        mem_store = watcher.mem_store
+        plan = warm_plan(target, snap, watcher.units, cgroup_cache, mem_store)
+
+        if not plan['fits']:
+            self.send_response(422)
+            self.send_header('Content-Type', 'application/json; charset=utf-8')
+            self.end_headers()
+            response = {
+                'error': 'consent_unfittable',
+                'unit': target,
+                'detail': f"estimated {plan['estimate_bytes']} bytes + headroom {plan['headroom_bytes']} bytes exceeds available + freed by consenting stops",
+                'estimate_bytes': plan['estimate_bytes'],
+                'estimate_source': plan['estimate_source'],
+                'mem_available_bytes': plan['mem_available_bytes'],
+                'headroom_bytes': plan['headroom_bytes'],
+                'freed_by': plan['freed_by'],
+                'shortfall_bytes': plan['shortfall_bytes'],
+                'consenting': plan['consenting'],
+                'excluded_unmarked': plan['excluded_unmarked']
+            }
+            self.wfile.write(json.dumps(response).encode('utf-8'))
+            return
+
+        # Step 10: Preflight
+        pf = switch_preflight(target, plan['stops'], watcher, watcher.units, self.server.port)
+        if not pf['ok']:
+            self.send_response(422)
+            self.send_header('Content-Type', 'application/json; charset=utf-8')
+            self.end_headers()
+            response = {
+                'error': 'preflight_failed',
+                'target': pf.get('target'),
+                'stop_candidates': pf.get('stop_candidates'),
+                'checks': pf.get('checks', []),
+                'fit': pf.get('fit'),
+                'port': pf.get('port'),
+                'suggested_stops': pf.get('suggested_stops', []),
+                'notices': pf.get('notices', [])
+            }
+            self.wfile.write(json.dumps(response).encode('utf-8'))
+            return
+
+        # Step 11: Start switch
+        try:
+            with watcher.lock:
+                # Re-check queue state after plan/preflight
+                if engine.pending_warm is not None:
+                    pending_unit = engine.pending_warm.get('unit')
+                    if pending_unit == target:
+                        # Dup
+                        self.send_response(200)
+                        self.send_header('Content-Type', 'application/json; charset=utf-8')
+                        self.end_headers()
+                        self.wfile.write(json.dumps({
+                            'status': 'already_queued',
+                            'unit': target,
+                            'pending': dict(engine.pending_warm)
+                        }).encode('utf-8'))
+                        return
+                    else:
+                        # Different unit in queue
+                        self.send_response(409)
+                        self.send_header('Content-Type', 'application/json; charset=utf-8')
+                        self.end_headers()
+                        self.wfile.write(json.dumps({
+                            'error': 'warm_queue_full',
+                            'pending': dict(engine.pending_warm)
+                        }).encode('utf-8'))
+                        return
+
+                # Slot is free and nothing pending, start the switch
+                result = engine.start_switch(target, plan['stops'], pf['confirm'],
+                                            origin='warm', requester=requester, warm_seq=None)
+
+                self.send_response(202)
+                self.send_header('Content-Type', 'application/json; charset=utf-8')
+                self.end_headers()
+                response = {
+                    'rollout_id': result.get('rollout_id'),
+                    'stops': plan['stops']
+                }
+                self.wfile.write(json.dumps(response).encode('utf-8'))
+
+        except ActuationError as e:
+            error_str = str(e)
+            if 'operation_in_progress' in error_str:
+                # Slot stolen: re-enter queue gate
+                with watcher.lock:
+                    if engine.pending_warm is None:
+                        engine.warm_seq += 1
+                        engine.pending_warm = {
+                            'seq': engine.warm_seq,
+                            'unit': target,
+                            'logical': logical,
+                            'requester': requester,
+                            'requested_at': time.time()
+                        }
+                        self.send_response(202)
+                        self.send_header('Content-Type', 'application/json; charset=utf-8')
+                        self.end_headers()
+                        self.wfile.write(json.dumps({
+                            'queued': True,
+                            'unit': target
+                        }).encode('utf-8'))
+                    else:
+                        # Queue full
+                        self.send_response(409)
+                        self.send_header('Content-Type', 'application/json; charset=utf-8')
+                        self.end_headers()
+                        self.wfile.write(json.dumps({
+                            'error': 'warm_queue_full',
+                            'pending': dict(engine.pending_warm)
+                        }).encode('utf-8'))
+            elif 'warm_consent' in error_str:
+                self.send_json_error(422, 'not_on_demand', str(e))
+            else:
+                self.send_json_error(400, 'warm_error', error_str)
+
+    def handle_warm_cancel(self):
+        """Handle POST /api/warm/cancel (cancel pending warm)."""
+        # Get engine
+        engine = self.server.rollout_engine
+        if not engine:
+            self.send_json_error(403, 'read_only_mode', 'launch with --actuate to enable rollouts')
+            return
+
+        watcher = self.server.watcher
+
+        # Cancel under lock
+        with watcher.lock:
+            if engine.pending_warm is None:
+                self.send_json_error(404, 'no_pending', 'no pending warm request')
+                return
+
+            unit = engine.pending_warm.get('unit')
+            requester = engine.pending_warm.get('requester')
+
+            engine.pending_warm = None
+            engine.last_warm = {
+                'unit': unit,
+                'requester': requester,
+                'disposition': 'cancelled',
+                'at': time.time()
+            }
+
+            self.send_response(200)
+            self.send_header('Content-Type', 'application/json; charset=utf-8')
+            self.end_headers()
+            self.wfile.write(json.dumps({
+                'cancelled': True,
+                'unit': unit
+            }).encode('utf-8'))
 
     def log_message(self, format, *args):
         """Suppress log messages."""

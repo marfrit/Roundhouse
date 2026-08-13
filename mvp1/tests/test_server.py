@@ -947,6 +947,7 @@ class TestWriteGuards(unittest.TestCase):
             "/api/units/<name>/edit", "/api/units/<name>/rollout",
             "/api/rollouts/<id>/rollback", "/api/rollouts/<id>/dismiss",
             "/api/switch/preview", "/api/switch", "/api/units/<name>/enablement",
+            "/api/warm", "/api/warm/cancel",
         }
         self.assertEqual(set(roundhouse.FROZEN_POST_ROUTES), expected_routes)
 
@@ -964,13 +965,15 @@ class TestWriteGuards(unittest.TestCase):
         found = {c.value for c in ast.walk(do_post)
                  if isinstance(c, ast.Constant) and isinstance(c.value, str)
                  and c.value.startswith('/')}
-        # Fragments the seven frozen routes decompose into when matched by prefix/suffix
+        # Fragments the nine frozen routes decompose into when matched by prefix/suffix
         from_frozen = {'/api/units/', '/edit', '/rollout', '/enablement',
                        '/api/rollouts/', '/rollback', '/dismiss',
-                       '/api/switch/preview', '/api/switch'}
+                       '/api/switch/preview', '/api/switch',
+                       '/api/warm', '/api/warm/cancel'}
         # GET-only paths do_POST recognises purely to answer 405 (§4 status doctrine)
         get_only = {'/', '/api/units', '/api/ports', '/api/deployments',
-                    '/api/mem', '/api/events'}
+                    '/api/mem', '/api/events', '/api/routing-config',
+                    '/api/routing-config.json', '/api/warm'}
         allowed = from_frozen | get_only
 
         self.assertEqual(
