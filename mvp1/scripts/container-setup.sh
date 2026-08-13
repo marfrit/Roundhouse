@@ -86,14 +86,20 @@ for scenario in SCENARIOS:
     tok = unit.exec_start.engine_argv[0]
     out = raw[:tok.start] + FAKE.encode() + raw[tok.end:]
 
-    # Port override if needed (for switch scenario)
-    if port_override and unit.known.get('execstart'):
-        port_pattern = b'--port'
-        if port_pattern in out:
-            # Find and replace the port number
-            import re
-            port_regex = rb'--port\s+\d+'
-            out = re.sub(port_regex, f'--port {port_override}'.encode(), out)
+    # Port override (the switch scenario needs fake B on its own port).
+    #
+    # This used to be guarded by `unit.known.get('execstart')` — a key `known` does not
+    # have (it holds Description/after/type/wantedby/... only), so the guard was always
+    # false and the override silently did nothing: fake B shipped on the fixture's own
+    # :8087, colliding with the FAKE_EXIT_1 unit and never on the :8093 the drill wants.
+    # Substitute unconditionally and FAIL LOUDLY if the flag is not there.
+    if port_override:
+        import re
+        out, n = re.subn(rb'--port\s+\d+', f'--port {port_override}'.encode(), out)
+        if n != 1:
+            raise SystemExit(f'{name}: expected exactly one --port to override, found {n}')
+        # the human-readable port in Description= would otherwise contradict the flag
+        out = re.sub(rb'\(port \d+\)', f'(port {port_override})'.encode(), out)
 
     inject = [f'Environment={k}={v}' for k, v in env.items()] + list(extra)
     marker = b'[Service]\n'

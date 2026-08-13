@@ -2472,18 +2472,9 @@ class RoundhouseRequestHandler(http.server.BaseHTTPRequestHandler):
             self.send_json_error(500, 'no_engine', 'rollout engine not initialized')
             return
 
-        # Check slot status (F11)
-        if engine.current and not _slot_free(engine.current):
-            self.send_response(409)
-            self.send_header('Content-Type', 'application/json; charset=utf-8')
-            self.end_headers()
-            response = {
-                'error': 'operation_in_progress',
-                'rollout_id': engine.current.get('rollout_id'),
-                'kind': engine.current.get('kind', 'rollout')
-            }
-            self.wfile.write(json.dumps(response).encode('utf-8'))
-            return
+        # NO slot check here. Preview is STATELESS: it takes no slot and answers while an
+        # operation runs (§4's route table lists no 409 for this route; the MVP2 edit
+        # preview behaves the same). Only /api/switch competes for the slot.
 
         # Find units
         watcher = self.server.watcher
@@ -2496,8 +2487,7 @@ class RoundhouseRequestHandler(http.server.BaseHTTPRequestHandler):
                 self.send_json_error(404, 'not_found', f'unit {stop_name} not found')
                 return
 
-        # Take snapshot and run preflight
-        snapshot = watcher.snapshot()
+        # Run preflight (one snapshot per request lives inside switch_preflight, §3.3)
         pf = switch_preflight(target, stops, watcher, watcher.units,
                              self.server.port)
 
@@ -2579,15 +2569,22 @@ class RoundhouseRequestHandler(http.server.BaseHTTPRequestHandler):
                 self.send_json_error(404, 'not_found', f'unit {stop_name} not found')
                 return
 
-        # Check that all are in selected units
-        if target not in watcher.units:
-            self.send_json_error(404, 'not_found', f'target {target} not found')
+        # Slot check (F11) BEFORE preflight/staleness: while another operation holds the
+        # slot the world is moving under us, so the fingerprint almost always mismatches
+        # and the honest answer would be masked as `preview_stale` ("re-preview" — which
+        # would loop forever). `start_switch` re-checks under the lock; this is the honest
+        # message, that one is the race-proof gate.
+        if not _slot_free(engine.current):
+            self.send_response(409)
+            self.send_header('Content-Type', 'application/json; charset=utf-8')
+            self.end_headers()
+            response = {
+                'error': 'operation_in_progress',
+                'rollout_id': engine.current.get('rollout_id'),
+                'kind': engine.current.get('kind', 'rollout'),
+            }
+            self.wfile.write(json.dumps(response).encode('utf-8'))
             return
-
-        for stop in stops:
-            if stop not in watcher.units:
-                self.send_json_error(404, 'not_found', f'stop {stop} not found')
-                return
 
         # Re-check preflight (run switch_preflight to validate everything is still good)
         pf = switch_preflight(target, stops, watcher, watcher.units,
@@ -4486,31 +4483,28 @@ class RolloutEngine:
 
                 # Confirm OFF
                 try:
-                    if not self._confirm_off(stop_unit):
-                        self._fail_rollout(switch_id, "stopping", "stop_unconfirmed",
-                                         offer_rollback=bool(switch.get('stopped')),
-                                         detail=f"unit {stop_unit} did not confirm OFF within {CONFIRM_OFF_TIMEOUT_SEC}s")
-                        # Append notice if rung is FAILED
-                        with self.watcher_lock:
-                            snapshot = self.watcher.snapshot()
-                            for u in snapshot.get('units', []):
-                                if u['unit'] == stop_unit and u.get('rung') == 'FAILED':
-                                    switch = self.rollouts.get(switch_id)
-                                    if switch:
-                                        switch['detail'] += " (unit FAILED; considered stopped)"
-                        return
-                except Exception as e:
+                    status = self._confirm_off(stop_unit)
+                except Exception:
+                    status = ''
+                if not status:
                     self._fail_rollout(switch_id, "stopping", "stop_unconfirmed",
                                      offer_rollback=bool(switch.get('stopped')),
-                                     detail=f"confirm timeout for {stop_unit}")
+                                     detail=f"unit {stop_unit} did not confirm OFF within {CONFIRM_OFF_TIMEOUT_SEC}s")
                     return
 
-                # Record the stopped unit
+                # Record the stopped unit.
                 with self.watcher_lock:
                     switch = self.rollouts.get(switch_id)
                     if switch:
                         switch['stopped'].append(stop_unit)
                         switch['updated_at'] = time.time()
+
+                # A FAILED-after-stop counts as stopped (the process is dead and its
+                # memory is freed) but must say so out loud — on the record AND on the
+                # stream, or the operator never learns the unit did not exit cleanly (F2).
+                if status == 'failed':
+                    self._update_phase(switch_id, "stopping",
+                                       f"{detail} (unit FAILED; considered stopped)")
 
             # Starting phase
             self._update_phase(switch_id, "starting", f"starting {target}")
@@ -4562,10 +4556,15 @@ class RolloutEngine:
         except Exception as e:
             self._fail_rollout(switch_id, "failed", "engine_error", detail=str(e))
 
-    def _confirm_off(self, unit_name: str) -> bool:
-        """Poll roster until unit's rung is not in ACTIVE_RUNGS, with fresh sensed_at.
+    def _confirm_off(self, unit_name: str) -> str:
+        """Poll the roster until `unit_name` is confirmed no longer running (F2).
 
-        Returns True if confirmed OFF within timeout, False otherwise.
+        Returns a STATUS STRING, falsy only on timeout, so callers can both gate on
+        truthiness and tell the two confirmed outcomes apart:
+          `'off'`     — rung left ACTIVE_RUNGS in a sample sensed after the stop returned
+          `'failed'`  — rung is FAILED: the process is dead and its memory is freed, which
+                        is all a switch needs, but the caller appends a notice (F2)
+          `''`        — not confirmed within CONFIRM_OFF_TIMEOUT_SEC
         """
         start = time.time()
         timeout = CONFIRM_OFF_TIMEOUT_SEC
@@ -4573,22 +4572,23 @@ class RolloutEngine:
         while time.time() - start < timeout:
             with self.watcher_lock:
                 snapshot = self.watcher.snapshot()
-                now = snapshot.get('now', time.time())
                 for u in snapshot.get('units', []):
                     if u['unit'] == unit_name:
                         rung = u.get('rung', 'OFF')
                         sensed_at = u.get('sensed_at', 0)
-                        # Check if rung is OFF and sensed_at is fresh (after we stopped)
-                        if rung not in ACTIVE_RUNGS and sensed_at > start:
-                            return True
-                        # FAILED counts as confirmed (process dead)
+                        # FAILED means the main process is gone; no freshness gate is
+                        # needed (a stop candidate was ACTIVE at preflight by construction).
                         if rung == 'FAILED':
-                            return True
+                            return 'failed'
+                        # Otherwise require a sample sensed AFTER the stop command returned:
+                        # the 3 s tick means the first samples still describe the live unit.
+                        if rung not in ACTIVE_RUNGS and sensed_at > start:
+                            return 'off'
                         break
 
             time.sleep(1)
 
-        return False
+        return ''
 
     def _run_restore(self, switch_id: str):
         """Worker thread for restore after a failed switch (§2.1 restoring phase)."""
@@ -4598,7 +4598,9 @@ class RolloutEngine:
 
         try:
             target = switch.get('target')
-            stopped_units = switch.get('stopped', [])
+            stopped_units = list(switch.get('stopped', []))
+            # §2.1: 900 s TOTAL for the restore, one shared clock — not per unit.
+            deadline = time.time() + WATCH_TIMEOUT_SEC
 
             # Stop target if active and non-fatal
             if target:
@@ -4616,43 +4618,50 @@ class RolloutEngine:
                     if target_active:
                         try:
                             self._stop_unit(target)
+                            # Wait for it to actually die before restarting the units it
+                            # displaced — otherwise the restored unit races the target for
+                            # the port. Non-fatal: the target may already be gone.
+                            self._confirm_off(target)
                         except Exception:
                             pass  # Log but don't fail
                 except Exception:
                     pass
 
             # Restart stopped units in original order
-            for unit in stopped_units:
+            for idx, unit in enumerate(stopped_units):
                 self._update_phase(switch_id, "restoring", f"starting {unit}")
                 try:
                     self._start_unit(unit)
                 except Exception as e:
-                    self._update_phase(switch_id, "restore_failed", f"start failed for {unit}: {e}")
+                    # Everything from this unit onward is still down: name exactly those.
+                    manual_cmd = f"systemctl --user start {' '.join(stopped_units[idx:])}"
+                    self._update_phase(switch_id, "restore_failed",
+                                       f"restore failed; manual recovery: {manual_cmd}")
                     with self.watcher_lock:
                         switch = self.rollouts.get(switch_id)
                         if switch:
                             switch['phase'] = 'restore_failed'
                             switch['failure'] = {'reason': 'restore_start_failed', 'detail': str(e)}
-                            manual_cmd = f"systemctl --user start {' '.join(stopped_units)}"
                             switch['detail'] = f"restore failed; manual recovery: {manual_cmd}"
                             switch['updated_at'] = time.time()
                     return
 
-                # Watch each unit back to READY
-                prior_start_ts = None
-                deadline = time.time() + WATCH_TIMEOUT_SEC
-                result = self._watch_to_ready(unit, prior_start_ts, deadline)
+                # Watch each unit back to READY against the shared restore deadline
+                result = self._watch_to_ready(unit, None, deadline)
 
                 if result[0] != 'ready':
                     reason = result[1] if result[0] == 'failed' else 'watch_timeout'
-                    self._update_phase(switch_id, "restore_failed", f"restore watch failed for {unit}: {reason}")
+                    # `unit` was started but never came up, so it stays in the list too.
+                    manual_cmd = f"systemctl --user start {' '.join(stopped_units[idx:])}"
+                    self._update_phase(switch_id, "restore_failed",
+                                       f"restore incomplete ({unit}: {reason}); manually start: {manual_cmd}")
                     with self.watcher_lock:
                         switch = self.rollouts.get(switch_id)
                         if switch:
                             switch['phase'] = 'restore_failed'
                             switch['failure'] = {'reason': 'restore_watch_failed', 'detail': reason}
-                            manual_cmd = f"systemctl --user start {' '.join([u for u in stopped_units if u != unit])}"
-                            switch['detail'] = f"restore incomplete; manually start: {manual_cmd}"
+                            switch['detail'] = (
+                                f"restore incomplete ({unit}: {reason}); manually start: {manual_cmd}")
                             switch['updated_at'] = time.time()
                     return
 
@@ -4987,6 +4996,10 @@ def switch_preflight(target: str, stops: List[str], watcher: 'Watcher', units: D
             "notices": []
         }
 
+    # The retired check passed: record it, so a successful preview carries all five
+    # §3.2 rows (the failing paths above return the single offending row).
+    checks.append({"ok": True, "check": "retired"})
+
     # 2. TARGET RUNG CHECK (F9: must be OFF with per-rung details)
     target_row = None
     for u in snapshot.get('units', []):
@@ -5000,8 +5013,16 @@ def switch_preflight(target: str, stops: List[str], watcher: 'Watcher', units: D
 
     if not target_check_ok:
         if target_rung == 'STANDBY':
-            gate = (target_row or {}).get('gate', {})
-            target_check_detail = f"waiting for kernel {gate.get('kernel')} (running: {gate.get('running')})"
+            # The gate dict is `parse_gate`'s shape: {'kind', 'wants', 'raw'} — it carries
+            # neither a 'kernel' nor a 'running' key, so reading those rendered
+            # "waiting for kernel None (running: None)". The running release lives on the
+            # snapshot (os.uname()[2]); `wants` is None for an opaque gate, where the raw
+            # ExecCondition is the only honest thing to show.
+            gate = (target_row or {}).get('gate') or {}
+            wants = gate.get('wants') or gate.get('raw') or 'an unknown kernel'
+            running = (snapshot.get('kernel')
+                       or getattr(watcher, 'running_kernel', None) or 'unknown')
+            target_check_detail = f"waiting for kernel {wants} (running: {running})"
         elif target_rung == 'RETIRED':
             target_check_detail = "unit is retired"
         elif target_rung in ACTIVE_RUNGS:
@@ -5035,7 +5056,17 @@ def switch_preflight(target: str, stops: List[str], watcher: 'Watcher', units: D
     stops_check_ok = True
     stop_offenders = []
 
+    # A duplicated tick is not harmless: the freed-memory sum below iterates `stops`, so
+    # the same unit's residency would be counted twice — inflating the budget until a
+    # switch that does NOT fit passes the fit check — and the worker would append it to
+    # `stopped` twice, making the restore start it twice. F9 lists duplicates as an
+    # ineligible-stop case; enforce it here, once, before any arithmetic runs.
+    seen = set()
     for stop_unit in stops:
+        if stop_unit in seen:
+            stop_offenders.append(f"{stop_unit} (listed twice)")
+            continue
+        seen.add(stop_unit)
         if stop_unit == target:
             stop_offenders.append(f"{stop_unit} (cannot stop target)")
         elif stop_unit not in units:

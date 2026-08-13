@@ -15,6 +15,9 @@ import json
 import time
 import socket
 import threading
+import hashlib
+import contextlib
+import queue
 import http.client
 from pathlib import Path
 from datetime import datetime, timezone
@@ -1788,10 +1791,21 @@ class TestFreedMemoryTerm(unittest.TestCase):
         ]}
         return watcher
 
+    # `preflight_memory` returns the labelled numbers only on the FAILING branch (MVP2
+    # behaviour, frozen by MVP3-SPEC §1's byte-identical requirement). These tests read
+    # `freed_bytes`, so the check has to be guaranteed to fail — and it was not: the
+    # estimate came from the real filesystem, so on a box where the fixture's model file
+    # actually exists (the acceptance container, which lays down stand-in models) the
+    # estimate collapsed to ~1.5 GiB, the check PASSED, and every read raised KeyError.
+    # Pin the estimate instead of relying on the host's model paths and free RAM.
+    FIXED_ESTIMATE = (12 * 1024 ** 3, 'test-injected')
+
     def _run(self, watcher, mem_available_kb=1024):
-        return roundhouse.preflight_memory(
-            self.unit, self.edits, watcher,
-            meminfo_reader=lambda: {'MemAvailable': mem_available_kb})
+        with patch.object(roundhouse, '_estimate_start_bytes',
+                          lambda *a, **k: self.FIXED_ESTIMATE):
+            return roundhouse.preflight_memory(
+                self.unit, self.edits, watcher,
+                meminfo_reader=lambda: {'MemAvailable': mem_available_kb})
 
     def test_stopped_unit_frees_nothing(self):
         """Regression: the snapshot `mem` row is an ESTIMATE for units that are OFF —
@@ -1903,9 +1917,14 @@ class TestSwitchPreflight(unittest.TestCase):
         unit = self._load_fixture('qwen3.6-coding.service')
         units = {unit.name: unit}
         watcher = MagicMock()
+        # `gate` is parse_gate's REAL shape — {'kind', 'wants', 'raw'}. It has no 'kernel'
+        # and no 'running' key; the running release comes off the snapshot (os.uname()[2]).
         watcher.snapshot.return_value = {
+            'kernel': '6.0.0',
             'units': [
-                {'unit': unit.name, 'rung': 'STANDBY', 'gate': {'kernel': '6.1.0', 'running': '6.0.0'},
+                {'unit': unit.name, 'rung': 'STANDBY',
+                 'gate': {'kind': 'kernel', 'wants': '6.1.0',
+                          'raw': '/bin/sh -c \'[ "$(uname -r)" = "6.1.0" ]\''},
                  'retired': False, 'port': 8085, 'mem': {}},
             ]
         }
@@ -1917,7 +1936,32 @@ class TestSwitchPreflight(unittest.TestCase):
 
         result = roundhouse.switch_preflight(unit.name, [], watcher, units, 8090, meminfo_reader)
         self.assertFalse(result['ok'])
-        self.assertIn('kernel 6.1.0', result['checks'][0]['detail'])
+        detail = result['checks'][0]['detail']
+        self.assertIn('kernel 6.1.0', detail)
+        self.assertIn('running: 6.0.0', detail)
+        self.assertNotIn('None', detail)
+
+    def test_target_standby_opaque_gate_shows_raw_condition(self):
+        """An opaque gate has wants=None; the raw ExecCondition is the honest fallback."""
+        unit = self._load_fixture('qwen3.6-coding.service')
+        units = {unit.name: unit}
+        watcher = MagicMock()
+        watcher.snapshot.return_value = {
+            'kernel': '6.0.0',
+            'units': [
+                {'unit': unit.name, 'rung': 'STANDBY',
+                 'gate': {'kind': 'opaque', 'wants': None, 'raw': '/usr/bin/test -e /dev/npu'},
+                 'retired': False, 'port': 8085, 'mem': {}},
+            ]
+        }
+        watcher._cgroup_cache = {}
+        watcher.mem_store = None
+
+        result = roundhouse.switch_preflight(unit.name, [], watcher, units, 8090,
+                                             lambda: {'MemAvailable': 20 * 1024 * 1024})
+        self.assertFalse(result['ok'])
+        self.assertIn('/usr/bin/test -e /dev/npu', result['checks'][0]['detail'])
+        self.assertNotIn('None', result['checks'][0]['detail'])
 
     def test_target_failed_fails_with_clear_failure_message(self):
         """FAILED target fails with 'clear the failure' message (F9)."""
@@ -1969,6 +2013,37 @@ class TestSwitchPreflight(unittest.TestCase):
         result = roundhouse.switch_preflight(unit.name, [], watcher, units, 8090)
         self.assertFalse(result['ok'])
         self.assertEqual(result['checks'][0]['check'], 'retired')
+
+    def test_duplicate_stop_is_refused_not_double_counted(self):
+        """F9: a name ticked twice is an ineligible stop.
+
+        Without this the freed sum iterates `stops` and credits the same unit's residency
+        twice, so a switch that does not fit passes the fit check.
+        """
+        unit = self._load_fixture('llama-server-gemma4.service')
+        other = self._load_fixture('qwen3.6-coding.service')
+        units = {unit.name: unit, other.name: other}
+        watcher = MagicMock()
+        watcher.snapshot.return_value = {'units': [
+            {'unit': unit.name, 'rung': 'OFF', 'retired': False, 'port': 8093, 'mem': {}},
+            {'unit': other.name, 'rung': 'READY', 'retired': False, 'port': 8085, 'mem': {}},
+        ]}
+        watcher._cgroup_cache = {other.name: {'current': 8 * 1024 ** 3}}
+        watcher.mem_store = None
+        meminfo = lambda: {'MemAvailable': 1024}          # 1 MiB: only `freed` can pay
+
+        dup = roundhouse.switch_preflight(unit.name, [other.name, other.name],
+                                          watcher, units, 8090, meminfo)
+        self.assertFalse(dup['ok'])
+        stops_check = [c for c in dup['checks'] if c['check'] == 'stops'][0]
+        self.assertFalse(stops_check['ok'])
+        self.assertIn('twice', stops_check['detail'])
+        self.assertIsNone(dup.get('confirm'))
+
+        # the single-tick version of the same request is legal, and frees 8 GiB ONCE
+        single = roundhouse.switch_preflight(unit.name, [other.name],
+                                             watcher, units, 8090, meminfo)
+        self.assertEqual(single['fit']['freed_bytes'], 8 * 1024 ** 3)
 
     def test_memory_check_uses_sum_of_freed_stops(self):
         """Memory check sums freed bytes from all ticked stops with per-unit labels."""
@@ -2160,18 +2235,462 @@ class TestSwitchConfirm(unittest.TestCase):
         self.assertNotIn('retired.service', fp)
 
 
-class TestSwitchEngine(_EngineHarness):
-    """Switch engine state machine per MVP3-SPEC §2.1."""
+class _ScriptedFleet:
+    """A stub watcher whose roster answers the way the test scripts it.
 
-    def test_switch_methods_exist(self):
-        """Verify all required switch methods exist."""
-        engine = roundhouse.RolloutEngine(MagicMock(), {}, self.temp_dir, 8090,
-                                        roundhouse.EventBus(), threading.Lock())
-        self.assertTrue(hasattr(engine, 'start_switch'))
-        self.assertTrue(hasattr(engine, '_run_switch'))
-        self.assertTrue(hasattr(engine, '_confirm_off'))
-        self.assertTrue(hasattr(engine, '_watch_to_ready'))
-        self.assertTrue(hasattr(engine, '_run_restore'))
+    The point of driving the fleet from the recorded lifecycle verbs (rather than a
+    canned `snapshot.side_effect` list) is that the confirmed-OFF gate and the watch
+    freshness gate are *timing* rules: they only mean anything against a roster that
+    changes when — and only when — something was actually stopped or started.
+    """
+
+    def __init__(self, rows, self_kernel='6.1.0'):
+        self.lock = threading.Lock()
+        self.rows = {name: dict(r) for name, r in rows.items()}
+        self.kernel = self_kernel
+        self.units = {}
+        self.mem_store = None
+        self._cgroup_cache = {}
+        self.running_kernel = self_kernel
+        # scripts, keyed by unit name
+        self.stop_plan = {}      # 'off' (default) | 'failed' | 'stuck' (never leaves ACTIVE)
+        self.start_plan = {}     # 'ready' (default) | 'failed' | 'loading' (never ready)
+        self.hold = {}           # unit -> threading.Event: delay the stop settling
+
+    # --- roster -------------------------------------------------------------------
+    def snapshot(self):
+        now = time.time()
+        with self.lock:
+            units = [dict(row, unit=name, sensed_at=now)
+                     for name, row in self.rows.items()]
+        return {'host': 'test', 'kernel': self.kernel, 'now': now,
+                'mem': {}, 'sources': {}, 'self_port': 8090, 'units': units}
+
+    def rung(self, name):
+        with self.lock:
+            return self.rows[name]['rung']
+
+    # --- effects of the lifecycle verbs -------------------------------------------
+    def on_stop(self, name):
+        plan = self.stop_plan.get(name, 'off')
+        if plan == 'stuck':
+            return                       # rung stays ACTIVE: confirm-off must time out
+        ev = self.hold.get(name)
+        if ev is not None:
+            threading.Thread(target=self._settle_when_released, args=(name, ev, plan),
+                             daemon=True).start()
+            return
+        self._settle_stop(name, plan)
+
+    def _settle_when_released(self, name, ev, plan):
+        ev.wait(30)
+        self._settle_stop(name, plan)
+
+    def _settle_stop(self, name, plan):
+        with self.lock:
+            self.rows[name]['rung'] = 'FAILED' if plan == 'failed' else 'OFF'
+
+    def on_start(self, name):
+        plan = self.start_plan.get(name, 'ready')
+        with self.lock:
+            row = self.rows[name]
+            # a real start moves ExecMainStartTimestamp; the watch freshness gate reads it
+            row['since'] = time.time()
+            row['start_ts_mono'] = str(int(time.time() * 1e6))
+            row['rung'] = {'ready': 'READY', 'failed': 'FAILED'}.get(plan, 'LOADING')
+
+
+class _SwitchHarness(unittest.TestCase):
+    """Engine + scripted fleet + recording gateways; no systemd, no git, no files."""
+
+    TARGET = 'llama-server-gemma4.service'
+    A = 'qwen3.6-coding.service'
+    B = 'llama-embed.service'
+
+    def setUp(self):
+        self.temp_dir = tempfile.mkdtemp()
+        self.actuate_calls = []
+        self.git_calls = []
+        fixtures = Path(__file__).resolve().parents[2] / 'docs' / 'fixtures'
+        self.units = {}
+        for name in (self.TARGET, self.A, self.B):
+            path = fixtures / name
+            if path.exists():
+                self.units[name] = roundhouse.parse_unit(str(path), path.read_bytes())
+
+    def tearDown(self):
+        shutil.rmtree(self.temp_dir, ignore_errors=True)
+
+    def _fleet(self, active):
+        """Fleet with `active` units READY and the target OFF."""
+        rows = {self.TARGET: {'rung': 'OFF', 'retired': False, 'port': 8093, 'since': 1.0,
+                              'start_ts_mono': '0', 'badges': [], 'mem': {}, 'enabled': True}}
+        port = 8085
+        for name in active:
+            rows[name] = {'rung': 'READY', 'retired': False, 'port': port, 'since': 100.0,
+                          'start_ts_mono': str(port), 'badges': [], 'mem': {}, 'enabled': True}
+            port += 1
+        fleet = _ScriptedFleet(rows)
+        fleet.units = {n: self.units[n] for n in rows if n in self.units}
+        return fleet
+
+    def _engine(self, fleet):
+        engine = roundhouse.RolloutEngine(fleet, dict(fleet.units), self.temp_dir, 8090,
+                                          roundhouse.EventBus(), threading.Lock())
+        self.events = engine.event_bus.subscribe()
+        return engine
+
+    def _stub_actuate(self, fleet):
+        def stub(argv, units, timeout=90):
+            self.actuate_calls.append(list(argv))
+            verb, name = argv[2], argv[-1]
+            if verb == 'stop':
+                fleet.on_stop(name)
+            elif verb == 'start':
+                fleet.on_start(name)
+            return ''
+        return stub
+
+    def _raising_git(self, *args, **kwargs):
+        raise AssertionError(f'run_git must never be called in a switch: {args}')
+
+    def _raising_atomic_write(self, *args, **kwargs):
+        raise AssertionError(f'_atomic_write must never be called in a switch: {args}')
+
+    def _confirm_for(self, fleet, target, stops):
+        return roundhouse.compute_switch_confirm(
+            target, stops, roundhouse.fleet_fingerprint(fleet.snapshot()))
+
+    @staticmethod
+    def _tiny_estimate(unit_name, profile, mem_store):
+        """The fixtures name model files that do not exist here, so the estimator falls
+        back to its 9 GiB default and the worker's re-run preflight would fail on any
+        build box with less free RAM than that. Memory arithmetic is TestSwitchPreflight's
+        subject; these tests are about the state machine, so pin the estimate small."""
+        return (64 * 1024 * 1024, 'test-injected')
+
+    def _run_switch(self, engine, fleet, target, stops, timeout=25.0, zero_writes=True):
+        """Drive one switch to a terminal phase with every gateway stubbed/blocked."""
+        confirm = self._confirm_for(fleet, target, stops)
+        ctx = [patch.object(roundhouse, 'run_actuate', self._stub_actuate(fleet)),
+               patch.object(roundhouse, '_estimate_start_bytes', self._tiny_estimate)]
+        if zero_writes:
+            ctx.append(patch.object(roundhouse, 'run_git', self._raising_git))
+            ctx.append(patch.object(roundhouse, '_atomic_write', self._raising_atomic_write))
+        with contextlib.ExitStack() as stack:
+            for c in ctx:
+                stack.enter_context(c)
+            rec = engine.start_switch(target, stops, confirm)
+            self._wait_terminal(rec, timeout)
+        return rec
+
+    def _wait_terminal(self, rec, timeout=25.0,
+                       terminals=('done', 'failed', 'restored', 'restore_failed')):
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            if rec['phase'] in terminals:
+                return rec
+            time.sleep(0.02)
+        self.fail(f"operation never settled; stuck in {rec['phase']}: {rec['detail']}")
+
+    def _wait_for(self, predicate, timeout=10.0, what='condition'):
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            if predicate():
+                return
+            time.sleep(0.02)
+        self.fail(f'timed out waiting for {what}')
+
+    def _phases(self):
+        """The phase sequence published on the SSE bus, duplicates collapsed."""
+        seq = []
+        while True:
+            try:
+                event, data, _ = self.events.get_nowait()
+            except queue.Empty:
+                break
+            self.assertEqual(event, 'rollout', 'SSE event name stays `rollout` (F5)')
+            seq.append((data['phase'], data.get('detail'), data.get('kind'), data.get('unit')))
+        return seq
+
+
+class TestSwitchEngine(_SwitchHarness):
+    """Switch engine state machine per MVP3-SPEC §2.1 / §7.2, behaviourally."""
+
+    # --- happy path ---------------------------------------------------------------
+
+    def test_happy_path_argv_sequence_is_stop_stop_start_and_nothing_else(self):
+        """F10: exactly [stop A, stop B, start T] — in order, with NO daemon-reload."""
+        fleet = self._fleet([self.A, self.B])
+        engine = self._engine(fleet)
+
+        rec = self._run_switch(engine, fleet, self.TARGET, [self.A, self.B])
+
+        self.assertEqual(rec['phase'], 'done', rec['detail'])
+        self.assertEqual(self.actuate_calls, [
+            ['systemctl', '--user', 'stop', '--', self.A],
+            ['systemctl', '--user', 'stop', '--', self.B],
+            ['systemctl', '--user', 'start', '--', self.TARGET],
+        ])
+        self.assertNotIn('daemon-reload', [c[2] for c in self.actuate_calls])
+        self.assertEqual(rec['stopped'], [self.A, self.B], 'stops recorded in order')
+        self.assertTrue(rec['target_started'])
+        self.assertIn('ready in', rec['detail'])
+
+    def test_happy_path_phase_and_sse_sequence(self):
+        """§2.1 phase order, kind='switch' on every event, and the stopping (i/n) detail."""
+        fleet = self._fleet([self.A, self.B])
+        engine = self._engine(fleet)
+
+        rec = self._run_switch(engine, fleet, self.TARGET, [self.A, self.B])
+        seq = self._phases()
+
+        phases = [p for p, _, _, _ in seq]
+        self.assertEqual(phases, ['preflight', 'stopping', 'stopping', 'starting',
+                                  'watching', 'done'], seq)
+        for phase, detail, kind, unit in seq:
+            self.assertEqual(kind, 'switch', f'{phase} event lost kind')
+            self.assertEqual(unit, self.TARGET, f'{phase} event lost unit')
+        details = [d for _, d, _, _ in seq]
+        self.assertEqual(details[1], f'stopping {self.A} (1/2)')
+        self.assertEqual(details[2], f'stopping {self.B} (2/2)')
+        self.assertEqual(rec['phase'], 'done')
+
+    def test_switch_with_no_ticks_skips_stopping_entirely(self):
+        """No ticked stops -> preflight goes straight to starting (§2.1 preflight row)."""
+        fleet = self._fleet([])
+        engine = self._engine(fleet)
+
+        rec = self._run_switch(engine, fleet, self.TARGET, [])
+
+        self.assertEqual(rec['phase'], 'done', rec['detail'])
+        self.assertEqual(self.actuate_calls,
+                         [['systemctl', '--user', 'start', '--', self.TARGET]])
+        self.assertEqual([p for p, _, _, _ in self._phases()],
+                         ['preflight', 'starting', 'watching', 'done'])
+
+    # --- the confirmed-OFF gate ---------------------------------------------------
+
+    def test_confirm_off_holds_stopping_until_the_roster_reports_off(self):
+        """The `stopping` phase must not advance on the stop command's return alone."""
+        fleet = self._fleet([self.A])
+        release = threading.Event()
+        fleet.hold[self.A] = release
+        engine = self._engine(fleet)
+        confirm = self._confirm_for(fleet, self.TARGET, [self.A])
+
+        with patch.object(roundhouse, 'run_actuate', self._stub_actuate(fleet)), \
+             patch.object(roundhouse, '_estimate_start_bytes', self._tiny_estimate), \
+             patch.object(roundhouse, 'run_git', self._raising_git):
+            rec = engine.start_switch(self.TARGET, [self.A], confirm)
+            self._wait_for(lambda: ['systemctl', '--user', 'stop', '--', self.A]
+                           in self.actuate_calls, what='the stop command')
+            # The stop RETURNED, but the roster still says READY.
+            time.sleep(1.5)
+            self.assertEqual(rec['phase'], 'stopping',
+                             'advanced before the roster confirmed OFF')
+            self.assertEqual(rec['stopped'], [], 'recorded a stop the roster never confirmed')
+            self.assertNotIn(['systemctl', '--user', 'start', '--', self.TARGET],
+                             self.actuate_calls, 'started the target over a live unit')
+
+            release.set()                       # roster now reports A OFF, freshly sensed
+            self._wait_terminal(rec)
+
+        self.assertEqual(rec['phase'], 'done', rec['detail'])
+        self.assertEqual(rec['stopped'], [self.A])
+        self.assertEqual(fleet.rung(self.A), 'OFF')
+
+    def test_confirm_off_timeout_fails_stop_unconfirmed_with_offer(self):
+        """A stop whose unit never leaves ACTIVE -> failed(stop_unconfirmed)."""
+        fleet = self._fleet([self.A, self.B])
+        fleet.stop_plan[self.B] = 'stuck'
+        engine = self._engine(fleet)
+
+        with patch.object(roundhouse, 'CONFIRM_OFF_TIMEOUT_SEC', 2):
+            rec = self._run_switch(engine, fleet, self.TARGET, [self.A, self.B])
+
+        self.assertEqual(rec['phase'], 'failed')
+        self.assertEqual(rec['failure']['reason'], 'stop_unconfirmed')
+        self.assertIn(self.B, rec['failure']['detail'])
+        self.assertEqual(rec['stopped'], [self.A], 'only the confirmed stop is recorded')
+        # A was stopped, so the reverse is offered (§2.6 reversible = stopped or started)
+        self.assertTrue(rec['rollback']['offered'])
+        self.assertFalse(rec['restored'])
+        self.assertNotIn(['systemctl', '--user', 'start', '--', self.TARGET],
+                         self.actuate_calls)
+
+    def test_failed_after_stop_counts_as_confirmed_and_says_so(self):
+        """F2: rung FAILED after a stop is 'stopped' (dead process) + a notice."""
+        fleet = self._fleet([self.A])
+        fleet.stop_plan[self.A] = 'failed'
+        engine = self._engine(fleet)
+
+        rec = self._run_switch(engine, fleet, self.TARGET, [self.A])
+
+        self.assertEqual(rec['phase'], 'done', rec['detail'])
+        self.assertEqual(rec['stopped'], [self.A], 'FAILED-after-stop must count as stopped')
+        notices = [d for _, d, _, _ in self._phases()
+                   if d and 'considered stopped' in d]
+        self.assertTrue(
+            notices or 'considered stopped' in rec['detail'],
+            'no FAILED notice was ever recorded on the record or the stream')
+        self.assertEqual(self.actuate_calls[-1],
+                         ['systemctl', '--user', 'start', '--', self.TARGET])
+
+    # --- target failures ----------------------------------------------------------
+
+    def test_target_watch_failure_offers_the_reverse(self):
+        """Target reaching FAILED -> failed(unit_failed) with a live restore offer."""
+        fleet = self._fleet([self.A])
+        fleet.start_plan[self.TARGET] = 'failed'
+        engine = self._engine(fleet)
+
+        rec = self._run_switch(engine, fleet, self.TARGET, [self.A])
+
+        self.assertEqual(rec['phase'], 'failed')
+        self.assertEqual(rec['failure']['reason'], 'unit_failed')
+        self.assertTrue(rec['rollback']['offered'], 'no restore offered after a failed target')
+        self.assertTrue(rec['target_started'])
+        self.assertEqual(rec['stopped'], [self.A])
+
+    def test_preflight_drift_fails_without_touching_anything(self):
+        """A stale confirm fails in preflight: nothing stopped, slot free (restored)."""
+        fleet = self._fleet([self.A])
+        engine = self._engine(fleet)
+
+        with patch.object(roundhouse, 'run_actuate', self._stub_actuate(fleet)), \
+             patch.object(roundhouse, '_estimate_start_bytes', self._tiny_estimate):
+            rec = engine.start_switch(self.TARGET, [self.A], 'not-the-right-hash')
+            self._wait_terminal(rec)
+
+        self.assertEqual(rec['phase'], 'failed')
+        self.assertEqual(rec['failure']['reason'], 'preview_stale')
+        self.assertEqual(self.actuate_calls, [], 'preflight failure actuated something')
+        self.assertTrue(rec['restored'], 'nothing changed, so the slot must be free')
+        self.assertTrue(roundhouse._slot_free(rec))
+        self.assertIsNone(rec['rollback'])
+
+    # --- restore ------------------------------------------------------------------
+
+    def test_restore_replays_stopped_units_in_original_order(self):
+        """§2.1 restoring: stop the target, then start `stopped` in the SAME order."""
+        fleet = self._fleet([self.A, self.B])
+        fleet.start_plan[self.TARGET] = 'failed'
+        engine = self._engine(fleet)
+
+        rec = self._run_switch(engine, fleet, self.TARGET, [self.A, self.B])
+        self.assertEqual(rec['phase'], 'failed')
+        self.assertEqual(rec['stopped'], [self.A, self.B])
+
+        self.actuate_calls.clear()
+        with patch.object(roundhouse, 'run_actuate', self._stub_actuate(fleet)), \
+             patch.object(roundhouse, 'run_git', self._raising_git), \
+             patch.object(roundhouse, '_atomic_write', self._raising_atomic_write):
+            engine.rollback(rec['rollout_id'])
+            self._wait_terminal(rec)
+
+        self.assertEqual(rec['phase'], 'restored', rec['detail'])
+        starts = [c[-1] for c in self.actuate_calls if c[2] == 'start']
+        self.assertEqual(starts, [self.A, self.B], 'restore replayed out of order')
+        self.assertEqual(fleet.rung(self.A), 'READY')
+        self.assertEqual(fleet.rung(self.B), 'READY')
+        self.assertIn('restored: 2 unit(s)', rec['detail'])
+        self.assertFalse(rec['rollback']['offered'])
+        self.assertTrue(roundhouse._slot_free(rec), 'restored must free the slot')
+
+    def test_restore_stops_the_target_before_replaying(self):
+        """A target that came up but never went READY is stopped first (port reuse)."""
+        fleet = self._fleet([self.A])
+        fleet.start_plan[self.TARGET] = 'loading'      # never reaches READY
+        engine = self._engine(fleet)
+
+        with patch.object(roundhouse, 'WATCH_TIMEOUT_SEC', 2):
+            rec = self._run_switch(engine, fleet, self.TARGET, [self.A])
+        self.assertEqual(rec['phase'], 'failed')
+        self.assertEqual(rec['failure']['reason'], 'watch_timeout')
+
+        self.actuate_calls.clear()
+        with patch.object(roundhouse, 'run_actuate', self._stub_actuate(fleet)), \
+             patch.object(roundhouse, 'run_git', self._raising_git):
+            engine.rollback(rec['rollout_id'])
+            self._wait_terminal(rec)
+
+        self.assertEqual(rec['phase'], 'restored', rec['detail'])
+        self.assertEqual(self.actuate_calls[0],
+                         ['systemctl', '--user', 'stop', '--', self.TARGET])
+
+    def test_restore_failure_is_terminal_and_names_the_manual_commands(self):
+        """§2.1: restore_failed carries the exact `systemctl --user start ...` recovery."""
+        fleet = self._fleet([self.A, self.B])
+        fleet.start_plan[self.TARGET] = 'failed'
+        engine = self._engine(fleet)
+
+        rec = self._run_switch(engine, fleet, self.TARGET, [self.A, self.B])
+        self.assertEqual(rec['stopped'], [self.A, self.B])
+
+        fleet.start_plan[self.B] = 'failed'            # B refuses to come back
+        with patch.object(roundhouse, 'run_actuate', self._stub_actuate(fleet)), \
+             patch.object(roundhouse, 'run_git', self._raising_git):
+            engine.rollback(rec['rollout_id'])
+            self._wait_terminal(rec)
+
+        self.assertEqual(rec['phase'], 'restore_failed')
+        self.assertIn('systemctl --user start', rec['detail'])
+        self.assertIn(self.B, rec['detail'], 'the unit still down must be named')
+        self.assertNotIn(self.A, rec['detail'], 'A came back; do not tell the operator to start it')
+        self.assertTrue(roundhouse._slot_free(rec), 'restore_failed is terminal')
+
+    def test_dismiss_frees_the_slot_after_a_failed_switch(self):
+        """Dismiss instead of restore: the offer settles and the next switch is accepted."""
+        fleet = self._fleet([self.A])
+        fleet.start_plan[self.TARGET] = 'failed'
+        engine = self._engine(fleet)
+
+        rec = self._run_switch(engine, fleet, self.TARGET, [self.A])
+        self.assertTrue(rec['rollback']['offered'])
+        self.assertFalse(roundhouse._slot_free(rec))
+
+        engine.dismiss(rec['rollout_id'])
+
+        self.assertFalse(rec['rollback']['offered'])
+        self.assertTrue(rec['rollback']['dismissed'])
+        self.assertTrue(roundhouse._slot_free(engine.current))
+        # and the slot really is usable again
+        fleet.start_plan[self.TARGET] = 'ready'
+        with patch.object(roundhouse, 'run_actuate', self._stub_actuate(fleet)), \
+             patch.object(roundhouse, '_estimate_start_bytes', self._tiny_estimate):
+            second = engine.start_switch(self.TARGET, [],
+                                         self._confirm_for(fleet, self.TARGET, []))
+            self._wait_terminal(second)
+        self.assertNotEqual(second['rollout_id'], rec['rollout_id'])
+
+    # --- the public record the UI actually reads ----------------------------------
+
+    def test_snapshot_rollout_key_carries_the_switch_record(self):
+        """take_snapshot's `rollout` key must be the SWITCH public record (F5/§2.4)."""
+        fleet = self._fleet([self.A])
+        engine = self._engine(fleet)
+        rec = self._run_switch(engine, fleet, self.TARGET, [self.A])
+        self.assertEqual(rec['phase'], 'done')
+
+        server = MagicMock()
+        server.watcher = fleet
+        server.watcher_lock = threading.Lock()
+        server.rollout_engine = engine
+        published = roundhouse.ThreadingHTTPServer.take_snapshot(server)['rollout']
+
+        self.assertEqual(published['kind'], 'switch')
+        self.assertEqual(published['target'], self.TARGET)
+        self.assertEqual(published['unit'], self.TARGET)
+        self.assertEqual(published['stops'], [self.A])
+        self.assertEqual(published['stopped'], [self.A])
+        self.assertTrue(published['target_started'])
+        self.assertEqual(published['phase'], 'done')
+        for rollout_only in ('edits', 'commit', 'was_active'):
+            self.assertNotIn(rollout_only, published,
+                             f'switch record leaked the rollout-only key {rollout_only}')
+        # identical to what GET /api/rollouts/<id> serves — one function, no drift
+        self.assertEqual(published, roundhouse.rollout_public_record(rec))
 
     def test_watch_to_ready_ready_terminal(self):
         """_watch_to_ready returns ('ready', elapsed) when rung reaches READY."""
@@ -2203,60 +2722,72 @@ class TestSwitchEngine(_EngineHarness):
         self.assertEqual(result[1], 'unit_failed')
 
 
-class TestSwitchZeroWrites(unittest.TestCase):
-    """Switch writes nothing per F10."""
+class TestSwitchZeroWrites(_SwitchHarness):
+    """F10: a switch writes nothing, provably — not the repo, not a single file.
 
-    def setUp(self):
-        self.temp_dir = tempfile.mkdtemp()
-        self.fixtures = Path(__file__).resolve().parents[2] / 'docs' / 'fixtures'
+    The old version of this class asserted `phase in (done, failed, restored,
+    restore_failed)` — a set containing every terminal phase, so it passed even when the
+    raising stub had aborted the switch. These assert the switch SUCCEEDS with both
+    write gateways armed to blow up, which is the only version that proves anything.
+    """
 
-    def tearDown(self):
-        shutil.rmtree(self.temp_dir, ignore_errors=True)
+    def test_full_switch_completes_with_both_write_gateways_raising(self):
+        fleet = self._fleet([self.A, self.B])
+        engine = self._engine(fleet)
 
-    def _load_fixture(self, name: str) -> roundhouse.UnitFile:
-        """Load a fixture unit file."""
-        path = self.fixtures / name
-        raw = path.read_bytes()
-        return roundhouse.parse_unit(str(path), raw)
+        rec = self._run_switch(engine, fleet, self.TARGET, [self.A, self.B],
+                               zero_writes=True)
 
-    def test_switch_with_run_git_raising_completes(self):
-        """Full switch completes even with run_git monkeypatched to raise."""
-        unit_t = self._load_fixture('qwen3.6-coding.service')
-        units = {unit_t.name: unit_t}
+        self.assertEqual(rec['phase'], 'done', rec['detail'])
+        self.assertEqual(rec['stopped'], [self.A, self.B])
+        self.assertEqual([c[2] for c in self.actuate_calls], ['stop', 'stop', 'start'])
 
-        watcher = MagicMock()
-        watcher.units = units
-        watcher.mem_store = None
-        watcher._cgroup_cache = {}
-        watcher.snapshot.return_value = {
-            'units': [
-                {'unit': unit_t.name, 'rung': 'OFF', 'retired': False, 'port': 8085, 'since': 1.0, 'start_ts_mono': '0', 'mem': {}, 'badges': []},
-            ]
-        }
+    def test_restore_completes_with_both_write_gateways_raising(self):
+        fleet = self._fleet([self.A])
+        fleet.start_plan[self.TARGET] = 'failed'
+        engine = self._engine(fleet)
 
-        engine = roundhouse.RolloutEngine(watcher, units, self.temp_dir, 8090,
-                                        roundhouse.EventBus(), threading.Lock())
+        rec = self._run_switch(engine, fleet, self.TARGET, [self.A], zero_writes=True)
+        self.assertEqual(rec['phase'], 'failed')
 
-        def stub_run_actuate(argv, units, timeout=90):
-            return ''
+        with patch.object(roundhouse, 'run_actuate', self._stub_actuate(fleet)), \
+             patch.object(roundhouse, 'run_git', self._raising_git), \
+             patch.object(roundhouse, '_atomic_write', self._raising_atomic_write):
+            engine.rollback(rec['rollout_id'])
+            self._wait_terminal(rec)
 
-        def raising_run_git(*args, **kwargs):
-            raise Exception("run_git should not be called")
+        self.assertEqual(rec['phase'], 'restored', rec['detail'])
 
-        fingerprint = roundhouse.fleet_fingerprint(watcher.snapshot())
-        confirm = roundhouse.compute_switch_confirm(unit_t.name, [], fingerprint)
+    def test_unit_file_mtimes_are_unchanged_across_a_switch(self):
+        """The container drill's mtime row, at engine level: copies of the real fixtures
+        sit in a scratch unit dir; a full switch must not touch one byte or one mtime."""
+        unit_dir = os.path.join(self.temp_dir, 'units')
+        os.makedirs(unit_dir)
+        fixtures = Path(__file__).resolve().parents[2] / 'docs' / 'fixtures'
+        before = {}
+        for name in (self.TARGET, self.A, self.B):
+            dest = os.path.join(unit_dir, name)
+            shutil.copyfile(fixtures / name, dest)
+            os.utime(dest, (1_600_000_000, 1_600_000_000))     # pin, so any write shows
+            st = os.stat(dest)
+            before[name] = (st.st_mtime_ns, st.st_size,
+                            hashlib.sha256(Path(dest).read_bytes()).hexdigest())
 
-        with patch.object(roundhouse, 'run_actuate', stub_run_actuate), \
-             patch.object(roundhouse, 'run_git', raising_run_git):
-            switch = engine.start_switch(unit_t.name, [], confirm)
-            deadline = time.time() + 10
-            while time.time() < deadline:
-                if switch['phase'] in ('done', 'failed'):
-                    break
-                time.sleep(0.05)
+        fleet = self._fleet([self.A, self.B])
+        engine = self._engine(fleet)
+        engine.unit_dir = unit_dir
 
-        # Switch should reach a terminal phase
-        self.assertIn(switch['phase'], ('done', 'failed', 'restore_failed', 'restored'))
+        rec = self._run_switch(engine, fleet, self.TARGET, [self.A, self.B])
+        self.assertEqual(rec['phase'], 'done', rec['detail'])
+
+        for name, expected in before.items():
+            st = os.stat(os.path.join(unit_dir, name))
+            actual = (st.st_mtime_ns, st.st_size,
+                      hashlib.sha256(Path(unit_dir, name).read_bytes()).hexdigest())
+            self.assertEqual(actual, expected, f'{name} was written during a switch')
+        self.assertEqual(sorted(os.listdir(unit_dir)),
+                         sorted([self.TARGET, self.A, self.B]),
+                         'a switch created a file in the unit dir')
 
 
 class TestSwitchSlot(unittest.TestCase):
@@ -2340,33 +2871,154 @@ class TestSwitchSlot(unittest.TestCase):
         finally:
             conn.close()
 
-    def test_switch_rejects_when_rollout_holds_slot(self):
-        """POST /api/switch returns 409 operation_in_progress when rollout holds slot."""
-        # Set up a "current" rollout
+    OFF_TARGET = 'qwen3.6-coding.service'      # rung OFF in the class stub roster
+
+    def _execute_body(self):
+        return {'target': self.OFF_TARGET, 'stops': [], 'confirm': 'whatever'}
+
+    def test_execute_rejected_when_rollout_holds_slot(self):
+        """POST /api/switch -> 409 operation_in_progress while a ROLLOUT holds the slot."""
         self.server.rollout_engine.current = {
             'rollout_id': 'ro-1-1', 'kind': 'rollout', 'phase': 'applying'
         }
         try:
-            status, body = self.post_http('/api/switch/preview', {'target': 'test.service'})
+            status, body = self.post_http('/api/switch', self._execute_body())
             self.assertEqual(status, 409)
             payload = json.loads(body)
             self.assertEqual(payload.get('error'), 'operation_in_progress')
+            self.assertEqual(payload.get('rollout_id'), 'ro-1-1')
+            self.assertEqual(payload.get('kind'), 'rollout')
         finally:
             self.server.rollout_engine.current = None
 
-    def test_switch_while_switch_rejected(self):
-        """Two concurrent switches are rejected."""
-        # Set up a "current" switch
+    def test_execute_rejected_while_switch_holds_slot(self):
+        """POST /api/switch -> 409 while another SWITCH holds the slot; kind says which."""
         self.server.rollout_engine.current = {
             'rollout_id': 'sw-1-1', 'kind': 'switch', 'phase': 'stopping'
         }
         try:
-            status, body = self.post_http('/api/switch/preview', {'target': 'test.service'})
+            status, body = self.post_http('/api/switch', self._execute_body())
             self.assertEqual(status, 409)
             payload = json.loads(body)
             self.assertEqual(payload.get('error'), 'operation_in_progress')
+            self.assertEqual(payload.get('kind'), 'switch')
         finally:
             self.server.rollout_engine.current = None
+
+    def test_execute_accepted_once_the_offer_is_dismissed(self):
+        """A failed switch whose offer was dismissed no longer holds the slot."""
+        self.server.rollout_engine.current = {
+            'rollout_id': 'sw-1-2', 'kind': 'switch', 'phase': 'failed',
+            'rollback': {'offered': False, 'dismissed': True}, 'restored': False,
+        }
+        try:
+            status, body = self.post_http('/api/switch', self._execute_body())
+            # Past the slot gate. What answers next (422 preflight / 409 preview_stale on
+            # the deliberately bogus confirm) depends on this host's MemAvailable; the
+            # claim under test is only that the slot no longer refuses it.
+            payload = json.loads(body) if body else {}
+            self.assertNotEqual(payload.get('error'), 'operation_in_progress', body)
+        finally:
+            self.server.rollout_engine.current = None
+
+    # --- the deviation this milestone removed: preview is STATELESS ------------------
+
+    def test_preview_succeeds_while_an_operation_holds_the_slot(self):
+        """Preview takes no slot (§4 lists no 409 for it) — the MVP2 edit-preview precedent.
+
+        Slot-checking the preview made the modal unopenable during any rollout, and the
+        operator's whole reason to preview mid-rollout is to plan the next move.
+        """
+        self.server.rollout_engine.current = {
+            'rollout_id': 'ro-1-1', 'kind': 'rollout', 'phase': 'applying'
+        }
+        try:
+            status, body = self.post_http('/api/switch/preview',
+                                          {'target': self.OFF_TARGET, 'stops': []})
+            self.assertIn(status, (200, 422), body)
+            self.assertNotEqual(status, 409, 'preview must not take the operation slot')
+        finally:
+            self.server.rollout_engine.current = None
+
+    def test_preview_unknown_target_still_404s_during_an_operation(self):
+        """Removing the slot check must not swallow the 404 doctrine."""
+        self.server.rollout_engine.current = {
+            'rollout_id': 'sw-9-9', 'kind': 'switch', 'phase': 'watching'
+        }
+        try:
+            status, _ = self.post_http('/api/switch/preview', {'target': 'nope.service'})
+            self.assertEqual(status, 404)
+        finally:
+            self.server.rollout_engine.current = None
+
+
+class TestSwitchSlotEngine(unittest.TestCase):
+    """Slot exclusivity at the ENGINE level, in both directions (§2.2, F11).
+
+    The HTTP class above stubs the engine; these drive the real `_slot_free` gate.
+    """
+
+    def setUp(self):
+        self.temp_dir = tempfile.mkdtemp()
+        fixtures = Path(__file__).resolve().parents[2] / 'docs' / 'fixtures'
+        path = fixtures / 'qwen3.6-coding.service'
+        self.unit = roundhouse.parse_unit(str(path), path.read_bytes())
+        watcher = MagicMock()
+        watcher.units = {self.unit.name: self.unit}
+        watcher.mem_store = None
+        watcher._cgroup_cache = {}
+        watcher.snapshot.return_value = {'units': [
+            {'unit': self.unit.name, 'rung': 'OFF', 'retired': False, 'enabled': True,
+             'since': 1.0, 'start_ts_mono': '0', 'badges': [], 'port': 8085, 'mem': {}},
+        ]}
+        self.engine = roundhouse.RolloutEngine(watcher, {self.unit.name: self.unit},
+                                               self.temp_dir, 8090, roundhouse.EventBus(),
+                                               threading.Lock())
+
+    def tearDown(self):
+        shutil.rmtree(self.temp_dir, ignore_errors=True)
+
+    def _switch_record(self, phase, rollback=None, restored=False):
+        return {'rollout_id': 'sw-0-0', 'kind': 'switch', 'unit': 'u.service',
+                'target': 'u.service', 'stops': [], 'stopped': [], 'target_started': False,
+                'phase': phase, 'detail': '', 'failure': None, 'rollback': rollback,
+                'restored': restored, 'started_at': 0.0, 'updated_at': 0.0}
+
+    def test_rollout_refused_while_a_switch_runs(self):
+        """The inverse direction: start_rollout raises rollout_in_progress under a switch."""
+        self.engine.current = self._switch_record('stopping')
+        with self.assertRaises(roundhouse.ActuationError) as ctx:
+            self.engine.start_rollout(self.unit.name, [], 'confirm')
+        self.assertIn('rollout_in_progress', str(ctx.exception))
+
+    def test_switch_refused_while_a_rollout_runs(self):
+        """start_switch raises operation_in_progress under a rollout."""
+        self.engine.current = {'rollout_id': 'ro-0-0', 'kind': 'rollout', 'phase': 'applying',
+                               'commit': None, 'rollback': None, 'restored': False}
+        with self.assertRaises(roundhouse.ActuationError) as ctx:
+            self.engine.start_switch(self.unit.name, [], 'confirm')
+        self.assertIn('operation_in_progress', str(ctx.exception))
+
+    def test_restore_terminals_free_the_slot(self):
+        """`restored` and `restore_failed` are in OPERATION_TERMINAL_PHASES (§2.2)."""
+        for phase in ('restored', 'restore_failed'):
+            self.assertTrue(roundhouse._slot_free(self._switch_record(phase)), phase)
+        self.assertIn('restored', roundhouse.OPERATION_TERMINAL_PHASES)
+        self.assertIn('restore_failed', roundhouse.OPERATION_TERMINAL_PHASES)
+
+    def test_restoring_holds_the_slot(self):
+        self.assertFalse(roundhouse._slot_free(self._switch_record('restoring')))
+
+    def test_failed_switch_with_live_offer_holds_the_slot(self):
+        held = self._switch_record('failed', rollback={'offered': True})
+        self.assertFalse(roundhouse._slot_free(held))
+        self.engine.current = held
+        self.engine.rollouts[held['rollout_id']] = held
+        with self.assertRaises(roundhouse.ActuationError):
+            self.engine.start_switch(self.unit.name, [], 'confirm')
+
+        self.engine.dismiss(held['rollout_id'])
+        self.assertTrue(roundhouse._slot_free(held), 'dismiss must free the slot')
 
 
 class TestSwitchRoutes(unittest.TestCase):

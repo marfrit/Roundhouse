@@ -4,7 +4,43 @@
 import sys
 import time
 import os
+import http.server
+import threading
 from datetime import datetime
+
+
+class _Health(http.server.BaseHTTPRequestHandler):
+    """Answers /health 200 so a drill can prove the port is really bound (and really
+    freed once the unit is stopped). The real llama-server binds; a fake that only
+    LOGGED "listening on ..." made every `curl the port` acceptance row vacuous —
+    it failed identically whether the unit was up or down."""
+
+    protocol_version = 'HTTP/1.0'
+
+    def do_GET(self):
+        body = b'{"status":"ok"}'
+        self.send_response(200)
+        self.send_header('Content-Type', 'application/json')
+        self.send_header('Content-Length', str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, fmt, *args):
+        pass
+
+
+def serve_health(port):
+    """Bind `port` for real, in a daemon thread. A failure to bind is fatal and looks
+    exactly like llama-server's own bind failure, which is what the drills key off."""
+    try:
+        httpd = http.server.ThreadingHTTPServer(('0.0.0.0', port), _Health)
+    except OSError as exc:
+        log_line('E', 'srv',
+                 f"start: couldn't bind HTTP server socket, hostname: 0.0.0.0, port: {port} ({exc})")
+        log_line('E', 'srv', "llama_server: exiting due to HTTP server error")
+        sys.exit(1)
+    threading.Thread(target=httpd.serve_forever, daemon=True).start()
+    return httpd
 
 def log_line(level, tag, msg):
     """Print a log line like llama-server does."""
@@ -61,6 +97,7 @@ def main():
     time.sleep(fake_load_seconds)
 
     log_line('I', 'srv', "llama_server: model loaded")
+    serve_health(port)
     log_line('I', 'srv', f"llama_server: listening on http://0.0.0.0:{port}")
 
     # If FAKE_BUSY_AFTER is set, go busy

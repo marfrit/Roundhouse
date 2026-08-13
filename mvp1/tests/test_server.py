@@ -597,10 +597,82 @@ class TestWriteGuards(unittest.TestCase):
         with self.assertRaises(roundhouse.ActuationError):
             roundhouse.run_git(["add", "--", "x.service"], "/tmp")
 
-    def test_actuate_armed_assignment_once(self):
-        """ACTUATE_ARMED assignment appears exactly twice: module-level False + one in cmd_serve."""
+    # ---- shared AST machinery for the §7.1 guards ---------------------------------
+
+    @classmethod
+    def _tree(cls):
         import ast
-        tree = ast.parse(self.SOURCE.read_text())
+        source = cls.SOURCE.read_text()
+        return source, ast.parse(source)
+
+    @staticmethod
+    def _parents(tree):
+        """child -> parent map; `ast` gives no parent links and every guard needs them."""
+        import ast
+        parents = {}
+        for node in ast.walk(tree):
+            for child in ast.iter_child_nodes(node):
+                parents[child] = node
+        return parents
+
+    @staticmethod
+    def _section_spans(source):
+        """{letter: [(first_line, end_line_exclusive)]} from the SECTION banners.
+
+        A letter's span runs to the next banner carrying a DIFFERENT letter, so Section
+        E's `PART 2` / `PART 3` banners stay inside one span (§7.1).
+        """
+        import re
+        banners = [(i, m.group(1))
+                   for i, line in enumerate(source.splitlines(), 1)
+                   for m in [re.match(r'^# ===== SECTION ([A-E])\b', line)] if m]
+        total = len(source.splitlines()) + 1
+        spans = {}
+        for idx, (line, letter) in enumerate(banners):
+            end = next((l2 for l2, let2 in banners[idx + 1:] if let2 != letter), total)
+            spans.setdefault(letter, []).append((line, end))
+        return spans
+
+    @classmethod
+    def _enclosing_func(cls, node, parents):
+        """Name of the innermost FunctionDef containing `node`, or None."""
+        import ast
+        cur = parents.get(node)
+        while cur is not None:
+            if isinstance(cur, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                return cur.name
+            cur = parents.get(cur)
+        return None
+
+    @classmethod
+    def _enclosing_call(cls, node, parents):
+        """The innermost Call containing `node`, or None."""
+        import ast
+        cur = parents.get(node)
+        while cur is not None:
+            if isinstance(cur, ast.Call):
+                return cur
+            cur = parents.get(cur)
+        return None
+
+    @staticmethod
+    def _callee_name(call):
+        import ast
+        if isinstance(call.func, ast.Name):
+            return call.func.id
+        if isinstance(call.func, ast.Attribute):
+            return call.func.attr
+        return None
+
+    def test_actuate_armed_assignment_once(self):
+        """Exactly two ACTUATE_ARMED assignments: module-level `False`, and one in cmd_serve.
+
+        The MVP2 version asserted `>= 1`, which a third assignment anywhere would have
+        satisfied — including one that arms the process outside `--actuate`.
+        """
+        import ast
+        source, tree = self._tree()
+        parents = self._parents(tree)
 
         assignments = []
         for node in ast.walk(tree):
@@ -608,10 +680,23 @@ class TestWriteGuards(unittest.TestCase):
                 targets = node.targets if isinstance(node, ast.Assign) else [node.target]
                 for target in targets:
                     if isinstance(target, ast.Name) and target.id == 'ACTUATE_ARMED':
-                        assignments.append((node.lineno, getattr(node, 'value', None)))
+                        assignments.append(node)
 
-        # Should have exactly two: module-level False and one inside cmd_serve
-        self.assertEqual(len(assignments), 2, f"Expected 2 ACTUATE_ARMED assignments, got {len(assignments)}")
+        self.assertEqual(len(assignments), 2,
+                         'ACTUATE_ARMED assignments at lines '
+                         f'{[n.lineno for n in assignments]}; expected exactly 2')
+
+        module_level = [n for n in assignments if self._enclosing_func(n, parents) is None]
+        in_cmd_serve = [n for n in assignments
+                        if self._enclosing_func(n, parents) == 'cmd_serve']
+        self.assertEqual(len(module_level), 1,
+                         'expected exactly one module-level ACTUATE_ARMED assignment')
+        self.assertEqual(len(in_cmd_serve), 1,
+                         'expected exactly one ACTUATE_ARMED assignment, inside cmd_serve')
+        self.assertIsInstance(module_level[0], ast.Assign)
+        self.assertIsInstance(module_level[0].value, ast.Constant)
+        self.assertIs(module_level[0].value.value, False,
+                      'the default must be a literal False — read-only unless armed')
 
     def test_only_subprocess_gateways_spawn(self):
         """subprocess.* only reachable from run_ro, spawn_ro_stream, run_actuate, run_git."""
@@ -652,59 +737,85 @@ class TestWriteGuards(unittest.TestCase):
         finally:
             roundhouse.ACTUATE_ARMED = False
 
-    def test_write_verbs_only_in_section_e(self):
-        """Write verbs in Call args are only via run_actuate, and _daemon_reload only in rollout paths."""
+    def _write_verb_constants(self, tree, parents):
+        """Every WRITE_VERBS string literal that could become an argv token.
+
+        Dict KEYS are excluded and only dict keys: `{'start': line.start}` in the parser
+        and the detail serializer are span offsets, not systemd verbs, and no dict key
+        can reach `subprocess` as an argument. Everything else — bare literals, list and
+        tuple elements, call arguments — is in scope.
+        """
         import ast
-        import re
-
-        source_text = self.SOURCE.read_text()
-        tree = ast.parse(source_text)
-
-        # Check that every WRITE_VERBS constant in a Call's args has callee name run_actuate
+        out = []
         for node in ast.walk(tree):
-            if isinstance(node, ast.Call):
-                if isinstance(node.func, ast.Name):
-                    callee_name = node.func.id
-                else:
-                    callee_name = None
+            if not (isinstance(node, ast.Constant) and isinstance(node.value, str)):
+                continue
+            if node.value not in self.WRITE_VERBS:
+                continue
+            parent = parents.get(node)
+            if isinstance(parent, ast.Dict) and any(k is node for k in parent.keys):
+                continue
+            out.append(node)
+        return out
 
-                for arg in node.args:
-                    if isinstance(arg, ast.Constant) and arg.value in self.WRITE_VERBS:
-                        if callee_name != 'run_actuate':
-                            self.fail(f"Write verb '{arg.value}' passed to '{callee_name}', not run_actuate at line {arg.lineno}")
+    def test_write_verbs_only_in_section_e(self):
+        """§7.1(1), all four legs — the MVP2 version implemented none of (a) and only a
+        shallow (b), so a `subprocess.run(["systemctl", "--user", "restart", ...])` seeded
+        in Section C sailed past it (the verb sits inside a List, not in `Call.args`).
 
-        # Check that every run_actuate Call is inside a ROLLOUT_CALLSITES function
+        (a) every write-verb literal lives inside Section E's span
+        (b) each one's innermost enclosing Call is `run_actuate`
+        (c) every `run_actuate` call sits in ROLLOUT_CALLSITES — unchanged by MVP3, which
+            is the point: the switch reuses the same three methods
+        (d) `_daemon_reload` is called only from the two rollout workers (F10's static leg)
+        """
+        import ast
+        source, tree = self._tree()
+        parents = self._parents(tree)
+        spans = self._section_spans(source)
+        self.assertIn('E', spans, 'no SECTION E banner found')
+        e_spans = spans['E']
+
+        def in_section_e(lineno):
+            return any(start <= lineno < end for start, end in e_spans)
+
+        verbs = self._write_verb_constants(tree, parents)
+        self.assertTrue(verbs, 'no write verbs found at all — the guard is not looking')
+
+        # (a) confinement to Section E
+        strays = [(n.lineno, n.value) for n in verbs if not in_section_e(n.lineno)]
+        self.assertEqual(strays, [],
+                         f'write verb literal outside SECTION E (spans {e_spans}): {strays}')
+
+        # (b) each one is an argument of a run_actuate call
+        for node in verbs:
+            call = self._enclosing_call(node, parents)
+            if call is None:
+                # Not an argument to anything: the ACTUATE_SYSTEMCTL_VERBS allowlist
+                # itself is such a literal set. Leg (a) already pinned it inside E, and
+                # §7.1(b) scopes this leg to constants "among a Call's arguments".
+                continue
+            callee = self._callee_name(call)
+            self.assertEqual(
+                callee, 'run_actuate',
+                f"write verb '{node.value}' at line {node.lineno} is passed to "
+                f"'{callee}', not run_actuate")
+
+        # (c) run_actuate is only called from the three lifecycle methods
         for node in ast.walk(tree):
-            if isinstance(node, ast.Call):
-                callee_name = None
-                if isinstance(node.func, ast.Name):
-                    callee_name = node.func.id
-                if callee_name == 'run_actuate':
-                    # Find enclosing function
-                    found = False
-                    for fn in ast.walk(tree):
-                        if isinstance(fn, ast.FunctionDef):
-                            if any(n is node for n in ast.walk(fn)):
-                                if fn.name in self.ROLLOUT_CALLSITES:
-                                    found = True
-                                    break
-                    if not found:
-                        self.fail(f"run_actuate call at line {node.lineno} not in ROLLOUT_CALLSITES: {self.ROLLOUT_CALLSITES}")
+            if isinstance(node, ast.Call) and self._callee_name(node) == 'run_actuate':
+                fn = self._enclosing_func(node, parents)
+                self.assertIn(fn, self.ROLLOUT_CALLSITES,
+                              f'run_actuate called at line {node.lineno} from {fn!r}, '
+                              f'not one of {sorted(self.ROLLOUT_CALLSITES)}')
 
-        # Check that _daemon_reload is only called from _run_rollout or _run_rollback
+        # (d) daemon-reload never reaches the switch or restore workers
         for node in ast.walk(tree):
-            if isinstance(node, ast.Call):
-                if isinstance(node.func, ast.Attribute) and node.func.attr == '_daemon_reload':
-                    # Find enclosing function
-                    found = False
-                    for fn in ast.walk(tree):
-                        if isinstance(fn, ast.FunctionDef):
-                            if any(n is node for n in ast.walk(fn)):
-                                if fn.name in {'_run_rollout', '_run_rollback'}:
-                                    found = True
-                                    break
-                    if not found:
-                        self.fail(f"_daemon_reload called at line {node.lineno} outside {{_run_rollout, _run_rollback}}")
+            if isinstance(node, ast.Call) and self._callee_name(node) == '_daemon_reload':
+                fn = self._enclosing_func(node, parents)
+                self.assertIn(fn, {'_run_rollout', '_run_rollback'},
+                              f'_daemon_reload called at line {node.lineno} from {fn!r} — '
+                              'a switch is lifecycle verbs only (F10)')
 
     def test_post_route_table_frozen_and_complete(self):
         """POST route table is complete and matches FROZEN_POST_ROUTES."""
@@ -777,7 +888,7 @@ class TestWriteGuards(unittest.TestCase):
         finally:
             shutil.rmtree(temp_dir, ignore_errors=True)
 
-        # Structural test: FROZEN_POST_ROUTES exists and contains the right paths
+        # Structural test 1: FROZEN_POST_ROUTES exists and contains the right paths
         self.assertTrue(hasattr(roundhouse, 'FROZEN_POST_ROUTES'))
         self.assertIsInstance(roundhouse.FROZEN_POST_ROUTES, (tuple, list))
         expected_routes = {
@@ -786,6 +897,38 @@ class TestWriteGuards(unittest.TestCase):
             "/api/switch/preview", "/api/switch",
         }
         self.assertEqual(set(roundhouse.FROZEN_POST_ROUTES), expected_routes)
+
+        # Structural test 2 (§7.1(2)) — the leg that makes the table load-bearing.
+        # Every path literal inside do_POST must be derivable from the frozen table (plus
+        # the GET-only paths do_POST must recognise to answer 405 instead of 404). Adding
+        # a dispatch branch without touching FROZEN_POST_ROUTES fails HERE; asserting the
+        # constant against itself, as the MVP2 version did, never could.
+        import ast
+        _, tree = self._tree()
+        do_post = next((n for n in ast.walk(tree)
+                        if isinstance(n, ast.FunctionDef) and n.name == 'do_POST'), None)
+        self.assertIsNotNone(do_post, 'do_POST not found')
+
+        found = {c.value for c in ast.walk(do_post)
+                 if isinstance(c, ast.Constant) and isinstance(c.value, str)
+                 and c.value.startswith('/')}
+        # Fragments the six frozen routes decompose into when matched by prefix/suffix
+        from_frozen = {'/api/units/', '/edit', '/rollout',
+                       '/api/rollouts/', '/rollback', '/dismiss',
+                       '/api/switch/preview', '/api/switch'}
+        # GET-only paths do_POST recognises purely to answer 405 (§4 status doctrine)
+        get_only = {'/', '/api/units', '/api/ports', '/api/deployments',
+                    '/api/mem', '/api/events'}
+        allowed = from_frozen | get_only
+
+        self.assertEqual(
+            found - allowed, set(),
+            'do_POST dispatches path literals absent from FROZEN_POST_ROUTES: '
+            f'{sorted(found - allowed)} — add the route to the table, or remove it')
+        self.assertEqual(
+            from_frozen - found, set(),
+            'FROZEN_POST_ROUTES names routes do_POST no longer dispatches: '
+            f'{sorted(from_frozen - found)}')
 
     def test_file_writes_confined(self):
         """File writes are confined to _atomic_write() function."""
