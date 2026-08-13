@@ -509,146 +509,110 @@ def _collect_pieces(raw: bytes, base_offset: int) -> List[tuple]:
 
 
 def _tokenize_pieces(pieces: List[tuple]) -> List[Token]:
-    """Tokenize value from pieces, preserving byte offsets.
+    """Tokenize value pieces into Tokens with absolute byte offsets.
 
-    Each piece is (base_offset, raw_bytes).
+    Tokens are scanned per piece in BYTES, each piece carrying its own
+    absolute base offset, so continuations cannot skew spans and there is
+    no char-vs-byte drift. A backslash-newline continuation acts as a word
+    separator, so no token ever spans two pieces.
     """
     tokens = []
 
-    # First, assemble the value for parsing
-    assembled_parts = []
-    for offset, raw_bytes in pieces:
-        assembled_parts.append(raw_bytes.decode('utf-8', errors='replace'))
-    assembled = ' '.join(assembled_parts)
+    def _is_ws(c: bytes) -> bool:
+        return c in (b' ', b'\t')
 
-    # Now tokenize with offset tracking
-    i = 0
-    piece_idx = 0
-    pos_in_piece = 0
-    base_offset, current_bytes = pieces[piece_idx]
+    for base, raw in pieces:
+        n = len(raw)
+        i = 0
+        while i < n:
+            c = raw[i:i + 1]
+            if _is_ws(c):
+                i += 1
+                continue
+            start = i
 
-    while i < len(assembled):
-        # Skip whitespace
-        if assembled[i] in ' \t\n':
-            i += 1
-            continue
-
-        # Single quote: no escapes
-        if assembled[i] == "'":
-            j = i + 1
-            while j < len(assembled) and assembled[j] != "'":
-                j += 1
-
-            if j < len(assembled):
-                # Found closing quote
-                text = assembled[i+1:j]
-                # Reconstruct raw from assembled (simplified - use the assembled bytes)
+            if c == b"'":
+                # Single-quoted: content is literal, no escapes, no specifiers.
+                j = raw.find(b"'", i + 1)
+                if j == -1:
+                    end_tok = n
+                    text = raw[i + 1:n].decode('utf-8', errors='replace')
+                else:
+                    end_tok = j + 1
+                    text = raw[i + 1:j].decode('utf-8', errors='replace')
                 tokens.append(Token(
                     text=text,
-                    raw=assembled[i:j+1].encode('utf-8'),
-                    start=base_offset + pos_in_piece + i,
-                    end=base_offset + pos_in_piece + j + 1,
+                    raw=raw[start:end_tok],
+                    start=base + start,
+                    end=base + end_tok,
                     has_specifier=False
                 ))
-                i = j + 1
-            else:
-                # Unterminated quote
-                text = assembled[i+1:]
-                tokens.append(Token(
-                    text=text,
-                    raw=assembled[i:].encode('utf-8'),
-                    start=base_offset + pos_in_piece + i,
-                    end=base_offset + pos_in_piece + len(assembled),
-                    has_specifier=False
-                ))
-                break
+                i = end_tok
 
-        # Double quote: handle escapes
-        elif assembled[i] == '"':
-            j = i + 1
-            text_parts = []
-            has_spec = False
-
-            while j < len(assembled):
-                if assembled[j] == '"':
-                    break
-                elif assembled[j] == '\\' and j + 1 < len(assembled):
-                    next_char = assembled[j + 1]
-                    if next_char == 'n':
-                        text_parts.append('\n')
-                    elif next_char == 't':
-                        text_parts.append('\t')
-                    elif next_char == '\\':
-                        text_parts.append('\\')
-                    elif next_char == '"':
-                        text_parts.append('"')
-                    else:
-                        text_parts.append(next_char)
-                    j += 2
-                elif assembled[j] == '%' and j + 1 < len(assembled):
-                    next_char = assembled[j + 1]
-                    if next_char == '%':
-                        text_parts.append('%')
+            elif c == b'"':
+                # Double-quoted: resolve \" \\ \n \t; %% -> %; lone % = specifier.
+                j = i + 1
+                text_parts = []
+                has_spec = False
+                closed = False
+                while j < n:
+                    cj = raw[j:j + 1]
+                    if cj == b'"':
+                        closed = True
+                        break
+                    if cj == b'\\' and j + 1 < n:
+                        nxt = raw[j + 1:j + 2]
+                        text_parts.append({b'n': b'\n', b't': b'\t',
+                                           b'\\': b'\\', b'"': b'"'}.get(nxt, nxt))
                         j += 2
-                    else:
-                        text_parts.append(assembled[j])
+                        continue
+                    if cj == b'%':
+                        if j + 1 < n and raw[j + 1:j + 2] == b'%':
+                            text_parts.append(b'%')
+                            j += 2
+                            continue
+                        text_parts.append(b'%')
                         has_spec = True
                         j += 1
-                else:
-                    text_parts.append(assembled[j])
+                        continue
+                    text_parts.append(cj)
                     j += 1
-
-            text = ''.join(text_parts)
-            if j < len(assembled):
-                # Found closing quote
+                end_tok = (j + 1) if closed else n
                 tokens.append(Token(
-                    text=text,
-                    raw=assembled[i:j+1].encode('utf-8'),
-                    start=base_offset + pos_in_piece + i,
-                    end=base_offset + pos_in_piece + j + 1,
+                    text=b''.join(text_parts).decode('utf-8', errors='replace'),
+                    raw=raw[start:end_tok],
+                    start=base + start,
+                    end=base + end_tok,
                     has_specifier=has_spec
                 ))
-                i = j + 1
+                i = end_tok
+
             else:
-                # Unterminated quote
-                tokens.append(Token(
-                    text=text,
-                    raw=assembled[i:].encode('utf-8'),
-                    start=base_offset + pos_in_piece + i,
-                    end=base_offset + pos_in_piece + len(assembled),
-                    has_specifier=has_spec
-                ))
-                break
-
-        # Unquoted token
-        else:
-            j = i
-            text_parts = []
-            has_spec = False
-
-            while j < len(assembled) and assembled[j] not in ' \t\n':
-                if assembled[j] == '%':
-                    next_char = assembled[j + 1] if j + 1 < len(assembled) else ''
-                    if next_char == '%':
-                        text_parts.append('%')
-                        j += 2
-                    else:
-                        text_parts.append(assembled[j])
+                # Unquoted word: runs to whitespace; %% -> %; lone % = specifier.
+                j = i
+                text_parts = []
+                has_spec = False
+                while j < n and not _is_ws(raw[j:j + 1]):
+                    cj = raw[j:j + 1]
+                    if cj == b'%':
+                        if j + 1 < n and raw[j + 1:j + 2] == b'%':
+                            text_parts.append(b'%')
+                            j += 2
+                            continue
+                        text_parts.append(b'%')
                         has_spec = True
                         j += 1
-                else:
-                    text_parts.append(assembled[j])
+                        continue
+                    text_parts.append(cj)
                     j += 1
-
-            text = ''.join(text_parts)
-            tokens.append(Token(
-                text=text,
-                raw=assembled[i:j].encode('utf-8'),
-                start=base_offset + pos_in_piece + i,
-                end=base_offset + pos_in_piece + j,
-                has_specifier=has_spec
-            ))
-            i = j
+                tokens.append(Token(
+                    text=b''.join(text_parts).decode('utf-8', errors='replace'),
+                    raw=raw[start:j],
+                    start=base + start,
+                    end=base + j,
+                    has_specifier=has_spec
+                ))
+                i = j
 
     return tokens
 
@@ -902,13 +866,20 @@ def select_units(unit_dir: str) -> List[str]:
         # Check for manage override
         has_manage = '# roundhouse: manage' in raw_str or '; roundhouse: manage' in raw_str
 
-        # Look for llama-server or llamafile in ExecStart
+        # D1: tokenized-basename match, not a substring scan of the physical
+        # line — a binary on a continuation line must count, and a path merely
+        # CONTAINING 'llama-server' must not.
         is_ours = False
-        for line in raw_str.split('\n'):
-            if line.strip().startswith('ExecStart='):
-                if 'llama-server' in line or 'llamafile' in line:
-                    is_ours = True
-                    break
+        try:
+            unit = parse_unit(fpath, raw)
+            if unit.exec_start:
+                for tok in unit.exec_start.tokens:
+                    base = os.path.basename(tok.text)
+                    if base.startswith('llama-server') or 'llamafile' in base:
+                        is_ours = True
+                        break
+        except Exception:
+            is_ours = False
 
         if has_manage or is_ours:
             managed.append(fpath)
@@ -1310,6 +1281,7 @@ class Watcher:
             # Compute rung and check for changes
             old_rung = self._get_rung(unit_name)
             new_rung = self._compute_rung(unit_name)
+            self._state[unit_name]['_rung'] = new_rung
 
             if old_rung != new_rung:
                 events.append(self._make_rung_event(unit_name, new_rung))
@@ -1405,6 +1377,7 @@ class Watcher:
 
         # Check for rung change
         new_rung = self._compute_rung(unit_name)
+        self._state[unit_name]['_rung'] = new_rung
         if old_rung != new_rung:
             events.append(self._make_rung_event(unit_name, new_rung))
 
@@ -1543,7 +1516,7 @@ class Watcher:
                 'since': self._state[unit_name].get('exec_main_start_ts') or self.now(),
                 'detail': self._compute_detail(unit_name, rung),
                 'badges': self._compute_badges(unit_name, rung),
-                'stale': False,
+                'stale': self._sources_degraded(),
                 'sensed_at': self._state[unit_name]['sensed_at'],
                 'enabled': self._state[unit_name].get('unit_file_state') == 'enabled',
                 'active_state': self._state[unit_name]['active_state'],
@@ -1597,7 +1570,9 @@ class Watcher:
         return state.get('_rung')
 
     def _compute_rung(self, unit_name: str) -> str:
-        """Compute the rung for a unit according to the 8-rung table (§3.3)."""
+        """Compute the rung per the 8-rung table (SPEC §3.3). PURE: no state
+        writes — the _rung cache is committed only inside apply_* under the
+        caller's lock, so unlocked snapshot() reads cannot swallow events."""
         unit = self.units.get(unit_name)
         if not unit:
             return 'OFF'
@@ -1608,36 +1583,29 @@ class Watcher:
 
         # Rule 1: RETIRED
         if unit.retired:
-            state['_rung'] = 'RETIRED'
             return 'RETIRED'
 
         # Rule 2: FAILED
         if active_state == 'failed':
-            state['_rung'] = 'FAILED'
             return 'FAILED'
 
         if active_state == 'activating' and sub_state == 'auto-restart':
-            state['_rung'] = 'FAILED'
             return 'FAILED'
 
         # Rule 3: STARTING
         if active_state == 'activating':
-            state['_rung'] = 'STARTING'
             return 'STARTING'
 
         # Rule 4: BUSY
         if active_state == 'active' and state.get('busy'):
-            state['_rung'] = 'BUSY'
             return 'BUSY'
 
         # Rule 5: READY
         if active_state == 'active' and state.get('ready'):
-            state['_rung'] = 'READY'
             return 'READY'
 
         # Rule 6: LOADING
         if active_state == 'active' and not state.get('ready'):
-            state['_rung'] = 'LOADING'
             return 'LOADING'
 
         # Rule 7: STANDBY
@@ -1646,15 +1614,12 @@ class Watcher:
                 gate = unit.gate
                 if gate['kind'] == 'kernel':
                     if gate.get('wants') != self.running_kernel:
-                        state['_rung'] = 'STANDBY'
                         return 'STANDBY'
                 elif gate['kind'] == 'opaque':
                     if state.get('condition_result') == 'no':
-                        state['_rung'] = 'STANDBY'
                         return 'STANDBY'
 
         # Rule 8: OFF
-        state['_rung'] = 'OFF'
         return 'OFF'
 
     def _rung_to_roster(self, rung: str) -> str:
@@ -1683,8 +1648,13 @@ class Watcher:
             'since': state.get('exec_main_start_ts') or self.now(),
             'detail': self._compute_detail(unit_name, rung),
             'badges': self._compute_badges(unit_name, rung),
-            'stale': False
+            'stale': self._sources_degraded()
         }
+
+    def _sources_degraded(self) -> bool:
+        """True when either sensing source is down: every rung is then a
+        best-effort guess and renders dimmed per SPEC.md section 3.4."""
+        return any(v != 'ok' for v in self.sources.values())
 
     def _compute_detail(self, unit_name: str, rung: str) -> str:
         """Compute the detail text for a rung."""
@@ -2099,13 +2069,13 @@ class RoundhouseRequestHandler(http.server.BaseHTTPRequestHandler):
 
     def serve_units(self):
         """Serve /api/units (snapshot)."""
-        snapshot = self.server.watcher.snapshot()
+        snapshot = self.server.take_snapshot()
         self.send_json(snapshot)
 
     def serve_unit_detail(self, unit_name):
         """Serve /api/units/<name>: the list row (a) plus the parsed-file detail (b)."""
         watcher = self.server.watcher
-        snapshot = watcher.snapshot()
+        snapshot = self.server.take_snapshot()
 
         row = next((u for u in snapshot.get('units', []) if u['unit'] == unit_name), None)
         if row is None:
@@ -2146,7 +2116,7 @@ class RoundhouseRequestHandler(http.server.BaseHTTPRequestHandler):
 
     def serve_ports(self):
         """Serve /api/ports (port board)."""
-        self.send_json(_build_port_board(self.server.watcher.snapshot()))
+        self.send_json(_build_port_board(self.server.take_snapshot()))
 
     def serve_deployments(self):
         """Serve /api/deployments (§4.4d).
@@ -2157,7 +2127,7 @@ class RoundhouseRequestHandler(http.server.BaseHTTPRequestHandler):
         consumers filter on `retired` (they are never placement targets).
         """
         watcher = self.server.watcher
-        snapshot = watcher.snapshot()
+        snapshot = self.server.take_snapshot()
         host = snapshot.get('host', '?')
 
         deployments = []
@@ -2186,7 +2156,7 @@ class RoundhouseRequestHandler(http.server.BaseHTTPRequestHandler):
         """Serve /api/mem: measured peak rows (§6 schema) plus the current per-unit
         number the UI shows, so a caller can tell measurement from estimate."""
         watcher = self.server.watcher
-        snapshot = watcher.snapshot()
+        snapshot = self.server.take_snapshot()
         store = getattr(watcher, 'mem_store', None)
 
         rows = []
@@ -2220,7 +2190,7 @@ class RoundhouseRequestHandler(http.server.BaseHTTPRequestHandler):
 
         try:
             # Send initial snapshot
-            snapshot = self.server.watcher.snapshot()
+            snapshot = self.server.take_snapshot()
             self.send_sse_event(0, 'snapshot', snapshot)
 
             # Heartbeat timer
@@ -2266,11 +2236,21 @@ class RoundhouseRequestHandler(http.server.BaseHTTPRequestHandler):
 class ThreadingHTTPServer(http.server.ThreadingHTTPServer):
     """HTTP server with references to watcher, event_bus, and port."""
 
-    def __init__(self, host_port, handler_class, watcher, event_bus, port):
+    def __init__(self, host_port, handler_class, watcher, event_bus, port,
+                 watcher_lock=None):
         self.watcher = watcher
         self.event_bus = event_bus
         self.port = port
+        # snapshot() reads AND writes watcher state (rung cache commit is
+        # elsewhere, but _state mutates under the sensing threads), so every
+        # handler read must take the same lock the threads use. Sockets are
+        # written OUTSIDE the lock: take_snapshot returns a plain dict.
+        self.watcher_lock = watcher_lock or threading.Lock()
         super().__init__(host_port, handler_class)
+
+    def take_snapshot(self):
+        with self.watcher_lock:
+            return self.watcher.snapshot()
 
 
 # ===== SECTION D: MAIN / CLI =====
@@ -2668,7 +2648,8 @@ def cmd_serve(args):
             RoundhouseRequestHandler,
             watcher,
             event_bus,
-            port
+            port,
+            watcher_lock=watcher_lock
         )
         print(f"Roundhouse listening on http://0.0.0.0:{port}")
 

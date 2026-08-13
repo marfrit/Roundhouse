@@ -314,28 +314,26 @@ class TestServerBasics(unittest.TestCase):
                     self.assertNotIn('innerHTML', notes_section, "innerHTML should not be used for notes")
 
     def test_index_html_red_only_in_failed_conflict(self):
-        """Test that red color appears only in .failed and .conflict-active rules."""
+        """STANDBY-never-red, enforced structurally: var(--red) may occur only
+        inside an allowlisted set of CSS rule bodies, none of which STANDBY
+        shares. Parses the stylesheet rule-by-rule instead of trusting labels."""
+        import re as _re
         html_path = Path(__file__).parent.parent / 'static' / 'index.html'
-        if html_path.exists():
-            with open(html_path, 'r') as f:
-                content = f.read()
-
-            # Check that red (or var(--red)) appears in CSS
-            self.assertIn('--red:', content, "CSS should define --red color")
-
-            # The actual color value should only be in .failed and .conflict rules
-            # This is a simplified check - a full check would parse CSS
-            if '--red' in content:
-                red_value = None
-                for line in content.split('\n'):
-                    if '--red:' in line:
-                        red_value = line
-                        break
-
-                # Verify it's a color definition
-                self.assertIsNotNone(red_value)
-                self.assertTrue(any(c in red_value for c in ['#', 'rgb', 'hsl']))
-
+        content = html_path.read_text()
+        self.assertIn('--red:', content, "CSS must define the --red token")
+        css = content[content.index('<style>'):content.index('</style>')]
+        # Split into rules: selector { body }
+        allowed = ('failed', 'conflict-active', 'error-state', 'port-cell.active')
+        for m in _re.finditer(r'([^{}]+)\{([^{}]*)\}', css):
+            selector, body = m.group(1).strip(), m.group(2)
+            if ':root' in selector:
+                continue  # the token definition itself
+            if 'var(--red)' in body or _re.search(r'--red[^:]', body):
+                self.assertTrue(
+                    any(a in selector for a in allowed),
+                    f"var(--red) used in selector {selector!r}, outside the allowlist")
+                self.assertNotIn('standby', selector.lower(),
+                                 "STANDBY must never share a red rule")
 
 class TestServerEventBus(unittest.TestCase):
     """Test EventBus functionality."""

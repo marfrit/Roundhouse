@@ -37,7 +37,6 @@ import json
 from pathlib import Path
 
 # Import contract: parser module is in the repo root (parent of this tests/ directory)
-# @coder must place parser.py in /tmp/sandbox/ or /var/lib/bullpen/coder/ etc.
 # Repo root = parent of tests/; it is inserted into sys.path
 # BUT per @noether: resolve paths relative to test file for grinder compatibility
 def get_fixtures_dir():

@@ -360,7 +360,16 @@
             const data = JSON.parse(e.data);
             state = data;
             render();
-            hideDegradedBanner();
+            // The banner reflects sensing health, not just the SSE connection:
+            // a dead journal tail with a healthy connection must still show.
+            const downSources = Object.entries(data.sources || {})
+                .filter(([, v]) => v !== 'ok');
+            if (downSources.length) {
+                showDegradedBanner('sensing degraded (' +
+                    downSources.map(([k, v]) => k + ' ' + v).join(', ') + ')');
+            } else {
+                hideDegradedBanner();
+            }
         });
 
         eventSource.addEventListener('rung', (e) => {
@@ -768,7 +777,7 @@
         }
 
         // Toggle OFF and RETIRED sections
-        document.getElementById('off-section-toggle').addEventListener('click', () => {
+        document.getElementById('off-toggle').addEventListener('click', () => {
             const list = document.getElementById('off-list');
             const toggle = document.getElementById('off-toggle');
             list.classList.toggle('expanded');

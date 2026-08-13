@@ -1,3 +1,8 @@
+# Frozen v0 contract parser. mvp1/roundhouse.py Section A is the canonical
+# parser going forward; this file and its suite stay as the original acceptance
+# contract and are not extended. Its byte offsets are proven exact only for
+# all-ASCII fixtures (comment offsets mix char/byte lengths on multi-byte
+# characters); the canonical parser is byte-exact everywhere.
 import os
 import re
 from typing import Dict, List, Any

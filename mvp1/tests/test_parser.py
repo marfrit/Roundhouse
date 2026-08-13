@@ -373,3 +373,57 @@ class TestBuildDeployment(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class TestByteOffsetProperties(unittest.TestCase):
+    """SPEC.md §8 property tests (2) and (3): the acceptance criterion
+    'byte offsets retained per extracted token', proven on every fixture.
+    These are the tests whose absence let a span-drift bug ship to review."""
+
+    def _fixtures(self):
+        fixdir = Path(__file__).resolve().parents[2] / "docs" / "fixtures"
+        extra = Path(__file__).resolve().parent / "fixtures-extra"
+        for d in (fixdir, extra):
+            for p in sorted(d.glob("*.service")):
+                yield p
+
+    def test_token_spans_slice_to_raw(self):
+        """Property (2): raw[t.start:t.end] == t.raw for every token of every fixture."""
+        checked = 0
+        for p in self._fixtures():
+            raw = p.read_bytes()
+            unit = roundhouse.parse_unit(str(p), raw)
+            if not unit.exec_start:
+                continue
+            for t in unit.exec_start.tokens:
+                self.assertEqual(
+                    raw[t.start:t.end], t.raw,
+                    f"{p.name}: token {t.text!r} span [{t.start}:{t.end}] "
+                    f"slices to {raw[t.start:t.end]!r}, not its raw bytes")
+                checked += 1
+        self.assertGreater(checked, 400, "property test must cover the full corpus")
+
+    def test_profile_value_spans_rederive(self):
+        """Property (3): every ParamProfile value span slices to the bytes of the
+        token that produced the field (re-derivable without re-tokenizing)."""
+        checked = 0
+        for p in self._fixtures():
+            raw = p.read_bytes()
+            unit = roundhouse.parse_unit(str(p), raw)
+            if not unit.exec_start:
+                continue
+            by_start = {t.start: t for t in unit.exec_start.tokens}
+            profile = roundhouse.extract_param_profile(unit.exec_start.engine_argv)
+            for name, span in (profile.get("spans") or {}).items():
+                for part in ("flag", "value"):
+                    s = span.get(part)
+                    if not s:
+                        continue
+                    tok = by_start.get(s[0])
+                    self.assertIsNotNone(
+                        tok, f"{p.name}: {name}.{part} span start {s[0]} matches no token")
+                    self.assertEqual(
+                        raw[s[0]:s[1]], tok.raw,
+                        f"{p.name}: {name}.{part} span does not slice to its token")
+                    checked += 1
+        self.assertGreater(checked, 100)

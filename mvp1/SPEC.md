@@ -393,6 +393,10 @@ BUSY/REQ activity implying ready (rules 3–4); tertiary = the amber `no_ready_m
 TimeoutStartSec while staying in LOADING. Under no circumstance does failure to detect READY
 produce a FAILED render or an HTTP probe.
 
+DEFERRED TO MILESTONE 2 (decided at MVP1 review): the `no_ready_marker` and
+`retired_but_running` badges are specified above but not implemented; per-unit `stale`
+is currently derived from global source health, not per-unit sensed_at age.
+
 Staleness: every unit in every snapshot carries `sensed_at` (epoch float of last input that
 touched it); the global snapshot carries `sources: {"journal": "ok"|"down since <t>",
 "systemctl": ...}`. UI shows an amber banner "sensing degraded" when either source is down;

@@ -132,17 +132,21 @@ clock only.
 ## The port board
 
 Show every unit's declared port, and flag collisions **between units, enabled or not**.
-Two real cases, verified 2026-08-12:
+The full latent picture, verified against all 23 units 2026-08-13 (the original survey
+counted only the enabled-vs-gated pairs and undercounted):
 
-| port | units | state |
+| port | claimants | state |
 |---|---|---|
-| `:8085` | `qwen3.6-coding` (enabled, active) · `mixperten` (disabled, `[RETIRED]`) | guarded by a DO-NOT-ENABLE comment |
-| `:8086` | `llama-task` (enabled, active) · `llama-server-qwen35-npu` (disabled, kernel-gated) | **unguarded** |
+| `:8085` | **6 units** — `qwen3.6-coding` (enabled, active) · `mixperten` (disabled, `[RETIRED]`, DO-NOT-ENABLE guard) · 4 more disabled units | one active claimant; the rest latent |
+| `:8086` | **3 units** — `llama-task` (enabled, active) · `llama-server-qwen35-npu` (disabled, kernel-gated) · `llama-server-gemma4` (disabled) | **unguarded** |
+| `:8090` | `deepseek-coder` (disabled) — so Roundhouse's own default port is itself a latent collision the board must show | latent |
 
 The `:8086` pair justifies the feature: harmless *only* because both the disable **and**
 the kernel gate hold. Enable that unit, boot the NPU kernel, and you get a bind race.
-This is the "mechanical interlocking" the design is named for, and it is a **sensing**
-feature — it belongs in Milestone 1.
+Not theoretical: on 2026-08-13 starting `llama-server-gemma4` (the undocumented third
+claimant) against a running `llama-task` bind-failed in under a second. This is the
+"mechanical interlocking" the design is named for, and it is a **sensing** feature —
+it belongs in Milestone 1.
 
 ---
 
@@ -150,7 +154,8 @@ feature — it belongs in Milestone 1.
 
 One Python file (house style of `/opt/llm-proxy.py`) + one static page + **SSE**.
 Talks to systemd via `systemctl --user` / user D-Bus. Runs as `roundhouse.service` on
-`:8090` (unclaimed today — the port board should confirm its own). **No node toolchain,
+`:8090` (latently claimed by the disabled `deepseek-coder` unit — the port board shows
+its own port's claims, merged, not overwritten). **No node toolchain,
 no build step.** Scope: **boltzmann only** — multi-host is Roundhouse's job, not this
 driver's.
 
@@ -158,7 +163,7 @@ driver's.
 
 ## Acceptance criteria
 
-- [ ] Parses all 23 units; unknown directives preserved, never dropped.
+- [ ] Parses all 23 units; selects the 22 whose ExecStart basename is a llama-server/llamafile engine (`classifier.service` is a bespoke python server — the ds4-class case, listed as not-ours with its reason); unknown directives preserved, never dropped.
 - [ ] **Byte offsets retained per extracted token** — a future round-trip splices bytes; a parser that normalises forecloses that option.
 - [ ] Comments render verbatim as operator's notes; none lost.
 - [ ] `llama-server-qwen35-npu` renders **STANDBY**, not FAILED, on the running kernel.
