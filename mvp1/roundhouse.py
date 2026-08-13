@@ -2084,6 +2084,9 @@ class RoundhouseRequestHandler(http.server.BaseHTTPRequestHandler):
         elif route.startswith('/api/rollouts/'):
             rollout_id = urllib.parse.unquote(route[len('/api/rollouts/'):])
             self.serve_rollout(rollout_id)
+        elif route == '/api/switch/preview' or route == '/api/switch':
+            # Switch routes are POST-only
+            self.error_405()
         else:
             self.error_404()
 
@@ -2099,10 +2102,12 @@ class RoundhouseRequestHandler(http.server.BaseHTTPRequestHandler):
             (route.startswith('/api/units/') and route.endswith('/edit')) or
             (route.startswith('/api/units/') and route.endswith('/rollout')) or
             (route.startswith('/api/rollouts/') and route.endswith('/rollback')) or
-            (route.startswith('/api/rollouts/') and route.endswith('/dismiss'))
+            (route.startswith('/api/rollouts/') and route.endswith('/dismiss')) or
+            route == '/api/switch/preview' or
+            route == '/api/switch'
         )
 
-        # Determine if this is a known GET-only route
+        # Determine if this is a known GET-only or POST-only route
         is_get_route = (
             route == '/' or
             route == '/api/units' or
@@ -2111,7 +2116,9 @@ class RoundhouseRequestHandler(http.server.BaseHTTPRequestHandler):
             route == '/api/deployments' or
             route == '/api/mem' or
             route == '/api/events' or
-            route.startswith('/api/rollouts/')   # GET-only unless /rollback|/dismiss
+            route.startswith('/api/rollouts/') or   # GET-only unless /rollback|/dismiss
+            route == '/api/switch/preview' or
+            route == '/api/switch'
         )
 
         # If it's not a POST route but is a known GET route, return 405 immediately
@@ -2146,6 +2153,10 @@ class RoundhouseRequestHandler(http.server.BaseHTTPRequestHandler):
         elif route.startswith('/api/rollouts/') and route.endswith('/dismiss'):
             rollout_id = urllib.parse.unquote(route[len('/api/rollouts/'):-len('/dismiss')])
             self.handle_dismiss(rollout_id)
+        elif route == '/api/switch/preview':
+            self.handle_switch_preview()
+        elif route == '/api/switch':
+            self.handle_switch()
         else:
             # Unknown POST route
             self.send_response(404)
@@ -2431,6 +2442,209 @@ class RoundhouseRequestHandler(http.server.BaseHTTPRequestHandler):
         self.send_header('Content-Type', 'application/json; charset=utf-8')
         self.end_headers()
         self.wfile.write(json.dumps({'ok': True}).encode('utf-8'))
+
+    def handle_switch_preview(self):
+        """Handle POST /api/switch/preview (preview mode)."""
+        # Read body
+        try:
+            content_length = int(self.headers.get('Content-Length', 0))
+            body = self.rfile.read(content_length)
+            data = json.loads(body)
+        except (ValueError, json.JSONDecodeError):
+            self.send_json_error(400, 'bad_json', 'malformed JSON body')
+            return
+
+        # Validate target
+        target = data.get('target')
+        if not isinstance(target, str):
+            self.send_json_error(400, 'bad_body', 'target must be a string')
+            return
+
+        # Validate stops (optional, defaults to [])
+        stops = data.get('stops', [])
+        if not isinstance(stops, list) or not all(isinstance(s, str) for s in stops):
+            self.send_json_error(400, 'bad_body', 'stops must be a list of strings')
+            return
+
+        # Get engine
+        engine = self.server.rollout_engine
+        if not engine:
+            self.send_json_error(500, 'no_engine', 'rollout engine not initialized')
+            return
+
+        # Check slot status (F11)
+        if engine.current and not _slot_free(engine.current):
+            self.send_response(409)
+            self.send_header('Content-Type', 'application/json; charset=utf-8')
+            self.end_headers()
+            response = {
+                'error': 'operation_in_progress',
+                'rollout_id': engine.current.get('rollout_id'),
+                'kind': engine.current.get('kind', 'rollout')
+            }
+            self.wfile.write(json.dumps(response).encode('utf-8'))
+            return
+
+        # Find units
+        watcher = self.server.watcher
+        if target not in watcher.units:
+            self.send_json_error(404, 'not_found', f'unit {target} not found')
+            return
+
+        for stop_name in stops:
+            if stop_name not in watcher.units:
+                self.send_json_error(404, 'not_found', f'unit {stop_name} not found')
+                return
+
+        # Take snapshot and run preflight
+        snapshot = watcher.snapshot()
+        pf = switch_preflight(target, stops, watcher, watcher.units,
+                             self.server.port)
+
+        # Build response based on preflight result
+        if pf['ok']:
+            self.send_response(200)
+            self.send_header('Content-Type', 'application/json; charset=utf-8')
+            self.end_headers()
+            response = {
+                'target': pf['target'],
+                'stop_candidates': pf['stop_candidates'],
+                'checks': pf['checks'],
+                'fit': pf['fit'],
+                'port': pf['port'],
+                'suggested_stops': pf['suggested_stops'],
+                'notices': pf['notices'],
+                'confirm': pf['confirm'],
+            }
+            self.wfile.write(json.dumps(response).encode('utf-8'))
+        else:
+            self.send_response(422)
+            self.send_header('Content-Type', 'application/json; charset=utf-8')
+            self.end_headers()
+            response = {
+                'error': 'preflight_failed',
+                'target': pf['target'],
+                'stop_candidates': pf['stop_candidates'],
+                'checks': pf['checks'],
+                'fit': pf['fit'],
+                'port': pf['port'],
+                'suggested_stops': pf['suggested_stops'],
+                'notices': pf['notices'],
+            }
+            self.wfile.write(json.dumps(response).encode('utf-8'))
+
+    def handle_switch(self):
+        """Handle POST /api/switch (execute)."""
+        # Read body
+        try:
+            content_length = int(self.headers.get('Content-Length', 0))
+            body = self.rfile.read(content_length)
+            data = json.loads(body)
+        except (ValueError, json.JSONDecodeError):
+            self.send_json_error(400, 'bad_json', 'malformed JSON body')
+            return
+
+        # Validate target
+        target = data.get('target')
+        if not isinstance(target, str):
+            self.send_json_error(400, 'bad_body', 'target must be a string')
+            return
+
+        # Validate stops (optional, defaults to [])
+        stops = data.get('stops', [])
+        if not isinstance(stops, list) or not all(isinstance(s, str) for s in stops):
+            self.send_json_error(400, 'bad_body', 'stops must be a list of strings')
+            return
+
+        # Validate confirm
+        confirm = data.get('confirm')
+        if not isinstance(confirm, str):
+            self.send_json_error(400, 'bad_body', 'confirm must be a string')
+            return
+
+        # Get engine
+        engine = self.server.rollout_engine
+        if not engine:
+            self.send_json_error(500, 'no_engine', 'rollout engine not initialized')
+            return
+
+        # Find units
+        watcher = self.server.watcher
+        if target not in watcher.units:
+            self.send_json_error(404, 'not_found', f'unit {target} not found')
+            return
+
+        for stop_name in stops:
+            if stop_name not in watcher.units:
+                self.send_json_error(404, 'not_found', f'unit {stop_name} not found')
+                return
+
+        # Check that all are in selected units
+        if target not in watcher.units:
+            self.send_json_error(404, 'not_found', f'target {target} not found')
+            return
+
+        for stop in stops:
+            if stop not in watcher.units:
+                self.send_json_error(404, 'not_found', f'stop {stop} not found')
+                return
+
+        # Re-check preflight (run switch_preflight to validate everything is still good)
+        pf = switch_preflight(target, stops, watcher, watcher.units,
+                             self.server.port)
+        if not pf['ok']:
+            self.send_response(422)
+            self.send_header('Content-Type', 'application/json; charset=utf-8')
+            self.end_headers()
+            response = {
+                'error': 'preflight_failed',
+                'target': pf['target'],
+                'stop_candidates': pf['stop_candidates'],
+                'checks': pf['checks'],
+                'fit': pf['fit'],
+                'port': pf['port'],
+                'suggested_stops': pf['suggested_stops'],
+                'notices': pf['notices'],
+            }
+            self.wfile.write(json.dumps(response).encode('utf-8'))
+            return
+
+        # Verify confirm hash matches (F3)
+        fingerprint = fleet_fingerprint(watcher.snapshot())
+        computed_confirm = compute_switch_confirm(target, stops, fingerprint)
+        if confirm != computed_confirm:
+            self.send_response(409)
+            self.send_header('Content-Type', 'application/json; charset=utf-8')
+            self.end_headers()
+            response = {
+                'error': 'preview_stale',
+                'detail': 'fleet state changed since preview (a unit started or stopped); re-preview'
+            }
+            self.wfile.write(json.dumps(response).encode('utf-8'))
+            return
+
+        # Start switch
+        try:
+            switch = engine.start_switch(target, stops, computed_confirm)
+            self.send_response(202)
+            self.send_header('Content-Type', 'application/json; charset=utf-8')
+            self.end_headers()
+            response = {'rollout_id': switch['rollout_id']}
+            self.wfile.write(json.dumps(response).encode('utf-8'))
+        except ActuationError as e:
+            error_str = str(e)
+            if 'operation_in_progress' in error_str:
+                self.send_response(409)
+                self.send_header('Content-Type', 'application/json; charset=utf-8')
+                self.end_headers()
+                response = {
+                    'error': 'operation_in_progress',
+                    'rollout_id': engine.current.get('rollout_id') if engine.current else None,
+                    'kind': engine.current.get('kind', 'rollout') if engine.current else None
+                }
+                self.wfile.write(json.dumps(response).encode('utf-8'))
+            else:
+                self.send_json_error(400, 'switch_error', error_str)
 
     def send_json_error(self, status: int, error: str, detail: str = None):
         """Send a JSON error response."""
@@ -2739,6 +2953,11 @@ GIT_VERBS = {"version", "rev-parse", "status", "ls-files", "log", "show",
 GIT_MUTATING_VERBS = {"add", "commit", "revert"}
 GIT_FORBIDDEN_TOKENS = {"push", "pull", "fetch", "remote", "clone", "init",
                         "checkout", "reset", "clean", "submodule"}
+FROZEN_POST_ROUTES = (
+    "/api/units/<name>/edit", "/api/units/<name>/rollout",
+    "/api/rollouts/<id>/rollback", "/api/rollouts/<id>/dismiss",
+    "/api/switch/preview", "/api/switch",
+)
 TOKEN_PATH = os.path.expanduser("~/.config/roundhouse/token")
 TOKEN = None
 HEADROOM_BYTES = 1 * 1024 * 1024 * 1024  # 1 GiB
@@ -2910,6 +3129,8 @@ Relaunch with --actuate when the worktree is clean.""", file=sys.stderr)
               file=sys.stderr)
     elif '*.bak*' not in ignore_text:
         print(f"warning: {gitignore} does not cover '*.bak*'", file=sys.stderr)
+    if ignore_text is not None and '*.roundhouse-tmp' not in ignore_text:
+        print(f"warning: {gitignore} does not cover '*.roundhouse-tmp'", file=sys.stderr)
 
 def print_git_init_instructions(unit_dir: str, unit_names: Optional[List[str]] = None):
     """Print the git init instructions message.

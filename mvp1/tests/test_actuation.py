@@ -2259,5 +2259,425 @@ class TestSwitchZeroWrites(unittest.TestCase):
         self.assertIn(switch['phase'], ('done', 'failed', 'restore_failed', 'restored'))
 
 
+class TestSwitchSlot(unittest.TestCase):
+    """Slot exclusivity for switches (F11, §2.2)."""
+
+    @classmethod
+    def setUpClass(cls):
+        """Start server on an ephemeral port."""
+        cls.temp_dir = tempfile.mkdtemp()
+        cls.fixtures = Path(__file__).resolve().parents[2] / 'docs' / 'fixtures'
+
+        # Create fixture units
+        qwen_path = cls.fixtures / 'qwen3.6-coding.service'
+        gemma_path = cls.fixtures / 'llama-server-gemma4.service'
+        qwen_unit = roundhouse.parse_unit(str(qwen_path), qwen_path.read_bytes())
+        gemma_unit = roundhouse.parse_unit(str(gemma_path), gemma_path.read_bytes())
+
+        # Create a stub watcher with units
+        cls.watcher = MagicMock(spec=roundhouse.Watcher)
+        cls.watcher.units = {'qwen3.6-coding.service': qwen_unit, 'llama-server-gemma4.service': gemma_unit}
+        cls.watcher.mem_store = None
+        cls.watcher._cgroup_cache = {}
+        cls.watcher.snapshot.return_value = {
+            'host': 'test', 'kernel': '6.1', 'now': time.time(),
+            'units': [
+                {'unit': 'qwen3.6-coding.service', 'rung': 'OFF', 'retired': False, 'port': 8085, 'start_ts_mono': '1234', 'mem': {}, 'badges': []},
+                {'unit': 'llama-server-gemma4.service', 'rung': 'READY', 'retired': False, 'port': 8093, 'start_ts_mono': '5678', 'mem': {}, 'badges': []},
+            ],
+            'mem': {}, 'sources': {}
+        }
+
+        cls.event_bus = roundhouse.EventBus()
+
+        # Find an available port
+        sock = socket.socket()
+        sock.bind(('127.0.0.1', 0))
+        cls.port = sock.getsockname()[1]
+        sock.close()
+
+        # Create server with arming
+        roundhouse.ACTUATE_ARMED = True
+        roundhouse.TOKEN = 'test-token'
+        cls.server = roundhouse.ThreadingHTTPServer(
+            ('127.0.0.1', cls.port),
+            roundhouse.RoundhouseRequestHandler,
+            cls.watcher,
+            cls.event_bus,
+            cls.port
+        )
+        cls.server.rollout_engine = MagicMock()
+
+        cls.server_thread = threading.Thread(target=cls.server.serve_forever, daemon=True)
+        cls.server_thread.start()
+        time.sleep(0.1)
+
+    @classmethod
+    def tearDownClass(cls):
+        """Shutdown server."""
+        cls.server.shutdown()
+        cls.server.server_close()
+        shutil.rmtree(cls.temp_dir, ignore_errors=True)
+        roundhouse.ACTUATE_ARMED = False
+        roundhouse.TOKEN = None
+
+    def post_http(self, path, data=None, headers=None):
+        """Make HTTP POST request."""
+        conn = http.client.HTTPConnection('127.0.0.1', self.port, timeout=5)
+        try:
+            body = None
+            if data:
+                body = json.dumps(data).encode('utf-8')
+            req_headers = headers or {}
+            if body and 'Content-Type' not in req_headers:
+                req_headers['Content-Type'] = 'application/json'
+            if 'Authorization' not in req_headers:
+                req_headers['Authorization'] = 'Bearer test-token'
+            conn.request('POST', path, body, req_headers)
+            resp = conn.getresponse()
+            resp_body = resp.read()
+            return resp.status, resp_body
+        finally:
+            conn.close()
+
+    def test_switch_rejects_when_rollout_holds_slot(self):
+        """POST /api/switch returns 409 operation_in_progress when rollout holds slot."""
+        # Set up a "current" rollout
+        self.server.rollout_engine.current = {
+            'rollout_id': 'ro-1-1', 'kind': 'rollout', 'phase': 'applying'
+        }
+        try:
+            status, body = self.post_http('/api/switch/preview', {'target': 'test.service'})
+            self.assertEqual(status, 409)
+            payload = json.loads(body)
+            self.assertEqual(payload.get('error'), 'operation_in_progress')
+        finally:
+            self.server.rollout_engine.current = None
+
+    def test_switch_while_switch_rejected(self):
+        """Two concurrent switches are rejected."""
+        # Set up a "current" switch
+        self.server.rollout_engine.current = {
+            'rollout_id': 'sw-1-1', 'kind': 'switch', 'phase': 'stopping'
+        }
+        try:
+            status, body = self.post_http('/api/switch/preview', {'target': 'test.service'})
+            self.assertEqual(status, 409)
+            payload = json.loads(body)
+            self.assertEqual(payload.get('error'), 'operation_in_progress')
+        finally:
+            self.server.rollout_engine.current = None
+
+
+class TestSwitchRoutes(unittest.TestCase):
+    """Switch routes and auth per MVP3-SPEC §4."""
+
+    @classmethod
+    def setUpClass(cls):
+        """Start server on an ephemeral port."""
+        cls.temp_dir = tempfile.mkdtemp()
+        cls.fixtures = Path(__file__).resolve().parents[2] / 'docs' / 'fixtures'
+
+        # Create fixture units
+        qwen_path = cls.fixtures / 'qwen3.6-coding.service'
+        gemma_path = cls.fixtures / 'llama-server-gemma4.service'
+        qwen_unit = roundhouse.parse_unit(str(qwen_path), qwen_path.read_bytes())
+        gemma_unit = roundhouse.parse_unit(str(gemma_path), gemma_path.read_bytes())
+
+        # Create a stub watcher
+        cls.watcher = MagicMock(spec=roundhouse.Watcher)
+        cls.watcher.units = {'qwen3.6-coding.service': qwen_unit, 'llama-server-gemma4.service': gemma_unit}
+        cls.watcher.mem_store = None
+        cls.watcher._cgroup_cache = {}
+        cls.watcher.snapshot.return_value = {
+            'host': 'test', 'kernel': '6.1', 'now': time.time(),
+            'units': [
+                {'unit': 'qwen3.6-coding.service', 'rung': 'OFF', 'retired': False, 'port': 8085, 'start_ts_mono': '1234', 'mem': {}, 'badges': []},
+                {'unit': 'llama-server-gemma4.service', 'rung': 'READY', 'retired': False, 'port': 8093, 'start_ts_mono': '5678', 'mem': {}, 'badges': []},
+            ],
+            'mem': {}, 'sources': {}
+        }
+
+        cls.event_bus = roundhouse.EventBus()
+
+        # Find an available port
+        sock = socket.socket()
+        sock.bind(('127.0.0.1', 0))
+        cls.port = sock.getsockname()[1]
+        sock.close()
+
+        # Create server with and without arming
+        roundhouse.ACTUATE_ARMED = False
+        cls.server = roundhouse.ThreadingHTTPServer(
+            ('127.0.0.1', cls.port),
+            roundhouse.RoundhouseRequestHandler,
+            cls.watcher,
+            cls.event_bus,
+            cls.port
+        )
+        cls.server.rollout_engine = MagicMock()
+        cls.server.rollout_engine.rollouts = {}
+        cls.server.rollout_engine.current = None
+
+        cls.server_thread = threading.Thread(target=cls.server.serve_forever, daemon=True)
+        cls.server_thread.start()
+        time.sleep(0.1)
+
+    @classmethod
+    def tearDownClass(cls):
+        """Shutdown server."""
+        cls.server.shutdown()
+        cls.server.server_close()
+        shutil.rmtree(cls.temp_dir, ignore_errors=True)
+
+    def setUp(self):
+        """Reset state before each test."""
+        self.server.rollout_engine.current = None
+
+    def post_http(self, path, data=None, headers=None):
+        """Make HTTP POST request."""
+        conn = http.client.HTTPConnection('127.0.0.1', self.port, timeout=5)
+        try:
+            body = None
+            if data:
+                body = json.dumps(data).encode('utf-8')
+            req_headers = headers or {}
+            if body and 'Content-Type' not in req_headers:
+                req_headers['Content-Type'] = 'application/json'
+            conn.request('POST', path, body, req_headers)
+            resp = conn.getresponse()
+            resp_body = resp.read()
+            return resp.status, resp_body
+        finally:
+            conn.close()
+
+    def get_http(self, path):
+        """Make HTTP GET request."""
+        conn = http.client.HTTPConnection('127.0.0.1', self.port, timeout=5)
+        try:
+            conn.request('GET', path)
+            resp = conn.getresponse()
+            return resp.status, resp.read()
+        finally:
+            conn.close()
+
+    def test_switch_preview_unarmed_returns_403(self):
+        """POST /api/switch/preview without --actuate returns 403."""
+        status, _ = self.post_http('/api/switch/preview', {'target': 'qwen3.6-coding.service'})
+        self.assertEqual(status, 403)
+
+    def test_switch_execute_unarmed_returns_403(self):
+        """POST /api/switch without --actuate returns 403."""
+        status, _ = self.post_http('/api/switch', {'target': 'qwen3.6-coding.service', 'stops': [], 'confirm': 'x'})
+        self.assertEqual(status, 403)
+
+    def test_switch_preview_bad_token_returns_401(self):
+        """POST /api/switch/preview with bad token returns 401."""
+        roundhouse.ACTUATE_ARMED = True
+        roundhouse.TOKEN = 'test-token'
+        try:
+            status, _ = self.post_http(
+                '/api/switch/preview',
+                {'target': 'qwen3.6-coding.service'},
+                {'Authorization': 'Bearer bad-token'}
+            )
+            self.assertEqual(status, 401)
+        finally:
+            roundhouse.ACTUATE_ARMED = False
+            roundhouse.TOKEN = None
+
+    def test_switch_preview_unknown_target_returns_404(self):
+        """POST /api/switch/preview with unknown target returns 404."""
+        roundhouse.ACTUATE_ARMED = True
+        roundhouse.TOKEN = 'test-token'
+        try:
+            status, _ = self.post_http(
+                '/api/switch/preview',
+                {'target': 'unknown.service'},
+                {'Authorization': 'Bearer test-token'}
+            )
+            self.assertEqual(status, 404)
+        finally:
+            roundhouse.ACTUATE_ARMED = False
+            roundhouse.TOKEN = None
+
+    def test_switch_preview_unknown_stop_returns_404(self):
+        """POST /api/switch/preview with unknown stop returns 404."""
+        roundhouse.ACTUATE_ARMED = True
+        roundhouse.TOKEN = 'test-token'
+        try:
+            status, _ = self.post_http(
+                '/api/switch/preview',
+                {'target': 'qwen3.6-coding.service', 'stops': ['unknown.service']},
+                {'Authorization': 'Bearer test-token'}
+            )
+            self.assertEqual(status, 404)
+        finally:
+            roundhouse.ACTUATE_ARMED = False
+            roundhouse.TOKEN = None
+
+    def test_switch_preview_success_includes_confirm(self):
+        """POST /api/switch/preview with valid input returns 200 with confirm."""
+        roundhouse.ACTUATE_ARMED = True
+        roundhouse.TOKEN = 'test-token'
+
+        # Mock switch_preflight to return a successful result
+        def mock_preflight(*args, **kwargs):
+            return {
+                'ok': True,
+                'checks': [
+                    {'check': 'retired', 'ok': True},
+                    {'check': 'target', 'ok': True},
+                    {'check': 'stops', 'ok': True},
+                    {'check': 'memory', 'ok': True},
+                    {'check': 'port', 'ok': True},
+                ],
+                'target': {'unit': 'qwen3.6-coding.service', 'rung': 'OFF', 'port': 8085},
+                'stop_candidates': [],
+                'fit': {'ok': True, 'estimate_bytes': 9000000000},
+                'port': {'ok': True, 'port': 8085, 'blockers': [], 'notices': []},
+                'suggested_stops': [],
+                'notices': [],
+                'confirm': 'abc123def456',
+            }
+
+        try:
+            with patch.object(roundhouse, 'switch_preflight', mock_preflight):
+                status, body = self.post_http(
+                    '/api/switch/preview',
+                    {'target': 'qwen3.6-coding.service', 'stops': []},
+                    {'Authorization': 'Bearer test-token'}
+                )
+            self.assertEqual(status, 200)
+            payload = json.loads(body)
+            self.assertIn('confirm', payload, "200 response must include confirm hash")
+            self.assertIn('target', payload)
+            self.assertIn('fit', payload)
+        finally:
+            roundhouse.ACTUATE_ARMED = False
+            roundhouse.TOKEN = None
+
+    def test_switch_preview_failure_omits_confirm(self):
+        """POST /api/switch/preview with ineligible target returns 422 without confirm."""
+        roundhouse.ACTUATE_ARMED = True
+        roundhouse.TOKEN = 'test-token'
+
+        # Mock switch_preflight to return a failing result
+        def mock_preflight(*args, **kwargs):
+            return {
+                'ok': False,
+                'checks': [
+                    {'check': 'target', 'ok': False, 'detail': 'already active (READY)'},
+                ],
+                'target': None,
+                'stop_candidates': [],
+                'fit': {'ok': False},
+                'port': {'ok': False, 'blockers': [], 'notices': []},
+                'suggested_stops': [],
+                'notices': [],
+            }
+
+        try:
+            with patch.object(roundhouse, 'switch_preflight', mock_preflight):
+                status, body = self.post_http(
+                    '/api/switch/preview',
+                    {'target': 'llama-server-gemma4.service', 'stops': []},
+                    {'Authorization': 'Bearer test-token'}
+                )
+            self.assertEqual(status, 422)
+            payload = json.loads(body)
+            self.assertNotIn('confirm', payload, "422 response must not include confirm")
+            self.assertEqual(payload.get('error'), 'preflight_failed')
+        finally:
+            roundhouse.ACTUATE_ARMED = False
+            roundhouse.TOKEN = None
+
+    def test_switch_execute_fingerprint_drift_returns_409(self):
+        """POST /api/switch with stale fingerprint returns 409 preview_stale."""
+        roundhouse.ACTUATE_ARMED = True
+        roundhouse.TOKEN = 'test-token'
+
+        # Mock switch_preflight for both calls
+        call_count = [0]
+
+        def mock_preflight(*args, **kwargs):
+            call_count[0] += 1
+            return {
+                'ok': True,
+                'checks': [{'check': 'target', 'ok': True}],
+                'target': {'unit': 'qwen3.6-coding.service', 'rung': 'OFF', 'port': 8085},
+                'stop_candidates': [],
+                'fit': {'ok': True},
+                'port': {'ok': True, 'blockers': [], 'notices': []},
+                'suggested_stops': [],
+                'notices': [],
+                'confirm': 'abc123' if call_count[0] == 1 else 'def456',  # Different confirm on second call
+            }
+
+        try:
+            with patch.object(roundhouse, 'switch_preflight', mock_preflight):
+                # First get a valid preview
+                status, preview_body = self.post_http(
+                    '/api/switch/preview',
+                    {'target': 'qwen3.6-coding.service', 'stops': []},
+                    {'Authorization': 'Bearer test-token'}
+                )
+            self.assertEqual(status, 200)
+            preview = json.loads(preview_body)
+            old_confirm = preview['confirm']
+
+            try:
+                # Now execute with the old confirm; it will mismatch the new one computed by switch_preflight
+                with patch.object(roundhouse, 'switch_preflight', mock_preflight):
+                    status, body = self.post_http(
+                        '/api/switch',
+                        {'target': 'qwen3.6-coding.service', 'stops': [], 'confirm': old_confirm},
+                        {'Authorization': 'Bearer test-token'}
+                    )
+                self.assertEqual(status, 409)
+                payload = json.loads(body)
+                self.assertEqual(payload.get('error'), 'preview_stale')
+            finally:
+                pass
+        finally:
+            roundhouse.ACTUATE_ARMED = False
+            roundhouse.TOKEN = None
+
+    def test_get_rollout_on_switch_record_returns_200(self):
+        """GET /api/rollouts/<sw-id> returns the switch record."""
+        roundhouse.ACTUATE_ARMED = True
+        try:
+            # Add a switch record
+            self.server.rollout_engine.rollouts = {
+                'sw-1-1': {
+                    'rollout_id': 'sw-1-1', 'kind': 'switch', 'unit': 'test.service',
+                    'target': 'test.service', 'stops': [], 'stopped': [],
+                    'target_started': False, 'phase': 'done', 'detail': 'switched',
+                    'restored': False, 'failure': None, 'rollback': None,
+                    'started_at': 1.0, 'updated_at': 2.0,
+                }
+            }
+            try:
+                status, body = self.get_http('/api/rollouts/sw-1-1')
+                self.assertEqual(status, 200)
+                rec = json.loads(body)
+                self.assertEqual(rec['kind'], 'switch')
+                self.assertEqual(rec['target'], 'test.service')
+            finally:
+                self.server.rollout_engine.rollouts = {}
+        finally:
+            roundhouse.ACTUATE_ARMED = False
+
+    def test_get_on_switch_preview_route_returns_405(self):
+        """GET /api/switch/preview returns 405."""
+        status, _ = self.get_http('/api/switch/preview')
+        self.assertEqual(status, 405)
+
+    def test_get_on_switch_route_returns_405(self):
+        """GET /api/switch returns 405."""
+        status, _ = self.get_http('/api/switch')
+        self.assertEqual(status, 405)
+
+
 if __name__ == '__main__':
     unittest.main()

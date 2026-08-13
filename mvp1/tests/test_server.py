@@ -598,7 +598,7 @@ class TestWriteGuards(unittest.TestCase):
             roundhouse.run_git(["add", "--", "x.service"], "/tmp")
 
     def test_actuate_armed_assignment_once(self):
-        """ACTUATE_ARMED assignment appears exactly once outside module level."""
+        """ACTUATE_ARMED assignment appears exactly twice: module-level False + one in cmd_serve."""
         import ast
         tree = ast.parse(self.SOURCE.read_text())
 
@@ -610,8 +610,8 @@ class TestWriteGuards(unittest.TestCase):
                     if isinstance(target, ast.Name) and target.id == 'ACTUATE_ARMED':
                         assignments.append((node.lineno, getattr(node, 'value', None)))
 
-        # Should have module-level False and one in cmd_serve or similar
-        self.assertGreaterEqual(len(assignments), 1)
+        # Should have exactly two: module-level False and one inside cmd_serve
+        self.assertEqual(len(assignments), 2, f"Expected 2 ACTUATE_ARMED assignments, got {len(assignments)}")
 
     def test_only_subprocess_gateways_spawn(self):
         """subprocess.* only reachable from run_ro, spawn_ro_stream, run_actuate, run_git."""
@@ -652,11 +652,203 @@ class TestWriteGuards(unittest.TestCase):
         finally:
             roundhouse.ACTUATE_ARMED = False
 
-    def test_post_routes_require_bearer(self):
-        """All POST routes return 403 or 401 based on check_bearer."""
-        # Functional test: requires a running server (see TestServerBasics)
-        # Placeholder for integration
-        pass
+    def test_write_verbs_only_in_section_e(self):
+        """Write verbs in Call args are only via run_actuate, and _daemon_reload only in rollout paths."""
+        import ast
+        import re
+
+        source_text = self.SOURCE.read_text()
+        tree = ast.parse(source_text)
+
+        # Check that every WRITE_VERBS constant in a Call's args has callee name run_actuate
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Call):
+                if isinstance(node.func, ast.Name):
+                    callee_name = node.func.id
+                else:
+                    callee_name = None
+
+                for arg in node.args:
+                    if isinstance(arg, ast.Constant) and arg.value in self.WRITE_VERBS:
+                        if callee_name != 'run_actuate':
+                            self.fail(f"Write verb '{arg.value}' passed to '{callee_name}', not run_actuate at line {arg.lineno}")
+
+        # Check that every run_actuate Call is inside a ROLLOUT_CALLSITES function
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Call):
+                callee_name = None
+                if isinstance(node.func, ast.Name):
+                    callee_name = node.func.id
+                if callee_name == 'run_actuate':
+                    # Find enclosing function
+                    found = False
+                    for fn in ast.walk(tree):
+                        if isinstance(fn, ast.FunctionDef):
+                            if any(n is node for n in ast.walk(fn)):
+                                if fn.name in self.ROLLOUT_CALLSITES:
+                                    found = True
+                                    break
+                    if not found:
+                        self.fail(f"run_actuate call at line {node.lineno} not in ROLLOUT_CALLSITES: {self.ROLLOUT_CALLSITES}")
+
+        # Check that _daemon_reload is only called from _run_rollout or _run_rollback
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Call):
+                if isinstance(node.func, ast.Attribute) and node.func.attr == '_daemon_reload':
+                    # Find enclosing function
+                    found = False
+                    for fn in ast.walk(tree):
+                        if isinstance(fn, ast.FunctionDef):
+                            if any(n is node for n in ast.walk(fn)):
+                                if fn.name in {'_run_rollout', '_run_rollback'}:
+                                    found = True
+                                    break
+                    if not found:
+                        self.fail(f"_daemon_reload called at line {node.lineno} outside {{_run_rollout, _run_rollback}}")
+
+    def test_post_route_table_frozen_and_complete(self):
+        """POST route table is complete and matches FROZEN_POST_ROUTES."""
+        import ast
+
+        # Behavioral test: boot unarmed server, POST to each frozen route, all 403
+        import tempfile
+        import shutil
+        import socket
+        import threading
+        import time
+        from unittest.mock import MagicMock
+
+        temp_dir = tempfile.mkdtemp()
+        try:
+            watcher = MagicMock(spec=roundhouse.Watcher)
+            watcher.snapshot.return_value = {
+                'host': 'test', 'kernel': '6.1', 'now': time.time(),
+                'mem': {}, 'units': [], 'sources': {}
+            }
+            watcher.units = {}
+
+            event_bus = roundhouse.EventBus()
+
+            # Find an available port
+            sock = socket.socket()
+            sock.bind(('127.0.0.1', 0))
+            port = sock.getsockname()[1]
+            sock.close()
+
+            # Create server without arming
+            roundhouse.ACTUATE_ARMED = False
+            server = roundhouse.ThreadingHTTPServer(
+                ('127.0.0.1', port),
+                roundhouse.RoundhouseRequestHandler,
+                watcher,
+                event_bus,
+                port
+            )
+
+            server_thread = threading.Thread(target=server.serve_forever, daemon=True)
+            server_thread.start()
+            time.sleep(0.1)
+
+            try:
+                # Instantiate each frozen route with dummy parameters
+                routes_to_test = [
+                    '/api/units/dummy.service/edit',
+                    '/api/units/dummy.service/rollout',
+                    '/api/rollouts/ro-1-1/rollback',
+                    '/api/rollouts/ro-1-1/dismiss',
+                    '/api/switch/preview',
+                    '/api/switch',
+                ]
+
+                import http.client
+                for route in routes_to_test:
+                    conn = http.client.HTTPConnection('127.0.0.1', port, timeout=5)
+                    try:
+                        conn.request('POST', route, b'{}', {'Content-Type': 'application/json'})
+                        resp = conn.getresponse()
+                        # All should be 403 unarmed or 404 for missing unit
+                        self.assertIn(resp.status, [403, 404], f"Route {route} returned {resp.status}")
+                    finally:
+                        conn.close()
+
+            finally:
+                server.shutdown()
+                server.server_close()
+        finally:
+            shutil.rmtree(temp_dir, ignore_errors=True)
+
+        # Structural test: FROZEN_POST_ROUTES exists and contains the right paths
+        self.assertTrue(hasattr(roundhouse, 'FROZEN_POST_ROUTES'))
+        self.assertIsInstance(roundhouse.FROZEN_POST_ROUTES, (tuple, list))
+        expected_routes = {
+            "/api/units/<name>/edit", "/api/units/<name>/rollout",
+            "/api/rollouts/<id>/rollback", "/api/rollouts/<id>/dismiss",
+            "/api/switch/preview", "/api/switch",
+        }
+        self.assertEqual(set(roundhouse.FROZEN_POST_ROUTES), expected_routes)
+
+    def test_file_writes_confined(self):
+        """File writes are confined to _atomic_write() function."""
+        import ast
+
+        source_text = self.SOURCE.read_text()
+        tree = ast.parse(source_text)
+
+        write_funcs = {'_atomic_write'}
+
+        for node in ast.walk(tree):
+            # Check for open() with write modes
+            if isinstance(node, ast.Call):
+                if isinstance(node.func, ast.Name) and node.func.id == 'open':
+                    # Check mode argument
+                    mode_str = None
+                    if len(node.args) >= 2 and isinstance(node.args[1], ast.Constant):
+                        mode_str = node.args[1].value
+                    elif any(kw.arg == 'mode' and isinstance(kw.value, ast.Constant) for kw in node.keywords):
+                        for kw in node.keywords:
+                            if kw.arg == 'mode' and isinstance(kw.value, ast.Constant):
+                                mode_str = kw.value.value
+
+                    if mode_str and any(c in mode_str for c in ['w', 'a', 'x', '+']):
+                        # Find enclosing function
+                        found = False
+                        for fn in ast.walk(tree):
+                            if isinstance(fn, ast.FunctionDef):
+                                if any(n is node for n in ast.walk(fn)):
+                                    if fn.name in write_funcs:
+                                        found = True
+                                        break
+                        if not found:
+                            self.fail(f"open() with write mode found outside {write_funcs}")
+
+                # Check for os.replace, os.rename, write_text, write_bytes
+                if isinstance(node.func, ast.Attribute):
+                    attr = node.func.attr
+                    if attr in {'replace', 'rename', 'write_text', 'write_bytes'}:
+                        # Check if it's os.X or X.write_text
+                        if isinstance(node.func.value, ast.Name) and node.func.value.id == 'os':
+                            if attr in {'replace', 'rename'}:
+                                # Find enclosing function
+                                found = False
+                                for fn in ast.walk(tree):
+                                    if isinstance(fn, ast.FunctionDef):
+                                        if any(n is node for n in ast.walk(fn)):
+                                            if fn.name in write_funcs:
+                                                found = True
+                                                break
+                                if not found:
+                                    self.fail(f"os.{attr} found outside {write_funcs}")
+                        elif attr in {'write_text', 'write_bytes'}:
+                            # Find enclosing function
+                            found = False
+                            for fn in ast.walk(tree):
+                                if isinstance(fn, ast.FunctionDef):
+                                    if any(n is node for n in ast.walk(fn)):
+                                        if fn.name in write_funcs:
+                                            found = True
+                                            break
+                            if not found:
+                                self.fail(f".{attr} found outside {write_funcs}")
 
 
 if __name__ == '__main__':
