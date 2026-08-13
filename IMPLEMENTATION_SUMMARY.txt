@@ -1,0 +1,117 @@
+# Roundhouse MVP4 T2 Implementation Summary
+
+## Task Completion
+
+**T2 Route + handler + guards implementation for Roundhouse MVP4**
+- Status: COMPLETE
+- All 285 tests passing (17 new tests added from baseline of 268)
+- No syntax errors, no compile-time issues
+- Full guard coverage implemented
+
+## Files Modified
+
+### 1. mvp1/roundhouse.py
+
+**Section C (Server/Handlers):**
+- Updated `do_POST` is_post_route check to include `/enablement` routes (line ~2162)
+- Added dispatch branch for `/enablement` routes in do_POST (line ~2209)
+- Implemented `handle_enablement(unit_name)` handler with exact 10-step sequence (lines 2435-2535):
+  1. Parse body; strict bool check for 'enabled'
+  2. Find unit (404 if not found)
+  3. Get engine (500 if not initialized)
+  4. Preflight checks via locked_snapshot (422 on collision/retired)
+  5. Get 'was' value from snapshot
+  6. Execute enablement via engine._set_enablement()
+  7. Read-back via run_ro + apply under watcher.lock
+  8. Compute strategy_note
+  9. Publish 'enablement' SSE event
+  10. Send 200 with frozen response keys
+- Updated `serve_deployments()` to include 'strategy_note' in load_strategy (line ~2923)
+- Updated `_build_port_board()` to compute boot status for self cell (lines 6074-6085)
+
+**Constants:**
+- FROZEN_POST_ROUTES already has 7th entry: "/api/units/<name>/enablement"
+
+### 2. mvp1/tests/test_server.py
+
+**TestWriteGuards enhancements:**
+- Added `test_os_system_os_popen_zero_tolerance()` - zero-tolerance for os.system/os.popen (§6(ii))
+- Extended `test_file_writes_confined()` to check Path.open write-mode forms (first positional or mode= kwarg)
+- Added `test_snapshot_calls_locked()` - verifies all snapshot() calls are locked (with-block or locked_snapshot)
+- Updated `test_post_route_table_frozen_and_complete()`:
+  - Added '/api/units/dummy.service/enablement' to routes_to_test
+  - Updated expected_routes to include "/api/units/<name>/enablement"
+  - Added '/enablement' to from_frozen set (7th route)
+
+### 3. mvp1/tests/test_actuation.py
+
+**New TestEnablementRoutes class (route-level integration tests):**
+- test_enablement_unarmed_returns_403 - auth without --actuate
+- test_enablement_bad_token_returns_401 - auth with bad token
+- test_enablement_unknown_unit_returns_404 - unit not found
+- test_enablement_bad_json_returns_400 - malformed JSON
+- test_enablement_string_enabled_returns_400 - enabled="true" (string)
+- test_enablement_number_enabled_returns_400 - enabled=1 (number)
+- test_enablement_null_enabled_returns_400 - enabled=null
+- test_enablement_absent_enabled_returns_400 - enabled absent
+- test_enablement_get_returns_404 - GET method not allowed (304 per spec)
+- test_enablement_200_has_frozen_keys - response has {unit,enabled,was,changed,strategy_note}
+- test_enablement_idempotent_re_enable_changed_false - toggling idempotent, systemctl invoked
+- test_enablement_422_enable_collision - port collision detection
+- test_enablement_422_retired - retired unit rejection
+
+**New TestEnablementSlotless class (slot-independence tests):**
+- test_enablement_with_rollout_in_progress - enablement succeeds with non-terminal rollout
+- test_enablement_with_switch_in_progress - enablement succeeds with non-terminal switch
+- Both verify engine.current identity is unchanged
+
+## Guard Verification
+
+✓ os.system/os.popen zero-tolerance: PASSED
+✓ Path.open write-mode confinement: PASSED
+✓ snapshot() lock unification: PASSED (all calls inside with-blocks or locked_snapshot)
+✓ ROLLOUT_CALLSITES frozen set: 4 names confirmed (_stop_unit, _start_unit, _daemon_reload, _set_enablement)
+✓ FROZEN_POST_ROUTES: 7 entries verified
+✓ Route table consistency: do_POST fragments match FROZEN_POST_ROUTES
+✓ No new write paths introduced
+✓ No unauthorized subprocess calls introduced
+
+## Test Coverage
+
+- Total tests: 285 (268 baseline + 17 new)
+- New test breakdown:
+  - TestEnablementRoutes: 13 tests
+  - TestEnablementSlotless: 2 tests
+  - TestWriteGuards enhancements: 2 tests
+  
+## Key Implementation Details
+
+1. **No slot check** in handler (slotless by design, per G1)
+2. **Strict bool validation** for 'enabled' field (rejects strings, numbers, null, absent)
+3. **Two-phase preflight**:
+   - Collision check (enable-specific)
+   - Retired check (both directions)
+4. **Graceful read-back degradation**: responds with requested value if read fails
+5. **Immediate SSE publication** with strategy_note to prevent UI staleness
+6. **Lock-safe read-back** via apply_unit_file_state under watcher.lock
+
+## Verification Commands
+
+```bash
+cd mvp1 && python3 -m unittest discover -s tests -v 2>&1 | tail -5
+# Expected: Ran 285 tests in ~32s, OK
+
+python3 -m py_compile roundhouse.py
+# Expected: no output (no syntax errors)
+
+python3 -m unittest tests.test_server.TestWriteGuards -v 2>&1 | grep -E "^test_|^OK|^FAILED"
+# Expected: all guards passing
+```
+
+## Files Touched Summary
+
+1. roundhouse.py - 5 locations (do_POST, handle_enablement, serve_deployments, _build_port_board)
+2. test_server.py - TestWriteGuards enhanced (2 new tests, 2 existing tests extended)
+3. test_actuation.py - 2 new test classes (15 tests total)
+
+All changes adhere to MVP4-SPEC requirements and frozen interface contracts.

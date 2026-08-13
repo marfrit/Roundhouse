@@ -3345,5 +3345,393 @@ class TestSwitchRoutes(unittest.TestCase):
         self.assertEqual(status, 405)
 
 
+# ===== MVP4 T2 route/slotless tests =====
+
+class TestEnablementRoutes(unittest.TestCase):
+    """Enablement toggle routes per MVP4-SPEC §3-4."""
+
+    @classmethod
+    def setUpClass(cls):
+        """Start server on an ephemeral port."""
+        cls.temp_dir = tempfile.mkdtemp()
+        cls.fixtures = Path(__file__).resolve().parents[2] / 'docs' / 'fixtures'
+
+        # Create fixture units
+        qwen_path = cls.fixtures / 'qwen3.6-coding.service'
+        qwen_unit = roundhouse.parse_unit(str(qwen_path), qwen_path.read_bytes())
+
+        # Create a stub watcher with lock
+        cls.watcher = MagicMock(spec=roundhouse.Watcher)
+        cls.watcher.lock = threading.Lock()
+        cls.watcher.units = {'qwen3.6-coding.service': qwen_unit}
+        cls.watcher.mem_store = None
+        cls.watcher.apply_unit_file_state = MagicMock()
+        cls.watcher.snapshot.return_value = {
+            'host': 'test', 'kernel': '6.1', 'now': time.time(),
+            'units': [
+                {'unit': 'qwen3.6-coding.service', 'rung': 'OFF', 'retired': False, 'enabled': False,
+                 'port': 8085, 'mem': {}, 'badges': [], 'strategy_note': None},
+            ],
+            'mem': {}, 'sources': {}, 'self_port': 8090, 'self_unit': {'enabled': True, 'unit_file_state': 'enabled'}
+        }
+
+        cls.event_bus = roundhouse.EventBus()
+
+        # Find an available port
+        sock = socket.socket()
+        sock.bind(('127.0.0.1', 0))
+        cls.port = sock.getsockname()[1]
+        sock.close()
+
+        # Create server with arming
+        roundhouse.ACTUATE_ARMED = True
+        roundhouse.TOKEN = 'test-token'
+        cls.server = roundhouse.ThreadingHTTPServer(
+            ('127.0.0.1', cls.port),
+            roundhouse.RoundhouseRequestHandler,
+            cls.watcher,
+            cls.event_bus,
+            cls.port
+        )
+        cls.server.rollout_engine = MagicMock()
+        cls.server.rollout_engine.current = None
+        cls.server.rollout_engine._set_enablement = MagicMock()
+
+        cls.server_thread = threading.Thread(target=cls.server.serve_forever, daemon=True)
+        cls.server_thread.start()
+        time.sleep(0.1)
+
+    @classmethod
+    def tearDownClass(cls):
+        """Shutdown server."""
+        cls.server.shutdown()
+        cls.server.server_close()
+        shutil.rmtree(cls.temp_dir, ignore_errors=True)
+        roundhouse.ACTUATE_ARMED = False
+        roundhouse.TOKEN = None
+
+    def post_http(self, path, data=None, headers=None):
+        """Make HTTP POST request."""
+        conn = http.client.HTTPConnection('127.0.0.1', self.port, timeout=5)
+        try:
+            body = None
+            if data is not None:
+                body = json.dumps(data).encode('utf-8')
+            req_headers = headers or {}
+            if body and 'Content-Type' not in req_headers:
+                req_headers['Content-Type'] = 'application/json'
+            conn.request('POST', path, body, req_headers)
+            resp = conn.getresponse()
+            resp_body = resp.read()
+            return resp.status, resp_body
+        finally:
+            conn.close()
+
+    def get_http(self, path):
+        """Make HTTP GET request."""
+        conn = http.client.HTTPConnection('127.0.0.1', self.port, timeout=5)
+        try:
+            conn.request('GET', path)
+            resp = conn.getresponse()
+            return resp.status, resp.read()
+        finally:
+            conn.close()
+
+    def test_enablement_unarmed_returns_403(self):
+        """POST /api/units/<name>/enablement without --actuate returns 403."""
+        roundhouse.ACTUATE_ARMED = False
+        try:
+            status, _ = self.post_http('/api/units/qwen3.6-coding.service/enablement', {'enabled': True})
+            self.assertEqual(status, 403)
+        finally:
+            roundhouse.ACTUATE_ARMED = True
+
+    def test_enablement_bad_token_returns_401(self):
+        """POST /api/units/<name>/enablement with bad token returns 401."""
+        status, _ = self.post_http(
+            '/api/units/qwen3.6-coding.service/enablement',
+            {'enabled': True},
+            {'Authorization': 'Bearer bad-token'}
+        )
+        self.assertEqual(status, 401)
+
+    def test_enablement_unknown_unit_returns_404(self):
+        """POST /api/units/<name>/enablement with unknown unit returns 404."""
+        status, _ = self.post_http(
+            '/api/units/unknown.service/enablement',
+            {'enabled': True},
+            {'Authorization': 'Bearer test-token'}
+        )
+        self.assertEqual(status, 404)
+
+    def test_enablement_bad_json_returns_400(self):
+        """POST with malformed JSON returns 400 bad_json."""
+        conn = http.client.HTTPConnection('127.0.0.1', self.port, timeout=5)
+        try:
+            conn.request('POST', '/api/units/qwen3.6-coding.service/enablement',
+                        b'{invalid json}', {'Authorization': 'Bearer test-token'})
+            resp = conn.getresponse()
+            status = resp.status
+            body = resp.read()
+            self.assertEqual(status, 400)
+            payload = json.loads(body)
+            self.assertEqual(payload.get('error'), 'bad_json')
+        finally:
+            conn.close()
+
+    def test_enablement_string_enabled_returns_400(self):
+        """POST with enabled='true' (string not bool) returns 400 bad_body."""
+        status, body = self.post_http(
+            '/api/units/qwen3.6-coding.service/enablement',
+            {'enabled': 'true'},
+            {'Authorization': 'Bearer test-token'}
+        )
+        self.assertEqual(status, 400)
+        payload = json.loads(body)
+        self.assertEqual(payload.get('error'), 'bad_body')
+
+    def test_enablement_number_enabled_returns_400(self):
+        """POST with enabled=1 (number) returns 400 bad_body."""
+        status, body = self.post_http(
+            '/api/units/qwen3.6-coding.service/enablement',
+            {'enabled': 1},
+            {'Authorization': 'Bearer test-token'}
+        )
+        self.assertEqual(status, 400)
+        payload = json.loads(body)
+        self.assertEqual(payload.get('error'), 'bad_body')
+
+    def test_enablement_null_enabled_returns_400(self):
+        """POST with enabled=null returns 400 bad_body."""
+        status, body = self.post_http(
+            '/api/units/qwen3.6-coding.service/enablement',
+            {'enabled': None},
+            {'Authorization': 'Bearer test-token'}
+        )
+        self.assertEqual(status, 400)
+        payload = json.loads(body)
+        self.assertEqual(payload.get('error'), 'bad_body')
+
+    def test_enablement_absent_enabled_returns_400(self):
+        """POST with enabled absent returns 400 bad_body."""
+        status, body = self.post_http(
+            '/api/units/qwen3.6-coding.service/enablement',
+            {},
+            {'Authorization': 'Bearer test-token'}
+        )
+        self.assertEqual(status, 400)
+        payload = json.loads(body)
+        self.assertEqual(payload.get('error'), 'bad_body')
+
+    def test_enablement_get_returns_404(self):
+        """GET /api/units/<name>/enablement returns 404 (no unit with /enablement suffix exists)."""
+        status, _ = self.get_http('/api/units/qwen3.6-coding.service/enablement')
+        self.assertEqual(status, 404)
+
+    def test_enablement_200_has_frozen_keys(self):
+        """POST /api/units/<name>/enablement with valid input returns 200 with frozen key set."""
+        # Mock the preflight and engine to succeed
+        with patch.object(roundhouse, 'enablement_preflight') as mock_pf, \
+             patch.object(roundhouse, 'run_ro') as mock_ro:
+            mock_pf.return_value = {'ok': True}
+            mock_ro.return_value = 'UnitFileState=enabled\n'
+
+            status, body = self.post_http(
+                '/api/units/qwen3.6-coding.service/enablement',
+                {'enabled': True},
+                {'Authorization': 'Bearer test-token'}
+            )
+            self.assertEqual(status, 200)
+            payload = json.loads(body)
+
+            # Verify frozen key set
+            frozen_keys = {'unit', 'enabled', 'was', 'changed', 'strategy_note'}
+            self.assertEqual(set(payload.keys()), frozen_keys,
+                           f"Response keys must be exactly {frozen_keys}, got {set(payload.keys())}")
+
+    def test_enablement_idempotent_re_enable_changed_false(self):
+        """Idempotent re-enable returns changed:false and systemctl was invoked."""
+        with patch.object(roundhouse, 'enablement_preflight') as mock_pf, \
+             patch.object(roundhouse, 'run_ro') as mock_ro:
+            # Unit already enabled, enabling it again
+            self.watcher.snapshot.return_value = {
+                **self.watcher.snapshot.return_value,
+                'units': [{'unit': 'qwen3.6-coding.service', 'rung': 'OFF', 'retired': False,
+                          'enabled': True, 'port': 8085, 'mem': {}, 'badges': [], 'strategy_note': None}]
+            }
+
+            mock_pf.return_value = {'ok': True}
+            mock_ro.return_value = 'UnitFileState=enabled\n'
+
+            status, body = self.post_http(
+                '/api/units/qwen3.6-coding.service/enablement',
+                {'enabled': True},
+                {'Authorization': 'Bearer test-token'}
+            )
+            self.assertEqual(status, 200)
+            payload = json.loads(body)
+            self.assertFalse(payload.get('changed'), "idempotent toggle should return changed:false")
+            # Verify _set_enablement was called
+            self.server.rollout_engine._set_enablement.assert_called()
+
+    def test_enablement_422_enable_collision(self):
+        """POST with port collision returns 422 enable_collision."""
+        with patch.object(roundhouse, 'enablement_preflight') as mock_pf:
+            mock_pf.return_value = {
+                'ok': False,
+                'port': 8085,
+                'claimants': [{'unit': 'other.service', 'enabled': True, 'rung': 'READY', 'port': 8085, 'gate': None}],
+                'detail': 'port 8085 is already a boot claim of: other.service (enabled, READY)'
+            }
+
+            status, body = self.post_http(
+                '/api/units/qwen3.6-coding.service/enablement',
+                {'enabled': True},
+                {'Authorization': 'Bearer test-token'}
+            )
+            self.assertEqual(status, 422)
+            payload = json.loads(body)
+            self.assertEqual(payload.get('error'), 'enable_collision')
+            self.assertIn('claimants', payload)
+
+    def test_enablement_422_retired(self):
+        """POST on retired unit returns 422 preflight_failed."""
+        with patch.object(roundhouse, 'enablement_preflight') as mock_pf:
+            mock_pf.return_value = {
+                'ok': False,
+                'detail': 'unit is [RETIRED]'
+            }
+
+            status, body = self.post_http(
+                '/api/units/qwen3.6-coding.service/enablement',
+                {'enabled': True},
+                {'Authorization': 'Bearer test-token'}
+            )
+            self.assertEqual(status, 422)
+            payload = json.loads(body)
+            self.assertEqual(payload.get('error'), 'preflight_failed')
+
+
+class TestEnablementSlotless(unittest.TestCase):
+    """Enablement is slotless: does not contend with rollout/switch for engine.current."""
+
+    @classmethod
+    def setUpClass(cls):
+        """Start server on an ephemeral port."""
+        cls.temp_dir = tempfile.mkdtemp()
+        cls.fixtures = Path(__file__).resolve().parents[2] / 'docs' / 'fixtures'
+
+        qwen_path = cls.fixtures / 'qwen3.6-coding.service'
+        qwen_unit = roundhouse.parse_unit(str(qwen_path), qwen_path.read_bytes())
+
+        cls.watcher = MagicMock(spec=roundhouse.Watcher)
+        cls.watcher.lock = threading.Lock()
+        cls.watcher.units = {'qwen3.6-coding.service': qwen_unit}
+        cls.watcher.mem_store = None
+        cls.watcher.apply_unit_file_state = MagicMock()
+        cls.watcher.snapshot.return_value = {
+            'host': 'test', 'kernel': '6.1', 'now': time.time(),
+            'units': [
+                {'unit': 'qwen3.6-coding.service', 'rung': 'OFF', 'retired': False, 'enabled': False,
+                 'port': 8085, 'mem': {}, 'badges': [], 'strategy_note': None},
+            ],
+            'mem': {}, 'sources': {}, 'self_port': 8090, 'self_unit': {'enabled': True, 'unit_file_state': 'enabled'}
+        }
+
+        cls.event_bus = roundhouse.EventBus()
+
+        sock = socket.socket()
+        sock.bind(('127.0.0.1', 0))
+        cls.port = sock.getsockname()[1]
+        sock.close()
+
+        roundhouse.ACTUATE_ARMED = True
+        roundhouse.TOKEN = 'test-token'
+        cls.server = roundhouse.ThreadingHTTPServer(
+            ('127.0.0.1', cls.port),
+            roundhouse.RoundhouseRequestHandler,
+            cls.watcher,
+            cls.event_bus,
+            cls.port
+        )
+        cls.server.rollout_engine = MagicMock()
+        cls.server.rollout_engine.current = None
+        cls.server.rollout_engine._set_enablement = MagicMock()
+
+        cls.server_thread = threading.Thread(target=cls.server.serve_forever, daemon=True)
+        cls.server_thread.start()
+        time.sleep(0.1)
+
+    @classmethod
+    def tearDownClass(cls):
+        """Shutdown server."""
+        cls.server.shutdown()
+        cls.server.server_close()
+        shutil.rmtree(cls.temp_dir, ignore_errors=True)
+        roundhouse.ACTUATE_ARMED = False
+        roundhouse.TOKEN = None
+
+    def post_http(self, path, data=None, headers=None):
+        """Make HTTP POST request."""
+        conn = http.client.HTTPConnection('127.0.0.1', self.port, timeout=5)
+        try:
+            body = None
+            if data is not None:
+                body = json.dumps(data).encode('utf-8')
+            req_headers = headers or {}
+            if body and 'Content-Type' not in req_headers:
+                req_headers['Content-Type'] = 'application/json'
+            conn.request('POST', path, body, req_headers)
+            resp = conn.getresponse()
+            resp_body = resp.read()
+            return resp.status, resp_body
+        finally:
+            conn.close()
+
+    def test_enablement_with_rollout_in_progress(self):
+        """Enablement succeeds even with a non-terminal rollout in engine.current."""
+        # Set up a non-terminal rollout
+        rollout_obj = {'rollout_id': 'ro-1-1', 'phase': 'running'}
+        self.server.rollout_engine.current = rollout_obj
+
+        with patch.object(roundhouse, 'enablement_preflight') as mock_pf, \
+             patch.object(roundhouse, 'run_ro') as mock_ro:
+            mock_pf.return_value = {'ok': True}
+            mock_ro.return_value = 'UnitFileState=enabled\n'
+
+            status, body = self.post_http(
+                '/api/units/qwen3.6-coding.service/enablement',
+                {'enabled': True},
+                {'Authorization': 'Bearer test-token'}
+            )
+            self.assertEqual(status, 200)
+            # Verify engine.current is unchanged (identity check would be overkill; verify it's still the same object)
+            self.assertIs(self.server.rollout_engine.current, rollout_obj)
+
+        self.server.rollout_engine.current = None
+
+    def test_enablement_with_switch_in_progress(self):
+        """Enablement succeeds even with a non-terminal switch in engine.current."""
+        # Set up a non-terminal switch
+        switch_obj = {'rollout_id': 'sw-1-1', 'phase': 'running', 'kind': 'switch'}
+        self.server.rollout_engine.current = switch_obj
+
+        with patch.object(roundhouse, 'enablement_preflight') as mock_pf, \
+             patch.object(roundhouse, 'run_ro') as mock_ro:
+            mock_pf.return_value = {'ok': True}
+            mock_ro.return_value = 'UnitFileState=enabled\n'
+
+            status, body = self.post_http(
+                '/api/units/qwen3.6-coding.service/enablement',
+                {'enabled': True},
+                {'Authorization': 'Bearer test-token'}
+            )
+            self.assertEqual(status, 200)
+            # Verify engine.current is unchanged
+            self.assertIs(self.server.rollout_engine.current, switch_obj)
+
+        self.server.rollout_engine.current = None
+
+
 if __name__ == '__main__':
     unittest.main()

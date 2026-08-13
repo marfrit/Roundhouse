@@ -717,6 +717,20 @@ class TestWriteGuards(unittest.TestCase):
 
         self.assertEqual(offenders, [], f'subprocess used outside gateways: {offenders}')
 
+    def test_os_system_os_popen_zero_tolerance(self):
+        """os.system and os.popen must not appear anywhere (§6(ii) guard)."""
+        import ast
+        tree = ast.parse(self.SOURCE.read_text())
+        offenders = []
+
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Attribute):
+                if isinstance(node.value, ast.Name) and node.value.id == 'os':
+                    if node.attr in ('system', 'popen'):
+                        offenders.append((node.lineno, f'os.{node.attr}'))
+
+        self.assertEqual(offenders, [], f'os.system/os.popen found: {offenders}')
+
     def test_section_e_exists(self):
         """Section E is present in roundhouse.py."""
         source = self.SOURCE.read_text()
@@ -817,6 +831,43 @@ class TestWriteGuards(unittest.TestCase):
                               f'_daemon_reload called at line {node.lineno} from {fn!r} — '
                               'a switch is lifecycle verbs only (F10)')
 
+    def test_snapshot_calls_locked(self):
+        """Every snapshot() call must be inside a with-block or inside locked_snapshot.
+
+        Regression guard (§7.1 item 3): proves that snapshot() is always taken under
+        watcher.lock or via the locked_snapshot() helper; unlocked calls deadlock
+        the worker threads (Risk 2).
+        """
+        import ast
+        source, tree = self._tree()
+        parents = self._parents(tree)
+
+        violations = []
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Call) and self._callee_name(node) == 'snapshot':
+                # Check if inside a with block
+                in_with = False
+                in_locked_snapshot = False
+
+                # Check if inside locked_snapshot function
+                fn = self._enclosing_func(node, parents)
+                if fn == 'locked_snapshot':
+                    in_locked_snapshot = True
+                else:
+                    # Check if inside a with block
+                    cur = parents.get(node)
+                    while cur is not None:
+                        if isinstance(cur, ast.With):
+                            in_with = True
+                            break
+                        cur = parents.get(cur)
+
+                if not (in_with or in_locked_snapshot):
+                    violations.append((node.lineno, fn))
+
+        self.assertEqual(violations, [],
+                        f'snapshot() called unlocked at: {violations}')
+
     def test_post_route_table_frozen_and_complete(self):
         """POST route table is complete and matches FROZEN_POST_ROUTES."""
         import ast
@@ -865,6 +916,7 @@ class TestWriteGuards(unittest.TestCase):
                 routes_to_test = [
                     '/api/units/dummy.service/edit',
                     '/api/units/dummy.service/rollout',
+                    '/api/units/dummy.service/enablement',
                     '/api/rollouts/ro-1-1/rollback',
                     '/api/rollouts/ro-1-1/dismiss',
                     '/api/switch/preview',
@@ -912,8 +964,8 @@ class TestWriteGuards(unittest.TestCase):
         found = {c.value for c in ast.walk(do_post)
                  if isinstance(c, ast.Constant) and isinstance(c.value, str)
                  and c.value.startswith('/')}
-        # Fragments the six frozen routes decompose into when matched by prefix/suffix
-        from_frozen = {'/api/units/', '/edit', '/rollout',
+        # Fragments the seven frozen routes decompose into when matched by prefix/suffix
+        from_frozen = {'/api/units/', '/edit', '/rollout', '/enablement',
                        '/api/rollouts/', '/rollback', '/dismiss',
                        '/api/switch/preview', '/api/switch'}
         # GET-only paths do_POST recognises purely to answer 405 (§4 status doctrine)
@@ -967,8 +1019,8 @@ class TestWriteGuards(unittest.TestCase):
                 # Check for os.replace, os.rename, write_text, write_bytes
                 if isinstance(node.func, ast.Attribute):
                     attr = node.func.attr
-                    if attr in {'replace', 'rename', 'write_text', 'write_bytes'}:
-                        # Check if it's os.X or X.write_text
+                    if attr in {'replace', 'rename', 'write_text', 'write_bytes', 'open'}:
+                        # Check if it's os.X or X.write_text or Path.open
                         if isinstance(node.func.value, ast.Name) and node.func.value.id == 'os':
                             if attr in {'replace', 'rename'}:
                                 # Find enclosing function
@@ -992,6 +1044,28 @@ class TestWriteGuards(unittest.TestCase):
                                             break
                             if not found:
                                 self.fail(f".{attr} found outside {write_funcs}")
+                        elif attr == 'open':
+                            # Path.open with write mode check (§6(ii))
+                            # Check first positional arg or mode= kwarg for w/a/x/+
+                            mode_str = None
+                            if len(node.args) >= 1 and isinstance(node.args[0], ast.Constant):
+                                mode_str = node.args[0].value
+                            elif any(kw.arg == 'mode' and isinstance(kw.value, ast.Constant) for kw in node.keywords):
+                                for kw in node.keywords:
+                                    if kw.arg == 'mode' and isinstance(kw.value, ast.Constant):
+                                        mode_str = kw.value.value
+
+                            if mode_str and any(c in mode_str for c in ['w', 'a', 'x', '+']):
+                                # Find enclosing function
+                                found = False
+                                for fn in ast.walk(tree):
+                                    if isinstance(fn, ast.FunctionDef):
+                                        if any(n is node for n in ast.walk(fn)):
+                                            if fn.name in write_funcs:
+                                                found = True
+                                                break
+                                if not found:
+                                    self.fail(f"Path.open with write mode found outside {write_funcs}")
 
 
 class TestMobileStatic(unittest.TestCase):
