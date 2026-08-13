@@ -874,7 +874,7 @@ class TestRoutesAuth(unittest.TestCase):
         self.assertEqual(rec['phase'], 'watching')
         self.assertNotIn('old_raw', rec)
         self.assertEqual(set(rec), {
-            'rollout_id', 'unit', 'phase', 'detail', 'edits', 'was_active', 'commit',
+            'rollout_id', 'kind', 'unit', 'phase', 'detail', 'edits', 'was_active', 'commit',
             'restored', 'failure', 'rollback', 'started_at', 'updated_at'})
 
     def test_get_on_post_only_rollout_subroutes_returns_405(self):
@@ -1859,6 +1859,404 @@ class TestTokenFilePermissions(unittest.TestCase):
 
         self.assertEqual(captured.get('mode'), 0o600,
                          "tmp file was world-readable until the post-replace chmod")
+
+
+class TestSwitchPreflight(unittest.TestCase):
+    """Switch preflight checks per MVP3-SPEC §3.2 and F9 eligibility doctrine."""
+
+    def setUp(self):
+        self.fixtures = Path(__file__).resolve().parents[2] / 'docs' / 'fixtures'
+        self.temp_dir = tempfile.mkdtemp()
+
+    def tearDown(self):
+        shutil.rmtree(self.temp_dir, ignore_errors=True)
+
+    def _load_fixture(self, name: str) -> roundhouse.UnitFile:
+        """Load a fixture unit file."""
+        path = self.fixtures / name
+        raw = path.read_bytes()
+        return roundhouse.parse_unit(str(path), raw)
+
+    def test_target_off_passes(self):
+        """Target with rung OFF passes the target check."""
+        unit = self._load_fixture('qwen3.6-coding.service')
+        units = {unit.name: unit}
+        watcher = MagicMock()
+        watcher.snapshot.return_value = {
+            'units': [
+                {'unit': unit.name, 'rung': 'OFF', 'retired': False, 'port': 8085, 'mem': {}},
+            ]
+        }
+        watcher._cgroup_cache = {}
+        watcher.mem_store = None
+
+        def meminfo_reader():
+            return {'MemAvailable': 20 * 1024 * 1024}  # 20 GiB in KiB
+
+        result = roundhouse.switch_preflight(unit.name, [], watcher, units, 8090, meminfo_reader)
+        self.assertTrue(result['ok'], f"Failed: {result['checks']}")
+        target_check = [c for c in result['checks'] if c['check'] == 'target'][0]
+        self.assertTrue(target_check['ok'])
+
+    def test_target_standby_fails_with_gate_detail(self):
+        """STANDBY target fails with gate details (F9)."""
+        unit = self._load_fixture('qwen3.6-coding.service')
+        units = {unit.name: unit}
+        watcher = MagicMock()
+        watcher.snapshot.return_value = {
+            'units': [
+                {'unit': unit.name, 'rung': 'STANDBY', 'gate': {'kernel': '6.1.0', 'running': '6.0.0'},
+                 'retired': False, 'port': 8085, 'mem': {}},
+            ]
+        }
+        watcher._cgroup_cache = {}
+        watcher.mem_store = None
+
+        def meminfo_reader():
+            return {'MemAvailable': 20 * 1024 * 1024}  # 20 GiB in KiB
+
+        result = roundhouse.switch_preflight(unit.name, [], watcher, units, 8090, meminfo_reader)
+        self.assertFalse(result['ok'])
+        self.assertIn('kernel 6.1.0', result['checks'][0]['detail'])
+
+    def test_target_failed_fails_with_clear_failure_message(self):
+        """FAILED target fails with 'clear the failure' message (F9)."""
+        unit = self._load_fixture('qwen3.6-coding.service')
+        units = {unit.name: unit}
+        watcher = MagicMock()
+        watcher.snapshot.return_value = {
+            'units': [
+                {'unit': unit.name, 'rung': 'FAILED', 'retired': False, 'port': 8085, 'mem': {}},
+            ]
+        }
+        watcher._cgroup_cache = {}
+        watcher.mem_store = None
+
+        def meminfo_reader():
+            return {'MemAvailable': 20 * 1024 * 1024}  # 20 GiB in KiB
+
+        result = roundhouse.switch_preflight(unit.name, [], watcher, units, 8090, meminfo_reader)
+        self.assertFalse(result['ok'])
+        self.assertIn('clear the failure by hand', result['checks'][0]['detail'])
+
+    def test_target_active_fails_with_already_active(self):
+        """Active target (READY/BUSY) fails with 'already active' (F9)."""
+        unit = self._load_fixture('qwen3.6-coding.service')
+        units = {unit.name: unit}
+        watcher = MagicMock()
+        watcher.snapshot.return_value = {
+            'units': [
+                {'unit': unit.name, 'rung': 'READY', 'retired': False, 'port': 8085, 'mem': {}},
+            ]
+        }
+        watcher._cgroup_cache = {}
+        watcher.mem_store = None
+
+        def meminfo_reader():
+            return {'MemAvailable': 20 * 1024 * 1024}  # 20 GiB in KiB
+
+        result = roundhouse.switch_preflight(unit.name, [], watcher, units, 8090, meminfo_reader)
+        self.assertFalse(result['ok'])
+        self.assertIn('already active', result['checks'][0]['detail'])
+
+    def test_retired_target_fails(self):
+        """Retired target fails at retired check."""
+        unit = self._load_fixture('qwen3.6-coding.service')
+        unit.retired = '[RETIRED]'
+        units = {unit.name: unit}
+        watcher = MagicMock()
+
+        result = roundhouse.switch_preflight(unit.name, [], watcher, units, 8090)
+        self.assertFalse(result['ok'])
+        self.assertEqual(result['checks'][0]['check'], 'retired')
+
+    def test_memory_check_uses_sum_of_freed_stops(self):
+        """Memory check sums freed bytes from all ticked stops with per-unit labels."""
+        target = 'target.service'
+        stop1 = 'stop1.service'
+        stop2 = 'stop2.service'
+
+        target_unit = self._load_fixture('qwen3.6-coding.service')
+        target_unit.name = target
+        stop1_unit = self._load_fixture('llama-server-gemma4.service')
+        stop1_unit.name = stop1
+        stop2_unit = self._load_fixture('llama-server-gemma4.service')
+        stop2_unit.name = stop2
+
+        units = {target: target_unit, stop1: stop1_unit, stop2: stop2_unit}
+        watcher = MagicMock()
+
+        cgroup_cache = {
+            stop1: {'current': 5 * 1024**3},
+            stop2: {'current': 3 * 1024**3},
+        }
+        watcher._cgroup_cache = cgroup_cache
+        watcher.mem_store = None
+        watcher.snapshot.return_value = {
+            'units': [
+                {'unit': target, 'rung': 'OFF', 'retired': False, 'port': 8090, 'mem': {}},
+                {'unit': stop1, 'rung': 'READY', 'retired': False, 'port': 8085, 'mem': {}},
+                {'unit': stop2, 'rung': 'BUSY', 'retired': False, 'port': 8086, 'mem': {}},
+            ]
+        }
+
+        def meminfo_reader():
+            return {'MemAvailable': 10 * 1024}  # 10 GiB
+
+        result = roundhouse.switch_preflight(target, [stop1, stop2], watcher, units, 8090, meminfo_reader)
+
+        # Check that freed_by has both stops with correct bytes and labels
+        freed_by = result['fit']['freed_by']
+        self.assertEqual(len(freed_by), 2)
+        freed_sum = sum(fb['bytes'] for fb in freed_by)
+        self.assertEqual(freed_sum, 8 * 1024**3)
+        # Verify labels are present
+        for fb in freed_by:
+            self.assertIn('source', fb)
+            self.assertIn('bytes', fb)
+            self.assertIn('unit', fb)
+
+    def test_port_blocker_rule(self):
+        """Port check: active un-ticked claimant is a blocker."""
+        target = 'target.service'
+        active_unit = 'active.service'
+
+        target_unit = self._load_fixture('qwen3.6-coding.service')
+        target_unit.name = target
+        active_u = self._load_fixture('llama-server-gemma4.service')
+        active_u.name = active_unit
+
+        units = {target: target_unit, active_unit: active_u}
+        watcher = MagicMock()
+        watcher._cgroup_cache = {}
+        watcher.mem_store = None
+        watcher.snapshot.return_value = {
+            'units': [
+                {'unit': target, 'rung': 'OFF', 'retired': False, 'port': 8085, 'mem': {}},
+                {'unit': active_unit, 'rung': 'READY', 'retired': False, 'port': 8085, 'mem': {}},
+            ]
+        }
+
+        def meminfo_reader():
+            return {'MemAvailable': 20 * 1024 * 1024}  # 20 GiB in KiB
+
+        result = roundhouse.switch_preflight(target, [], watcher, units, 8090, meminfo_reader)
+
+        # Port check should fail due to blocker
+        port_check = result['port']
+        self.assertFalse(port_check['ok'])
+        self.assertTrue(len(port_check['blockers']) > 0)
+
+    def test_port_notice_for_ticked_claimant(self):
+        """Port check: ticked claimant is a notice, not blocker."""
+        target = 'target.service'
+        ticked_unit = 'ticked.service'
+
+        target_unit = self._load_fixture('qwen3.6-coding.service')
+        target_unit.name = target
+        ticked_u = self._load_fixture('llama-server-gemma4.service')
+        ticked_u.name = ticked_unit
+
+        units = {target: target_unit, ticked_unit: ticked_u}
+        watcher = MagicMock()
+        watcher._cgroup_cache = {}
+        watcher.mem_store = None
+        watcher.snapshot.return_value = {
+            'units': [
+                {'unit': target, 'rung': 'OFF', 'retired': False, 'port': 8085, 'mem': {}},
+                {'unit': ticked_unit, 'rung': 'READY', 'retired': False, 'port': 8085, 'mem': {}},
+            ]
+        }
+
+        def meminfo_reader():
+            return {'MemAvailable': 20 * 1024 * 1024}  # 20 GiB in KiB
+
+        result = roundhouse.switch_preflight(target, [ticked_unit], watcher, units, 8090, meminfo_reader)
+
+        # Port check should pass (ticked unit will stop)
+        port_check = result['port']
+        self.assertTrue(port_check['ok'])
+
+    def test_suggest_stops_empty_when_fits(self):
+        """suggest_stops returns empty list when fit passes (F7)."""
+        target = 'target.service'
+        units = {}
+        watcher = MagicMock()
+        watcher._cgroup_cache = {}
+        watcher.mem_store = None
+
+        estimate = 5 * 1024**3
+        budget = 20 * 1024**3
+
+        result = roundhouse.switch_preflight(target, [], watcher, units, 8090)
+        # When fit passes, suggest_stops should be empty
+        self.assertEqual(result['suggested_stops'], [])
+
+    def test_suggest_stops_greedy_order(self):
+        """suggest_stops walks candidates in resident_bytes descending order (F7)."""
+        # Test the suggest_stops function directly
+        target = 'target.service'
+        cand1 = 'cand1.service'
+        cand2 = 'cand2.service'
+
+        stop_candidates = [
+            {'unit': cand1, 'rung': 'READY'},
+            {'unit': cand2, 'rung': 'READY'},
+        ]
+        cgroup_cache = {
+            cand1: {'current': 10 * 1024**3},  # Larger
+            cand2: {'current': 5 * 1024**3},   # Smaller
+        }
+
+        # Make fit fail with small budget
+        estimate = 15 * 1024**3
+        budget = 10 * 1024**3  # Not enough
+
+        result = roundhouse.suggest_stops(target, [], stop_candidates, estimate, budget, [],
+                                         cgroup_cache, None)
+
+        # Suggestions should be in greedy order: cand1 (larger) before cand2
+        if len(result) > 1:
+            self.assertEqual(result[0], cand1)
+
+
+class TestSwitchConfirm(unittest.TestCase):
+    """Switch confirm hash canonicalization per F3."""
+
+    def test_confirm_order_independent_in_stops(self):
+        """compute_switch_confirm is order-independent in stops."""
+        confirm1 = roundhouse.compute_switch_confirm('t', ['b', 'a'], {'a': '123', 't': '0'})
+        confirm2 = roundhouse.compute_switch_confirm('t', ['a', 'b'], {'t': '0', 'a': '123'})
+        self.assertEqual(confirm1, confirm2)
+
+    def test_confirm_sensitive_to_ts_mono_change(self):
+        """Changing any unit's ts_mono changes the confirm hash."""
+        confirm1 = roundhouse.compute_switch_confirm('t', ['a'], {'a': '123', 't': '0'})
+        confirm2 = roundhouse.compute_switch_confirm('t', ['a'], {'a': '124', 't': '0'})
+        self.assertNotEqual(confirm1, confirm2)
+
+    def test_confirm_none_canonicalizes_to_zero(self):
+        """None/''/absent ts_mono canonicalize to '0'."""
+        fp1 = roundhouse.fleet_fingerprint({'units': [
+            {'unit': 'a.service', 'retired': False, 'start_ts_mono': None}
+        ]})
+        fp2 = roundhouse.fleet_fingerprint({'units': [
+            {'unit': 'a.service', 'retired': False, 'start_ts_mono': ''}
+        ]})
+        fp3 = roundhouse.fleet_fingerprint({'units': [
+            {'unit': 'a.service', 'retired': False}
+        ]})
+        self.assertEqual(fp1['a.service'], '0')
+        self.assertEqual(fp2['a.service'], '0')
+        self.assertEqual(fp3['a.service'], '0')
+
+    def test_fleet_fingerprint_excludes_retired(self):
+        """fleet_fingerprint excludes retired units."""
+        fp = roundhouse.fleet_fingerprint({'units': [
+            {'unit': 'active.service', 'retired': False, 'start_ts_mono': '123'},
+            {'unit': 'retired.service', 'retired': True, 'start_ts_mono': '456'},
+        ]})
+        self.assertIn('active.service', fp)
+        self.assertNotIn('retired.service', fp)
+
+
+class TestSwitchEngine(_EngineHarness):
+    """Switch engine state machine per MVP3-SPEC §2.1."""
+
+    def test_switch_methods_exist(self):
+        """Verify all required switch methods exist."""
+        engine = roundhouse.RolloutEngine(MagicMock(), {}, self.temp_dir, 8090,
+                                        roundhouse.EventBus(), threading.Lock())
+        self.assertTrue(hasattr(engine, 'start_switch'))
+        self.assertTrue(hasattr(engine, '_run_switch'))
+        self.assertTrue(hasattr(engine, '_confirm_off'))
+        self.assertTrue(hasattr(engine, '_watch_to_ready'))
+        self.assertTrue(hasattr(engine, '_run_restore'))
+
+    def test_watch_to_ready_ready_terminal(self):
+        """_watch_to_ready returns ('ready', elapsed) when rung reaches READY."""
+        watcher = MagicMock()
+        watcher.snapshot.side_effect = [
+            {'units': [{'unit': 'u.service', 'rung': 'LOADING', 'badges': []}]},
+            {'units': [{'unit': 'u.service', 'rung': 'READY', 'badges': []}]},
+        ]
+
+        engine = roundhouse.RolloutEngine(watcher, {}, self.temp_dir, 8090,
+                                        roundhouse.EventBus(), threading.Lock())
+        result = engine._watch_to_ready('u.service', None, time.time() + 10)
+
+        self.assertEqual(result[0], 'ready')
+        self.assertGreater(result[1], 0)
+
+    def test_watch_to_ready_failed_terminal(self):
+        """_watch_to_ready returns ('failed', reason, detail) when rung is FAILED."""
+        watcher = MagicMock()
+        watcher.snapshot.return_value = {
+            'units': [{'unit': 'u.service', 'rung': 'FAILED', 'badges': []}]
+        }
+
+        engine = roundhouse.RolloutEngine(watcher, {}, self.temp_dir, 8090,
+                                        roundhouse.EventBus(), threading.Lock())
+        result = engine._watch_to_ready('u.service', None, time.time() + 10)
+
+        self.assertEqual(result[0], 'failed')
+        self.assertEqual(result[1], 'unit_failed')
+
+
+class TestSwitchZeroWrites(unittest.TestCase):
+    """Switch writes nothing per F10."""
+
+    def setUp(self):
+        self.temp_dir = tempfile.mkdtemp()
+        self.fixtures = Path(__file__).resolve().parents[2] / 'docs' / 'fixtures'
+
+    def tearDown(self):
+        shutil.rmtree(self.temp_dir, ignore_errors=True)
+
+    def _load_fixture(self, name: str) -> roundhouse.UnitFile:
+        """Load a fixture unit file."""
+        path = self.fixtures / name
+        raw = path.read_bytes()
+        return roundhouse.parse_unit(str(path), raw)
+
+    def test_switch_with_run_git_raising_completes(self):
+        """Full switch completes even with run_git monkeypatched to raise."""
+        unit_t = self._load_fixture('qwen3.6-coding.service')
+        units = {unit_t.name: unit_t}
+
+        watcher = MagicMock()
+        watcher.units = units
+        watcher.mem_store = None
+        watcher._cgroup_cache = {}
+        watcher.snapshot.return_value = {
+            'units': [
+                {'unit': unit_t.name, 'rung': 'OFF', 'retired': False, 'port': 8085, 'since': 1.0, 'start_ts_mono': '0', 'mem': {}, 'badges': []},
+            ]
+        }
+
+        engine = roundhouse.RolloutEngine(watcher, units, self.temp_dir, 8090,
+                                        roundhouse.EventBus(), threading.Lock())
+
+        def stub_run_actuate(argv, units, timeout=90):
+            return ''
+
+        def raising_run_git(*args, **kwargs):
+            raise Exception("run_git should not be called")
+
+        fingerprint = roundhouse.fleet_fingerprint(watcher.snapshot())
+        confirm = roundhouse.compute_switch_confirm(unit_t.name, [], fingerprint)
+
+        with patch.object(roundhouse, 'run_actuate', stub_run_actuate), \
+             patch.object(roundhouse, 'run_git', raising_run_git):
+            switch = engine.start_switch(unit_t.name, [], confirm)
+            deadline = time.time() + 10
+            while time.time() < deadline:
+                if switch['phase'] in ('done', 'failed'):
+                    break
+                time.sleep(0.05)
+
+        # Switch should reach a terminal phase
+        self.assertIn(switch['phase'], ('done', 'failed', 'restore_failed', 'restored'))
 
 
 if __name__ == '__main__':

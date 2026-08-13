@@ -1062,6 +1062,7 @@ import subprocess
 import threading
 
 READONLY_SYSTEMCTL_VERBS = {"show", "cat", "list-units", "list-unit-files"}
+ACTIVE_RUNGS = {'STARTING', 'LOADING', 'READY', 'BUSY'}
 
 # Journal regex constants per §3.4 (AMENDED per orchestrator)
 # llama-server patterns
@@ -1181,7 +1182,6 @@ def classify_port_claims(claims: List[Dict]) -> tuple:
     if len(claims) < 2:
         return (None, None)
 
-    ACTIVE_RUNGS = {'STARTING', 'LOADING', 'READY', 'BUSY'}
     if sum(1 for c in claims if c.get('rung') in ACTIVE_RUNGS) >= 2:
         return ('active', 'two claimants are live on this port right now')
 
@@ -1558,6 +1558,7 @@ class Watcher:
                 'rung': rung,
                 'roster': self._rung_to_roster(rung),
                 'since': self._state[unit_name].get('exec_main_start_ts') or self.now(),
+                'start_ts_mono': self._state[unit_name].get('exec_main_start_ts_mono') or '0',
                 'detail': self._compute_detail(unit_name, rung),
                 'badges': self._compute_badges(unit_name, rung),
                 'stale': self._sources_degraded(),
@@ -2689,25 +2690,45 @@ class ThreadingHTTPServer(http.server.ThreadingHTTPServer):
 # ===== SECTION E: ACTUATION (armed only by --actuate; run_actuate + run_git are the only mutation gateways) =====
 
 def rollout_public_record(rollout: dict) -> dict:
-    """The §4.3 wire shape of a rollout record.
+    """The §4.3 wire shape of a rollout or switch record.
 
     One implementation for both consumers (snapshot merge and GET /api/rollouts/<id>) so
     they cannot drift; `old_raw` (the in-memory pre-edit bytes) is never serialized.
     """
-    return {
+    kind = rollout.get('kind', 'rollout')
+
+    # Common fields for both kinds
+    common = {
         'rollout_id': rollout['rollout_id'],
+        'kind': kind,
         'unit': rollout['unit'],
         'phase': rollout['phase'],
         'detail': rollout['detail'],
-        'edits': rollout['edits'],
-        'was_active': rollout['was_active'],
-        'commit': rollout['commit'],
-        'restored': rollout['restored'],
         'failure': rollout['failure'],
         'rollback': rollout['rollback'],
+        'restored': rollout['restored'],
         'started_at': rollout['started_at'],
         'updated_at': rollout['updated_at'],
     }
+
+    # Kind-specific fields
+    if kind == 'switch':
+        # Switch record: add switch-specific fields
+        common.update({
+            'target': rollout.get('target'),
+            'stops': rollout.get('stops', []),
+            'stopped': rollout.get('stopped', []),
+            'target_started': rollout.get('target_started', False),
+        })
+    else:
+        # Rollout record: add rollout-specific fields
+        common.update({
+            'edits': rollout['edits'],
+            'was_active': rollout['was_active'],
+            'commit': rollout['commit'],
+        })
+
+    return common
 
 
 # Module globals
@@ -2721,6 +2742,12 @@ GIT_FORBIDDEN_TOKENS = {"push", "pull", "fetch", "remote", "clone", "init",
 TOKEN_PATH = os.path.expanduser("~/.config/roundhouse/token")
 TOKEN = None
 HEADROOM_BYTES = 1 * 1024 * 1024 * 1024  # 1 GiB
+
+# Timeout constants (section E)
+STOP_TIMEOUT_SEC = 150
+CONFIRM_OFF_TIMEOUT_SEC = 30
+START_TIMEOUT_SEC = 30
+WATCH_TIMEOUT_SEC = 900
 
 # Exceptions
 class ActuationError(Exception):
@@ -3448,6 +3475,13 @@ ROLLOUT_PHASES = ("preflight", "applying", "reloading", "starting", "watching",
 # Terminal phases: the slot is unconditionally free in these.
 ROLLOUT_TERMINAL_PHASES = ("done", "rolled_back", "rollback_failed")
 
+# Switch phases
+SWITCH_PHASES = ("preflight", "stopping", "starting", "watching",
+                 "done", "failed", "restoring", "restored", "restore_failed")
+
+# Terminal phases for both kinds (rollout + switch)
+OPERATION_TERMINAL_PHASES = ROLLOUT_TERMINAL_PHASES + ("restored", "restore_failed")
+
 
 def _slot_free(record: Optional[Dict]) -> bool:
     """§4.1: is the global rollout slot idle?
@@ -3465,7 +3499,7 @@ def _slot_free(record: Optional[Dict]) -> bool:
     if record is None:
         return True
     phase = record.get('phase')
-    if phase in ROLLOUT_TERMINAL_PHASES:
+    if phase in OPERATION_TERMINAL_PHASES:
         return True
     if phase == 'failed':
         if record.get('restored'):
@@ -3596,37 +3630,6 @@ def preflight_memory(unit: UnitFile, edits: List[Edit], watcher: 'Watcher',
         elif edit.field in ("cache_type_k", "cache_type_v", "model_path"):
             new_profile[edit.field] = edit.new_text
 
-    # Estimate memory
-    store = getattr(watcher, 'mem_store', None)
-    estimate_bytes = None
-    estimate_source = None
-
-    # Try exact measurement first
-    model_path = new_profile.get('model_path')
-    if model_path and unit.exec_start:
-        try:
-            file_id = f"sz{os.stat(model_path).st_size}:mt{int(os.stat(model_path).st_mtime)}"
-            mem = store.lookup(unit.name, file_id, new_profile.get('ctx')) if store else None
-            if mem:
-                estimate_bytes = mem['bytes']
-                estimate_source = "measured"
-        except Exception:
-            pass
-
-    # Fallback to formula
-    if estimate_bytes is None:
-        if model_path:
-            try:
-                size = os.path.getsize(model_path)
-                estimate_bytes = int(size * 1.10 + 1.5 * 1024**3)
-                estimate_source = "formula"
-            except Exception:
-                pass
-
-        if estimate_bytes is None:
-            estimate_bytes = int(9 * 1024**3)  # Default 9 GiB
-            estimate_source = "default"
-
     # Check model_path exists if being edited
     for edit in edits:
         if edit.field == "model_path":
@@ -3636,6 +3639,10 @@ def preflight_memory(unit: UnitFile, edits: List[Edit], watcher: 'Watcher',
                     "check": "memory",
                     "detail": f"model file not found: {edit.new_text}"
                 }
+
+    # Estimate memory using extracted helper
+    store = getattr(watcher, 'mem_store', None)
+    estimate_bytes, estimate_source = _estimate_start_bytes(unit.name, new_profile, store)
 
     # Read MemAvailable
     mem_available = None
@@ -3655,12 +3662,11 @@ def preflight_memory(unit: UnitFile, edits: List[Edit], watcher: 'Watcher',
     if mem_available is None:
         mem_available = 0
 
-    # Freed memory from stopping this unit (E9).
+    # Freed memory from stopping this unit (E9), using extracted helper.
     #
     # Only a unit that is actually RESIDENT frees anything. The snapshot's `mem` row is a
     # measured peak or an estimate FORMULA and is reported for units that are OFF too, so
     # reading it unconditionally credited the budget with memory nobody is holding.
-    # Order (active case only): cgroup memory.current -> last_peak -> measured row -> 0.
     freed_bytes = 0
     freed_source = 'none (unit not active)'
     snapshot = watcher.snapshot()
@@ -3670,20 +3676,9 @@ def preflight_memory(unit: UnitFile, edits: List[Edit], watcher: 'Watcher',
             unit_row = u
             break
 
-    rung = (unit_row or {}).get('rung')
-    if rung in ('STARTING', 'LOADING', 'READY', 'BUSY'):
-        cgroup = (getattr(watcher, '_cgroup_cache', None) or {}).get(unit.name) or {}
-        current = cgroup.get('current')
-        last_peak = cgroup.get('last_peak')
-        row_mem = (unit_row or {}).get('mem') or {}
-        if current:
-            freed_bytes, freed_source = current, 'cgroup memory.current'
-        elif last_peak:
-            freed_bytes, freed_source = last_peak, 'cgroup memory.peak (last sample)'
-        elif row_mem.get('source') == 'measured' and row_mem.get('bytes'):
-            freed_bytes, freed_source = row_mem['bytes'], 'measured peak row'
-        else:
-            freed_bytes, freed_source = 0, 'active, but no cgroup sample yet'
+    if unit_row:
+        cgroup_cache = getattr(watcher, '_cgroup_cache', None) or {}
+        freed_bytes, freed_source = _freed_bytes(unit.name, unit_row, cgroup_cache)
 
     budget = mem_available + freed_bytes
     headroom = HEADROOM_BYTES
@@ -3773,6 +3768,7 @@ class RolloutEngine:
 
             rollout = {
                 "rollout_id": rollout_id,
+                "kind": "rollout",
                 "unit": unit_name,
                 "phase": "preflight",
                 "detail": "checking prerequisites",
@@ -3969,15 +3965,21 @@ class RolloutEngine:
 
     def _update_phase(self, rollout_id: str, phase: str, detail: str):
         """Update phase and publish SSE event."""
+        kind = None
+        unit = None
         with self.watcher_lock:
             rollout = self.rollouts.get(rollout_id)
             if rollout:
                 rollout['phase'] = phase
                 rollout['detail'] = detail
                 rollout['updated_at'] = time.time()
+                kind = rollout.get('kind', 'rollout')
+                unit = rollout.get('unit')
 
         self.event_bus.publish('rollout', {
             'rollout_id': rollout_id,
+            'kind': kind,
+            'unit': unit,
             'phase': phase,
             'detail': detail,
             'ok': True,
@@ -3998,6 +4000,8 @@ class RolloutEngine:
         §4.1 reads it to free the slot, and the record has to say so out loud.
         """
         text = detail or reason
+        kind = None
+        unit = None
         with self.watcher_lock:
             rollout = self.rollouts.get(rollout_id)
             if rollout:
@@ -4006,21 +4010,31 @@ class RolloutEngine:
                 rollout['failure'] = {'reason': reason, 'detail': text}
                 if restored:
                     rollout['restored'] = True
-                if offer_rollback and rollout['commit']:
-                    rollout['rollback'] = {'offered': True}
+                kind = rollout.get('kind', 'rollout')
+                unit = rollout.get('unit')
+                # Offer reversibility per §2.6: rollouts require commit; switches need stopped/target_started
+                if offer_rollback:
+                    if kind == 'rollout':
+                        if rollout.get('commit'):
+                            rollout['rollback'] = {'offered': True}
+                    else:  # switch
+                        if rollout.get('stopped') or rollout.get('target_started'):
+                            rollout['rollback'] = {'offered': True}
                 rollout['updated_at'] = time.time()
 
         self.event_bus.publish('rollout', {
             'rollout_id': rollout_id,
+            'kind': kind,
+            'unit': unit,
             'phase': 'failed',
             'detail': text,
             'ok': False,
             'ts': time.time()
         })
 
-    def _stop_unit(self, unit_name: str):
+    def _stop_unit(self, unit_name: str, timeout: float = STOP_TIMEOUT_SEC):
         """Stop a unit."""
-        run_actuate(["systemctl", "--user", "stop", "--", unit_name], self.units)
+        run_actuate(["systemctl", "--user", "stop", "--", unit_name], self.units, timeout=timeout)
 
     def _start_unit(self, unit_name: str):
         """Start a unit."""
@@ -4125,30 +4139,360 @@ class RolloutEngine:
             return False
         return True
 
-    def rollback(self, rollout_id: str):
-        """Start rollback of a failed rollout.
+    def _watch_to_ready(self, unit_name: str, prior_start_ts: Optional[float], deadline_ts: float) -> tuple:
+        """Watch a unit to READY/BUSY, or return failure reason (extracted from _watch_unit).
 
-        Eligibility check AND the `rolling_back` transition happen under `watcher_lock`:
-        check-and-set outside it let a double-click through twice, and two `_run_rollback`
-        workers on one unit interleave `git revert` with a byte-restore commit.
+        Returns: ('ready', elapsed) | ('failed', reason, detail) | ('timeout',)
+        """
+        start = time.time()
+
+        while time.time() < deadline_ts:
+            rung = None
+            badges = []
+            since = None
+            with self.watcher_lock:
+                snapshot = self.watcher.snapshot()
+                for u in snapshot.get('units', []):
+                    if u['unit'] == unit_name:
+                        rung = u.get('rung', 'OFF')
+                        badges = u.get('badges') or []
+                        since = u.get('since')
+                        break
+
+            # Freshness gate: check if we're looking at a stale sample
+            if prior_start_ts is not None and since == prior_start_ts:
+                time.sleep(1)
+                continue
+
+            elapsed = time.time() - start
+            if rung in ('READY', 'BUSY'):
+                return ('ready', elapsed)
+            if rung == 'FAILED':
+                return ('failed', 'unit_failed', 'unit reached FAILED state')
+            if 'no_ready_marker' in badges:
+                return ('failed', 'no_ready_marker', 'active but no ready marker seen before TimeoutStartSec')
+
+            time.sleep(1)
+
+        return ('timeout',)
+
+    def start_switch(self, target: str, stops: List[str], confirm: str) -> Dict:
+        """Start a switch operation. Returns the switch record."""
+        with self.watcher_lock:
+            if not _slot_free(self.current):
+                if self.current and self.current.get('kind') == 'switch':
+                    raise ActuationError("operation_in_progress")
+                elif self.current and self.current.get('phase') == 'failed' and _rollback_offered(self.current):
+                    raise ActuationError("operation_in_progress")
+                raise ActuationError("operation_in_progress")
+
+            unit = self.units.get(target)
+            if not unit:
+                raise ActuationError(f"unit {target} not found")
+
+            # Create switch record
+            self.counter += 1
+            switch_id = f"sw-{int(time.time())}-{self.counter}"
+            now = time.time()
+
+            switch = {
+                "rollout_id": switch_id,
+                "kind": "switch",
+                "unit": target,
+                "target": target,
+                "stops": stops,
+                "stopped": [],
+                "target_started": False,
+                "phase": "preflight",
+                "detail": "checking prerequisites",
+                "failure": None,
+                "rollback": None,
+                "restored": False,
+                "started_at": now,
+                "updated_at": now,
+            }
+
+            self.current = switch
+            self.rollouts[switch_id] = switch
+
+            # Spawn worker thread
+            threading.Thread(
+                target=self._run_switch,
+                args=(switch_id, target, stops, confirm),
+                name="switch",
+                daemon=True
+            ).start()
+
+            return switch
+
+    def _run_switch(self, switch_id: str, target: str, stops: List[str], confirm: str):
+        """Worker thread for switch execution (§2.1 phase table)."""
+        switch = self.rollouts.get(switch_id)
+        if not switch:
+            return
+
+        try:
+            # Preflight: rerun switch_preflight and recompute confirm (§2.1 preflight row)
+            self._update_phase(switch_id, "preflight", "checking prerequisites")
+            pf = switch_preflight(target, stops, self.watcher, self.units, self.self_port)
+            if not pf["ok"]:
+                self._fail_rollout(switch_id, "preflight", "preflight",
+                                 detail="pre-flight checks failed", restored=True)
+                return
+
+            # Recompute confirm from the current snapshot and compare
+            with self.watcher_lock:
+                snapshot = self.watcher.snapshot()
+            fingerprint = fleet_fingerprint(snapshot)
+            computed_confirm = compute_switch_confirm(target, stops, fingerprint)
+            if computed_confirm != confirm:
+                self._fail_rollout(switch_id, "preflight", "preview_stale",
+                                 detail="fleet state changed since preview (a unit started or stopped); re-preview", restored=True)
+                return
+
+            # Stopping phase: sequential stops with confirmation
+            stop_count = len(stops)
+            for i, stop_unit in enumerate(stops):
+                detail = f"stopping {stop_unit} ({i+1}/{stop_count})"
+                self._update_phase(switch_id, "stopping", detail)
+
+                try:
+                    self._stop_unit(stop_unit, timeout=STOP_TIMEOUT_SEC)
+                except Exception as e:
+                    self._fail_rollout(switch_id, "stopping", "stop_error",
+                                     offer_rollback=bool(switch.get('stopped')), detail=f"stop failed: {e}")
+                    return
+
+                # Confirm OFF
+                try:
+                    if not self._confirm_off(stop_unit):
+                        self._fail_rollout(switch_id, "stopping", "stop_unconfirmed",
+                                         offer_rollback=bool(switch.get('stopped')),
+                                         detail=f"unit {stop_unit} did not confirm OFF within {CONFIRM_OFF_TIMEOUT_SEC}s")
+                        # Append notice if rung is FAILED
+                        with self.watcher_lock:
+                            snapshot = self.watcher.snapshot()
+                            for u in snapshot.get('units', []):
+                                if u['unit'] == stop_unit and u.get('rung') == 'FAILED':
+                                    switch = self.rollouts.get(switch_id)
+                                    if switch:
+                                        switch['detail'] += " (unit FAILED; considered stopped)"
+                        return
+                except Exception as e:
+                    self._fail_rollout(switch_id, "stopping", "stop_unconfirmed",
+                                     offer_rollback=bool(switch.get('stopped')),
+                                     detail=f"confirm timeout for {stop_unit}")
+                    return
+
+                # Record the stopped unit
+                with self.watcher_lock:
+                    switch = self.rollouts.get(switch_id)
+                    if switch:
+                        switch['stopped'].append(stop_unit)
+                        switch['updated_at'] = time.time()
+
+            # Starting phase
+            self._update_phase(switch_id, "starting", f"starting {target}")
+
+            # Capture prior_start_ts before starting
+            prior_start_ts = None
+            with self.watcher_lock:
+                snapshot = self.watcher.snapshot()
+                for u in snapshot.get('units', []):
+                    if u['unit'] == target:
+                        prior_start_ts = u.get('since')
+                        break
+
+            try:
+                self._start_unit(target)
+            except Exception as e:
+                self._fail_rollout(switch_id, "starting", "start_error",
+                                 offer_rollback=True, detail=f"start failed: {e}")
+                return
+
+            # Mark target as started BEFORE watching (per §2.1)
+            with self.watcher_lock:
+                switch = self.rollouts.get(switch_id)
+                if switch:
+                    switch['target_started'] = True
+                    switch['updated_at'] = time.time()
+
+            # Watching phase
+            self._update_phase(switch_id, "watching", f"watching {target}")
+            deadline = time.time() + WATCH_TIMEOUT_SEC
+            result = self._watch_to_ready(target, prior_start_ts, deadline)
+
+            if result[0] == 'ready':
+                elapsed = result[1]
+                self._update_phase(switch_id, "done", f"switched: {target} ready in {elapsed:.1f}s")
+                with self.watcher_lock:
+                    switch = self.rollouts.get(switch_id)
+                    if switch:
+                        switch['phase'] = 'done'
+                        switch['restored'] = False
+                        switch['updated_at'] = time.time()
+            elif result[0] == 'failed':
+                reason, detail = result[1], result[2]
+                self._fail_rollout(switch_id, "watching", reason, offer_rollback=True, detail=detail)
+            else:  # timeout
+                self._fail_rollout(switch_id, "watching", "watch_timeout",
+                                 offer_rollback=True, detail=f"watch timeout ({WATCH_TIMEOUT_SEC}s)")
+
+        except Exception as e:
+            self._fail_rollout(switch_id, "failed", "engine_error", detail=str(e))
+
+    def _confirm_off(self, unit_name: str) -> bool:
+        """Poll roster until unit's rung is not in ACTIVE_RUNGS, with fresh sensed_at.
+
+        Returns True if confirmed OFF within timeout, False otherwise.
+        """
+        start = time.time()
+        timeout = CONFIRM_OFF_TIMEOUT_SEC
+
+        while time.time() - start < timeout:
+            with self.watcher_lock:
+                snapshot = self.watcher.snapshot()
+                now = snapshot.get('now', time.time())
+                for u in snapshot.get('units', []):
+                    if u['unit'] == unit_name:
+                        rung = u.get('rung', 'OFF')
+                        sensed_at = u.get('sensed_at', 0)
+                        # Check if rung is OFF and sensed_at is fresh (after we stopped)
+                        if rung not in ACTIVE_RUNGS and sensed_at > start:
+                            return True
+                        # FAILED counts as confirmed (process dead)
+                        if rung == 'FAILED':
+                            return True
+                        break
+
+            time.sleep(1)
+
+        return False
+
+    def _run_restore(self, switch_id: str):
+        """Worker thread for restore after a failed switch (§2.1 restoring phase)."""
+        switch = self.rollouts.get(switch_id)
+        if not switch:
+            return
+
+        try:
+            target = switch.get('target')
+            stopped_units = switch.get('stopped', [])
+
+            # Stop target if active and non-fatal
+            if target:
+                self._update_phase(switch_id, "restoring", f"stopping {target}")
+                try:
+                    # Check if target is active
+                    with self.watcher_lock:
+                        snapshot = self.watcher.snapshot()
+                        target_active = False
+                        for u in snapshot.get('units', []):
+                            if u['unit'] == target and u.get('rung') in ACTIVE_RUNGS:
+                                target_active = True
+                                break
+
+                    if target_active:
+                        try:
+                            self._stop_unit(target)
+                        except Exception:
+                            pass  # Log but don't fail
+                except Exception:
+                    pass
+
+            # Restart stopped units in original order
+            for unit in stopped_units:
+                self._update_phase(switch_id, "restoring", f"starting {unit}")
+                try:
+                    self._start_unit(unit)
+                except Exception as e:
+                    self._update_phase(switch_id, "restore_failed", f"start failed for {unit}: {e}")
+                    with self.watcher_lock:
+                        switch = self.rollouts.get(switch_id)
+                        if switch:
+                            switch['phase'] = 'restore_failed'
+                            switch['failure'] = {'reason': 'restore_start_failed', 'detail': str(e)}
+                            manual_cmd = f"systemctl --user start {' '.join(stopped_units)}"
+                            switch['detail'] = f"restore failed; manual recovery: {manual_cmd}"
+                            switch['updated_at'] = time.time()
+                    return
+
+                # Watch each unit back to READY
+                prior_start_ts = None
+                deadline = time.time() + WATCH_TIMEOUT_SEC
+                result = self._watch_to_ready(unit, prior_start_ts, deadline)
+
+                if result[0] != 'ready':
+                    reason = result[1] if result[0] == 'failed' else 'watch_timeout'
+                    self._update_phase(switch_id, "restore_failed", f"restore watch failed for {unit}: {reason}")
+                    with self.watcher_lock:
+                        switch = self.rollouts.get(switch_id)
+                        if switch:
+                            switch['phase'] = 'restore_failed'
+                            switch['failure'] = {'reason': 'restore_watch_failed', 'detail': reason}
+                            manual_cmd = f"systemctl --user start {' '.join([u for u in stopped_units if u != unit])}"
+                            switch['detail'] = f"restore incomplete; manually start: {manual_cmd}"
+                            switch['updated_at'] = time.time()
+                    return
+
+            # Success: all units back to READY
+            self._update_phase(switch_id, "restored", f"restored: {len(stopped_units)} unit(s) back to READY")
+            with self.watcher_lock:
+                switch = self.rollouts.get(switch_id)
+                if switch:
+                    switch['phase'] = 'restored'
+                    switch['rollback'] = {'offered': False, 'phase': 'restored'}
+                    switch['updated_at'] = time.time()
+
+        except Exception as e:
+            self._update_phase(switch_id, "restore_failed", str(e))
+            with self.watcher_lock:
+                switch = self.rollouts.get(switch_id)
+                if switch:
+                    switch['phase'] = 'restore_failed'
+                    switch['updated_at'] = time.time()
+
+    def rollback(self, rollout_id: str):
+        """Start rollback/restore of a failed operation (rollout or switch).
+
+        Eligibility check AND the transition happen under `watcher_lock`:
+        check-and-set outside it let a double-click through twice.
         """
         with self.watcher_lock:
             rollout = self.rollouts.get(rollout_id)
-            if not rollout or not rollout.get('commit'):
+            if not rollout:
                 raise ActuationError("not_rollbackable")
+
+            kind = rollout.get('kind', 'rollout')
+
+            # Eligibility: rollouts require commit; switches only require a live offer
+            if kind == 'rollout':
+                if not rollout.get('commit'):
+                    raise ActuationError("not_rollbackable")
+            # switches have no commit requirement - just checked by offer
 
             if rollout.get('phase') != 'failed' or not _rollback_offered(rollout):
                 raise ActuationError("not_rollbackable")
 
             # Claim the offer inside the lock: the loser of a race (second click, or a
             # dismiss arriving concurrently) now sees phase != 'failed' / no offer.
-            rollout['phase'] = 'rolling_back'
-            rollout['rollback'] = {'offered': False, 'phase': 'rolling_back'}
+            if kind == 'switch':
+                rollout['phase'] = 'restoring'
+                rollout['rollback'] = {'offered': False, 'phase': 'restoring'}
+            else:
+                rollout['phase'] = 'rolling_back'
+                rollout['rollback'] = {'offered': False, 'phase': 'rolling_back'}
             rollout['updated_at'] = time.time()
 
-        # Spawn rollback worker
+            # Spawn appropriate worker
+            if kind == 'switch':
+                worker_target = self._run_restore
+            else:
+                worker_target = self._run_rollback
+
+        # Spawn worker (outside lock)
         threading.Thread(
-            target=self._run_rollback,
+            target=worker_target,
             args=(rollout_id,),
             daemon=True
         ).start()
@@ -4263,6 +4607,441 @@ class RolloutEngine:
             # a dismissed offer has to leave a record that says so.
             rollout['rollback'] = {'offered': False, 'dismissed': True}
             rollout['updated_at'] = time.time()
+
+
+# ===== SECTION E PART 3: SWITCH (lifecycle verbs only; no file writes, no git, no daemon-reload) =====
+
+def fleet_fingerprint(snapshot: Dict) -> Dict[str, str]:
+    """Compute a fingerprint of the fleet's lifecycle state (F3).
+
+    Returns {unit: ts_mono_str} for every non-retired selected unit.
+    ts_mono_str = the unit's ExecMainStartTimestampMonotonic as a string,
+    with None/''/'0' canonicalized to '0'.
+    """
+    result = {}
+    for u in snapshot.get('units', []):
+        if not u.get('retired'):
+            ts_mono = u.get('start_ts_mono') or '0'
+            result[u['unit']] = str(ts_mono)
+    return result
+
+
+def compute_switch_confirm(target: str, stops: List[str], fingerprint: Dict[str, str]) -> str:
+    """Compute the switch confirm hash (F3 canonicalization).
+
+    confirm = sha256(canonical_json({
+        "kind": "switch",
+        "target": name,
+        "stops": sorted(ticked names),
+        "fingerprint": {unit: ts_mono_str for every non-retired selected unit}
+    })).hexdigest()
+
+    Fingerprinting all units (not just target+stops) is deliberate: any unit
+    starting or stopping between preview and execute invalidates the memory
+    arithmetic and the runtime port picture.
+    """
+    obj = {
+        "kind": "switch",
+        "target": target,
+        "stops": sorted(stops),
+        "fingerprint": fingerprint
+    }
+    canonical_json = json.dumps(obj, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(canonical_json.encode()).hexdigest()
+
+
+def _estimate_start_bytes(unit_name: str, profile: Dict, mem_store) -> tuple:
+    """Estimate memory needed to start a unit (bytes, source_label).
+
+    Order: exact measured (unit, file_id, ctx) -> "measured"
+           newest measured (unit, file_id, any ctx) -> "measured at ctx <c>; target ctx unproven"
+           formula int(size*1.10 + 1.5 GiB) -> "formula"
+           9 GiB default -> "default"
+    """
+    model_path = profile.get('model_path')
+    ctx = profile.get('ctx')
+
+    # Try exact measurement first
+    if model_path:
+        try:
+            file_id = f"sz{os.stat(model_path).st_size}:mt{int(os.stat(model_path).st_mtime)}"
+            if mem_store:
+                mem = mem_store.lookup(unit_name, file_id, ctx)
+                if mem:
+                    return (mem['bytes'], "measured")
+        except Exception:
+            pass
+
+    # Fallback to formula
+    if model_path:
+        try:
+            size = os.path.getsize(model_path)
+            return (int(size * 1.10 + 1.5 * 1024**3), "formula")
+        except Exception:
+            pass
+
+    # Default fallback
+    return (int(9 * 1024**3), "default")
+
+
+def _freed_bytes(unit_name: str, unit_row: Dict, cgroup_cache: Dict) -> tuple:
+    """Estimate memory freed by stopping a unit (bytes, source_label).
+
+    Only a unit that is actually RESIDENT frees anything.
+    Order: cgroup memory.current -> last_peak -> measured row -> 0
+    """
+    rung = unit_row.get('rung')
+    if rung not in ACTIVE_RUNGS:
+        return (0, 'none (unit not active)')
+
+    # Check cgroup
+    cgroup = cgroup_cache.get(unit_name) or {}
+    current = cgroup.get('current')
+    if current:
+        return (current, 'cgroup memory.current')
+
+    last_peak = cgroup.get('last_peak')
+    if last_peak:
+        return (last_peak, 'cgroup memory.peak (last sample)')
+
+    # Check measured row
+    row_mem = unit_row.get('mem') or {}
+    if row_mem.get('source') == 'measured' and row_mem.get('bytes'):
+        return (row_mem['bytes'], 'measured peak row')
+
+    # Active but no sample yet
+    return (0, 'active, but no cgroup sample yet')
+
+
+def switch_preflight(target: str, stops: List[str], watcher: 'Watcher', units: Dict[str, 'UnitFile'],
+                    self_port: int, meminfo_reader=None) -> Dict:
+    """Run preflight checks for a switch operation (§3.2 five checks exactly).
+
+    Returns {
+        "ok": bool,
+        "checks": [...],
+        "target": {...},
+        "stop_candidates": [...],
+        "fit": {...},
+        "port": {...},
+        "suggested_stops": [...],
+        "notices": [...],
+        "confirm": "..." (only if all checks pass)
+    }
+    """
+    checks = []
+    notices = []
+
+    # One snapshot for everything (§3.3 one-snapshot rule)
+    snapshot = watcher.snapshot()
+    cgroup_cache = getattr(watcher, '_cgroup_cache', None) or {}
+    mem_store = getattr(watcher, 'mem_store', None)
+
+    # 1. RETIRED CHECK
+    target_unit = units.get(target)
+    if not target_unit:
+        return {
+            "ok": False,
+            "checks": [{"ok": False, "check": "retired",
+                       "detail": f"unit {target} not found"}],
+            "target": {},
+            "stop_candidates": [],
+            "fit": {},
+            "port": {},
+            "suggested_stops": [],
+            "notices": []
+        }
+
+    if target_unit.retired:
+        retired_detail = target_unit.retired_note or '[RETIRED]'
+        return {
+            "ok": False,
+            "checks": [{"ok": False, "check": "retired",
+                       "detail": f"unit is {retired_detail} — structurally excluded from every actuation path"}],
+            "target": {},
+            "stop_candidates": [],
+            "fit": {},
+            "port": {},
+            "suggested_stops": [],
+            "notices": []
+        }
+
+    # 2. TARGET RUNG CHECK (F9: must be OFF with per-rung details)
+    target_row = None
+    for u in snapshot.get('units', []):
+        if u['unit'] == target:
+            target_row = u
+            break
+
+    target_rung = target_row.get('rung', 'OFF') if target_row else 'OFF'
+    target_check_ok = (target_rung == 'OFF')
+    target_check_detail = None
+
+    if not target_check_ok:
+        if target_rung == 'STANDBY':
+            gate = (target_row or {}).get('gate', {})
+            target_check_detail = f"waiting for kernel {gate.get('kernel')} (running: {gate.get('running')})"
+        elif target_rung == 'RETIRED':
+            target_check_detail = "unit is retired"
+        elif target_rung in ACTIVE_RUNGS:
+            target_check_detail = "already active"
+        elif target_rung == 'FAILED':
+            target_check_detail = "unit is FAILED — clear the failure by hand first"
+        else:
+            target_check_detail = f"target rung is {target_rung}"
+
+        return {
+            "ok": False,
+            "checks": [{"ok": False, "check": "target", "detail": target_check_detail}],
+            "target": target_row or {},
+            "stop_candidates": [],
+            "fit": {},
+            "port": {},
+            "suggested_stops": [],
+            "notices": []
+        }
+
+    target_check = {"ok": True, "check": "target"}
+    checks.append(target_check)
+
+    # Build stop candidates list for checks and response
+    stop_candidates = []
+    for u in snapshot.get('units', []):
+        if u['unit'] != target and u.get('rung') in ACTIVE_RUNGS and not u.get('retired'):
+            stop_candidates.append(u)
+
+    # 3. STOPS CHECK
+    stops_check_ok = True
+    stop_offenders = []
+
+    for stop_unit in stops:
+        if stop_unit == target:
+            stop_offenders.append(f"{stop_unit} (cannot stop target)")
+        elif stop_unit not in units:
+            stop_offenders.append(f"{stop_unit} (not found)")
+        elif units[stop_unit].retired:
+            stop_offenders.append(f"{stop_unit} (retired)")
+        else:
+            # Check if in active candidates
+            found_active = False
+            for u in stop_candidates:
+                if u['unit'] == stop_unit:
+                    found_active = True
+                    break
+            if not found_active:
+                stop_offenders.append(f"{stop_unit} (not active)")
+
+    if stop_offenders:
+        stops_check_ok = False
+
+    stops_check = {
+        "ok": stops_check_ok,
+        "check": "stops",
+        "detail": f"ineligible stops: {', '.join(stop_offenders)}" if stop_offenders else ""
+    }
+    checks.append(stops_check)
+
+    if not stops_check_ok:
+        return {
+            "ok": False,
+            "checks": checks,
+            "target": target_row or {},
+            "stop_candidates": [
+                {
+                    "unit": u['unit'],
+                    "rung": u.get('rung', 'OFF'),
+                    "resident_bytes": _freed_bytes(u['unit'], u, cgroup_cache)[0],
+                    "resident_source": _freed_bytes(u['unit'], u, cgroup_cache)[1],
+                    "port": u.get('port'),
+                    "alias": u.get('alias', u['unit']),
+                    "ticked": u['unit'] in stops
+                }
+                for u in stop_candidates
+            ],
+            "fit": {},
+            "port": {},
+            "suggested_stops": [],
+            "notices": notices
+        }
+
+    # 4. MEMORY CHECK
+    target_profile = {}
+    if target_unit.exec_start:
+        target_profile = extract_param_profile(target_unit.exec_start.engine_argv)
+
+    estimate_bytes, estimate_source = _estimate_start_bytes(target, target_profile, mem_store)
+
+    # Read MemAvailable
+    mem_available = None
+    if meminfo_reader:
+        info = meminfo_reader()
+        mem_available = info.get('MemAvailable', 0) * 1024
+    else:
+        try:
+            with open('/proc/meminfo', 'r') as f:
+                for line in f:
+                    if line.startswith('MemAvailable:'):
+                        mem_available = int(line.split()[1]) * 1024
+                        break
+        except Exception:
+            pass
+
+    if mem_available is None:
+        mem_available = 0
+
+    # Compute freed bytes for ticked stops (multi-stop with per-unit breakdown)
+    freed_by = []
+    freed_bytes = 0
+    for stop_unit in stops:
+        stop_row = None
+        for u in snapshot.get('units', []):
+            if u['unit'] == stop_unit:
+                stop_row = u
+                break
+
+        if stop_row:
+            bytes_val, source_label = _freed_bytes(stop_unit, stop_row, cgroup_cache)
+            freed_bytes += bytes_val
+            freed_by.append({"unit": stop_unit, "bytes": bytes_val, "source": source_label})
+
+    budget = mem_available + freed_bytes
+    headroom = HEADROOM_BYTES
+    memory_ok = (estimate_bytes + headroom <= budget)
+
+    memory_check = {
+        "ok": memory_ok,
+        "check": "memory",
+        "estimate_bytes": estimate_bytes,
+        "estimate_source": estimate_source,
+        "mem_available_bytes": mem_available,
+        "freed_bytes": freed_bytes,
+        "freed_by": freed_by,
+        "headroom_bytes": headroom,
+        "budget_bytes": budget
+    }
+
+    if not memory_ok:
+        memory_check['detail'] = (
+            f"estimated {estimate_bytes/(1024**3):.1f} GiB ({estimate_source}), "
+            f"+ {headroom/(1024**3):.1f} GiB headroom exceeds budget {budget/(1024**3):.1f} GiB "
+            f"(MemAvailable {mem_available/(1024**3):.1f} GiB + "
+            f"{freed_bytes/(1024**3):.1f} GiB freed by stopping {len(stops)} unit(s))"
+        )
+
+    checks.append(memory_check)
+
+    # 5. PORT CHECK (F4 runtime rule)
+    target_port = (target_row or {}).get('port', 8080)
+    port_blockers = []
+    port_notices = []
+
+    for u in snapshot.get('units', []):
+        if u['unit'] != target and u.get('port') == target_port:
+            u_rung = u.get('rung', 'OFF')
+            if u_rung in ACTIVE_RUNGS and u['unit'] not in stops:
+                # Blocker: active and not ticked to stop
+                port_blockers.append({
+                    "unit": u['unit'],
+                    "rung": u_rung,
+                    "detail": f"port {target_port} will still be bound after the plan: {u['unit']} ({u_rung}, not ticked)"
+                })
+            else:
+                # Notice: ticked/STANDBY/RETIRED claimant
+                port_notices.append({
+                    "unit": u['unit'],
+                    "rung": u_rung,
+                    "detail": f"port {target_port} also declared by {u['unit']} ({u_rung})"
+                })
+
+    # Self-port check
+    if target_port == self_port:
+        port_blockers.append({
+            "unit": "roundhouse",
+            "rung": "N/A",
+            "detail": f"port {target_port} is in use by roundhouse itself"
+        })
+
+    port_check = {
+        "ok": len(port_blockers) == 0,
+        "check": "port",
+        "port": target_port,
+        "blockers": port_blockers,
+        "notices": port_notices
+    }
+
+    checks.append(port_check)
+
+    # Suggested stops (F7)
+    suggested_stops = []
+    if not memory_ok:
+        suggested_stops = suggest_stops(target, stops, stop_candidates,
+                                       estimate_bytes, budget, freed_by,
+                                       cgroup_cache, mem_store)
+
+    # Compute confirm hash only if all checks pass
+    confirm = None
+    ok = all(c["ok"] for c in checks)
+    if ok:
+        fingerprint = fleet_fingerprint(snapshot)
+        confirm = compute_switch_confirm(target, stops, fingerprint)
+
+    return {
+        "ok": ok,
+        "checks": checks,
+        "target": target_row or {},
+        "stop_candidates": [
+            {
+                "unit": u['unit'],
+                "rung": u.get('rung', 'OFF'),
+                "resident_bytes": _freed_bytes(u['unit'], u, cgroup_cache)[0],
+                "resident_source": _freed_bytes(u['unit'], u, cgroup_cache)[1],
+                "port": u.get('port'),
+                "alias": u.get('alias', u['unit']),
+                "ticked": u['unit'] in stops
+            }
+            for u in stop_candidates
+        ],
+        "fit": memory_check,
+        "port": port_check,
+        "suggested_stops": suggested_stops,
+        "notices": notices,
+        "confirm": confirm
+    }
+
+
+def suggest_stops(target: str, stops: List[str], stop_candidates: List[Dict],
+                 estimate: int, budget: int, freed_by: List[Dict],
+                 cgroup_cache: Dict, mem_store) -> List[str]:
+    """Compute suggested stops per F7 greedy-by-residency rule.
+
+    Only when fit fails with submitted ticks: walk active, un-ticked, non-target
+    candidates in order (resident_bytes descending, name ascending tie-break),
+    hypothetically adding each to freed sum until estimate + HEADROOM <= budget
+    or candidates exhausted. Return added names in walk order; empty list if fit passes.
+    """
+    if estimate + HEADROOM_BYTES <= budget:
+        return []
+
+    # Build candidate list: active, un-ticked, not target
+    candidates_for_suggestion = []
+    for u in stop_candidates:
+        if u['unit'] not in stops and u['unit'] != target:
+            resident_bytes, _ = _freed_bytes(u['unit'], u, cgroup_cache)
+            candidates_for_suggestion.append((u['unit'], resident_bytes))
+
+    # Sort by resident_bytes descending, name ascending (tie-break)
+    candidates_for_suggestion.sort(key=lambda x: (-x[1], x[0]))
+
+    # Greedily add until fit or exhaustion
+    suggested = []
+    current_budget = budget
+    for unit_name, resident_bytes in candidates_for_suggestion:
+        if estimate + HEADROOM_BYTES <= current_budget:
+            break
+        suggested.append(unit_name)
+        current_budget += resident_bytes
+
+    return suggested
 
 
 # ===== SECTION D: MAIN / CLI =====

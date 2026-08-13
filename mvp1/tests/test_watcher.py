@@ -512,12 +512,46 @@ class TestWatcher(unittest.TestCase):
         if snap['units']:
             unit_dict = snap['units'][0]
             required_unit_keys = {
-                'unit', 'description', 'retired', 'rung', 'roster', 'since',
+                'unit', 'description', 'retired', 'rung', 'roster', 'since', 'start_ts_mono',
                 'detail', 'badges', 'stale', 'sensed_at', 'enabled', 'active_state',
                 'sub_state', 'n_restarts', 'port', 'port_source', 'alias', 'gate',
                 'model_file', 'quant_hint', 'ctx', 'mem', 'port_conflict'
             }
             self.assertEqual(set(unit_dict.keys()), required_unit_keys)
+
+    def test_start_ts_mono_stability(self):
+        """start_ts_mono is '0' for OFF units and stable across snapshots."""
+        unit = self._load_unit("qwen3.6-coding.service")
+        units = {unit.name: unit}
+
+        watcher = roundhouse.Watcher(units, "6.12.0", None)
+        # Unit starts OFF (not in LOADING/READY/BUSY)
+        watcher._state[unit.name]['active_state'] = 'inactive'
+
+        snap1 = watcher.snapshot()
+        snap2 = watcher.snapshot()
+
+        # Find the unit in both snapshots
+        unit1 = None
+        unit2 = None
+        for u in snap1.get('units', []):
+            if u['unit'] == unit.name:
+                unit1 = u
+                break
+        for u in snap2.get('units', []):
+            if u['unit'] == unit.name:
+                unit2 = u
+                break
+
+        # OFF unit should have start_ts_mono of '0'
+        self.assertEqual(unit1['start_ts_mono'], '0')
+        self.assertEqual(unit2['start_ts_mono'], '0')
+
+        # start_ts_mono should be stable (unlike since which uses now())
+        self.assertEqual(unit1['start_ts_mono'], unit2['start_ts_mono'])
+
+        # But since changes each time (now() is called)
+        self.assertNotEqual(unit1['since'], unit2['since'])
 
     def test_long_running_badge(self):
         """BUSY for >30 min should get long_running badge."""
