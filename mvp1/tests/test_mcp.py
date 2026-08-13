@@ -13,9 +13,11 @@ import shutil
 import http.server
 import http.client
 import socket
+import subprocess
 import threading
 import time
 import copy
+import queue as _queue
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 from io import StringIO
@@ -28,6 +30,109 @@ import roundhouse
 
 # Constants
 _GIB = 1024 * 1024 * 1024
+_MCP_PATH = str(Path(__file__).resolve().parent.parent / 'roundhouse_mcp.py')
+
+
+class McpPipeClient:
+    """The MCP server as a REAL SUBPROCESS over real pipes (SPEC Risk #1 guard).
+
+    Every read has a deadline: a framing mistake (Content-Length headers, a
+    pretty-printed envelope, a stray print to stdout) deadlocks the pipe, and the
+    deadline is what turns that silence into a red instead of a hung suite.
+    """
+
+    def __init__(self, url, token=None, client_name='pipe-client'):
+        env = dict(os.environ)
+        env.pop('ROUNDHOUSE_TOKEN', None)
+        if token is not None:
+            env['ROUNDHOUSE_TOKEN'] = token
+        # HOME is redirected so a stray ~/.config/roundhouse/token on the build box
+        # can never silently satisfy a test that means to run token-less.
+        env['HOME'] = tempfile.mkdtemp(prefix='mcp-pipe-home-')
+        self._home = env['HOME']
+        self.proc = subprocess.Popen(
+            [sys.executable, _MCP_PATH, '--url', url],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            text=True, bufsize=1, env=env)
+        self._lines = _queue.Queue()
+        self._stderr = []
+        self._reader = threading.Thread(target=self._pump, daemon=True)
+        self._reader.start()
+        self._errreader = threading.Thread(target=self._pump_err, daemon=True)
+        self._errreader.start()
+        self.client_name = client_name
+
+    def _pump(self):
+        for line in self.proc.stdout:
+            self._lines.put(line)
+        self._lines.put(None)
+
+    def _pump_err(self):
+        for line in self.proc.stderr:
+            self._stderr.append(line)
+
+    def send(self, msg):
+        self.proc.stdin.write(json.dumps(msg, separators=(',', ':')) + '\n')
+        self.proc.stdin.flush()
+
+    def recv(self, timeout=20.0):
+        try:
+            line = self._lines.get(timeout=timeout)
+        except _queue.Empty:
+            raise AssertionError(
+                'no JSON-RPC line from the MCP subprocess within %.0fs '
+                '(framing deadlock?); stderr so far: %r' % (timeout, self.drain_stderr()))
+        if line is None:
+            raise AssertionError('MCP subprocess closed stdout; stderr: %r' % self.drain_stderr())
+        assert line.endswith('\n'), 'response was not newline-terminated'
+        assert '\r' not in line, 'response carried a CR'
+        return json.loads(line)
+
+    def request(self, method, params=None, msg_id=1, timeout=20.0):
+        self.send({'jsonrpc': '2.0', 'id': msg_id, 'method': method, 'params': params or {}})
+        return self.recv(timeout=timeout)
+
+    def initialize(self):
+        resp = self.request('initialize', {
+            'protocolVersion': '2025-06-18',
+            'capabilities': {},
+            'clientInfo': {'name': self.client_name, 'version': '1.0'},
+        }, msg_id=0)
+        self.send({'jsonrpc': '2.0', 'method': 'notifications/initialized'})
+        return resp['result']
+
+    def call_tool(self, name, arguments=None, msg_id=1, timeout=20.0):
+        """Returns (parsed tool-result JSON, isError)."""
+        resp = self.request('tools/call',
+                            {'name': name, 'arguments': arguments or {}},
+                            msg_id=msg_id, timeout=timeout)
+        if 'error' in resp:
+            raise AssertionError('tools/call returned a JSON-RPC error: %r' % resp['error'])
+        result = resp['result']
+        return json.loads(result['content'][0]['text']), result['isError']
+
+    def drain_stderr(self):
+        return ''.join(self._stderr)
+
+    def close(self):
+        for stream in (self.proc.stdin,):
+            try:
+                stream.close()
+            except Exception:
+                pass
+        try:
+            self.proc.wait(timeout=10)
+        except Exception:
+            self.proc.kill()
+            self.proc.wait(timeout=5)
+        self._reader.join(timeout=5)
+        self._errreader.join(timeout=5)
+        for stream in (self.proc.stdout, self.proc.stderr):
+            try:
+                stream.close()
+            except Exception:
+                pass
+        shutil.rmtree(self._home, ignore_errors=True)
 
 
 class TestFraming(unittest.TestCase):
@@ -53,14 +158,31 @@ class TestFraming(unittest.TestCase):
         self.assertIsNone(response)
 
     def test_batch_array_returns_minus_32600(self):
-        """Batch array (not in spec, not supported) -> -32600."""
-        # Note: handle_message receives already-parsed JSON, so batch would be a list
-        # But it still checks isinstance(msg, list) and returns error with id:null
-        # The actual batch detection happens at the message level
-        msg = {'jsonrpc': '2.0', 'id': 1, 'method': 'test'}
-        # To test batch behavior, we'd need to test at the input parsing level
-        # For now, we note that a list would be caught
-        self.assertTrue(True)  # Placeholder
+        """I11: a top-level JSON array (batch) -> -32600 'batch not supported', id null."""
+        msg = [{'jsonrpc': '2.0', 'id': 1, 'method': 'ping'}]
+        response = roundhouse_mcp.handle_message(msg, {})
+        self.assertEqual(response['error']['code'], -32600)
+        self.assertEqual(response['error']['message'], 'batch not supported')
+        self.assertIsNone(response['id'])
+
+    def test_null_params_tolerated(self):
+        """I11/§3: params absent or explicitly null must not become -32603."""
+        for params in (None, {}):
+            msg = {'jsonrpc': '2.0', 'id': 4, 'method': 'initialize'}
+            if params is not None:
+                msg['params'] = params
+            else:
+                msg['params'] = None
+            response = roundhouse_mcp.handle_message(msg, {'url': 'http://127.0.0.1:1',
+                                                           'client_name': 'unknown'})
+            self.assertNotIn('error', response, f'params={params!r} produced an error')
+            self.assertEqual(response['result']['serverInfo']['name'], 'roundhouse-mcp')
+
+        # tools/list with params: null likewise
+        msg = {'jsonrpc': '2.0', 'id': 5, 'method': 'tools/list', 'params': None}
+        response = roundhouse_mcp.handle_message(msg, {'url': 'http://127.0.0.1:1',
+                                                       'client_name': 'unknown'})
+        self.assertEqual(len(response['result']['tools']), 16)
 
     def test_ping_returns_empty_result(self):
         """ping method -> empty result dict."""
@@ -356,6 +478,104 @@ class TestShaping(unittest.TestCase):
         result, is_error = roundhouse_mcp.shape_result(status, payload)
         self.assertEqual(result['raw'], '404 Not Found')
 
+    def test_shape_result_injection_wins_on_key_collision(self):
+        """I2: the injected http_status wins over a body key of the same name."""
+        result, _is_error = roundhouse_mcp.shape_result(200, {'http_status': 'from-body', 'k': 1})
+        self.assertEqual(result['http_status'], 200)
+
+    def _call_with_canned_http(self, tool, arguments, status, payload):
+        """Drive tools/call through handle_message with call_roundhouse canned."""
+        calls = []
+
+        def fake_call(method, path, body=None, token=None, requester=None):
+            calls.append((method, path, body, token, requester))
+            return (status, payload)
+
+        os.environ['ROUNDHOUSE_TOKEN'] = 'canned-token'
+        try:
+            with patch.object(roundhouse_mcp, 'call_roundhouse', fake_call):
+                response = roundhouse_mcp.handle_message(
+                    {'jsonrpc': '2.0', 'id': 1, 'method': 'tools/call',
+                     'params': {'name': tool, 'arguments': arguments}},
+                    {'url': 'http://127.0.0.1:9', 'client_name': 'unit-test'})
+        finally:
+            del os.environ['ROUNDHOUSE_TOKEN']
+        text = response['result']['content'][0]['text']
+        return json.loads(text), response['result']['isError'], calls
+
+    def test_tools_call_injection_wins_on_key_collision(self):
+        """I2 on the LIVE path: tools/call must shape through the same rule as shape_result."""
+        result, is_error, _calls = self._call_with_canned_http(
+            'port_board', {}, 200, {'http_status': 'from-body', 'ports': []})
+        self.assertEqual(result['http_status'], 200)
+        self.assertFalse(is_error)
+
+    def test_tools_call_empty_text_body_still_carries_raw(self):
+        """I2: a non-JSON body becomes {'http_status': N, 'raw': ...} even when empty."""
+        result, is_error, _calls = self._call_with_canned_http(
+            'port_board', {}, 404, '')
+        self.assertEqual(result, {'http_status': 404, 'raw': ''})
+        self.assertFalse(is_error)
+
+    def test_fleet_status_surfaces_snapshot_rollout_as_operation(self):
+        """I5: `operation` is the snapshot's `rollout` value verbatim (not a key named
+        `operation`, which take_snapshot never emits)."""
+        record = {'rollout_id': 'sw-1-1', 'kind': 'switch', 'phase': 'stopping',
+                  'unit': 'a.service', 'detail': 'stopping b.service (1/1)'}
+        snapshot = {
+            'host': 'h', 'kernel': '6.1', 'now': 1.0, 'mode': 'actuate',
+            'mem': {}, 'sources': {}, 'self_port': 8090, 'self_unit': {},
+            'units': [], 'rollout': record,
+        }
+        result, _is_error, _calls = self._call_with_canned_http(
+            'fleet_status', {}, 200, snapshot)
+        self.assertEqual(result['operation'], record,
+                         'fleet_status dropped the running operation')
+        self.assertEqual(result['n_units'], 0)
+        self.assertNotIn('rollout', result)
+
+    def test_one_http_call_per_tool_call_even_on_409(self):
+        """Risk #3, the stub-count leg: a 409 `preview_stale` is answered ONCE. No
+        auto-re-preview, no retry — the wrapper has no state slot to loop with."""
+        result, is_error, calls = self._call_with_canned_http(
+            'switch_execute', {'target': 'a.service', 'confirm': 'stale'},
+            409, {'error': 'preview_stale', 'detail': 'fleet state changed'})
+        self.assertEqual(len(calls), 1, f'{len(calls)} HTTP calls for one tools/call')
+        self.assertEqual(calls[0][0], 'POST')
+        self.assertEqual(calls[0][1], '/api/switch')
+        self.assertFalse(is_error)
+        self.assertEqual(result['error'], 'preview_stale')
+
+    def test_confirm_is_passed_through_verbatim(self):
+        """I4: the wrapper is confirm-opaque — it forwards the string, never derives it."""
+        _result, _is_error, calls = self._call_with_canned_http(
+            'switch_execute',
+            {'target': 'a.service', 'stops': ['b.service'], 'confirm': 'CONFIRM-FROM-PREVIEW'},
+            202, {'rollout_id': 'sw-1'})
+        body = calls[0][2]
+        self.assertEqual(body, {'target': 'a.service', 'stops': ['b.service'],
+                                'confirm': 'CONFIRM-FROM-PREVIEW'})
+
+    def test_fleet_status_shaper_does_not_eat_a_transport_failure(self):
+        """I8 beats I5: an unreachable Roundhouse must still answer
+        {error, url, detail}. Running the I5 keep-list over that dict dropped all
+        three keys and handed the agent a cheerful empty fleet instead."""
+        result, is_error, _calls = self._call_with_canned_http(
+            'fleet_status', {}, None, '[Errno 111] Connection refused')
+        self.assertTrue(is_error)
+        self.assertEqual(result['error'], 'roundhouse_unreachable')
+        self.assertEqual(result['url'], 'http://127.0.0.1:9')
+        self.assertIn('refused', result['detail'])
+        self.assertNotIn('n_units', result)
+
+    def test_fleet_status_shaper_does_not_eat_an_error_body(self):
+        """The keep-list is for the /api/units SNAPSHOT. A 5xx (or any refusal) body
+        must pass through whole — shaping it would drop `error` and `detail`."""
+        result, is_error, _calls = self._call_with_canned_http(
+            'fleet_status', {}, 500, {'error': 'boom', 'detail': 'watcher died'})
+        self.assertTrue(is_error)
+        self.assertEqual(result, {'http_status': 500, 'error': 'boom', 'detail': 'watcher died'})
+
     def test_shape_fleet_status_keep_list(self):
         """shape_fleet_status keeps only specified fields."""
         snapshot = {
@@ -383,7 +603,8 @@ class TestShaping(unittest.TestCase):
                     'port_conflict': None
                 }
             ],
-            'operation': None,
+            # take_snapshot emits the operation record under the key `rollout` (I5).
+            'rollout': None,
         }
         result = roundhouse_mcp.shape_fleet_status(snapshot)
         # Check kept fields
@@ -421,11 +642,115 @@ class TestShaping(unittest.TestCase):
                     'port_conflict': {'port': 8080, 'claimants': ['b.service']}
                 }
             ],
-            'operation': None,
+            # take_snapshot emits the operation record under the key `rollout` (I5).
+            'rollout': None,
         }
         result = roundhouse_mcp.shape_fleet_status(snapshot)
         self.assertIn('port_conflict', result['units'][0])
         self.assertEqual(result['units'][0]['port_conflict']['claimants'], ['b.service'])
+
+
+S = {'type': 'string'}
+_EMPTY_OBJ = {'type': 'object', 'properties': {}, 'additionalProperties': False}
+_EDITS = {'type': 'object', 'additionalProperties': S, 'minProperties': 1}
+
+# MVP6-SPEC §4 transcribed as data: name -> (method, path, action, body_args,
+# send_requester, has_shaper, schema). Any drift between the registry and the frozen
+# catalog is a red here — this is the §4/§5 audit as a mechanical check, not a reading.
+FROZEN_CATALOG = {
+    'fleet_status': ('GET', '/api/units', False, (), False, True, _EMPTY_OBJ),
+    'unit_detail': ('GET', '/api/units/{unit}', False, (), False, False,
+                    {'type': 'object', 'properties': {'unit': S},
+                     'required': ['unit'], 'additionalProperties': False}),
+    'port_board': ('GET', '/api/ports', False, (), False, False, _EMPTY_OBJ),
+    'deployments': ('GET', '/api/deployments', False, (), False, False, _EMPTY_OBJ),
+    'routing_config': ('GET', '/api/routing-config.json', False, (), False, False, _EMPTY_OBJ),
+    'operation_status': ('GET', '/api/rollouts/{rollout_id}', False, (), False, False,
+                         {'type': 'object', 'properties': {'rollout_id': S},
+                          'required': ['rollout_id'], 'additionalProperties': False}),
+    'warm_state': ('GET', '/api/warm', False, (), False, False, _EMPTY_OBJ),
+    'switch_preview': ('POST', '/api/switch/preview', True, ('target', 'stops'), False, False,
+                       {'type': 'object',
+                        'properties': {'target': S, 'stops': {'type': 'array', 'items': S}},
+                        'required': ['target'], 'additionalProperties': False}),
+    'switch_execute': ('POST', '/api/switch', True, ('target', 'stops', 'confirm'), False, False,
+                       {'type': 'object',
+                        'properties': {'target': S, 'stops': {'type': 'array', 'items': S},
+                                       'confirm': S},
+                        'required': ['target', 'confirm'], 'additionalProperties': False}),
+    'edit_preview': ('POST', '/api/units/{unit}/edit', True, ('edits',), False, False,
+                     {'type': 'object', 'properties': {'unit': S, 'edits': _EDITS},
+                      'required': ['unit', 'edits'], 'additionalProperties': False}),
+    'edit_rollout': ('POST', '/api/units/{unit}/rollout', True, ('edits', 'confirm'), False, False,
+                     {'type': 'object',
+                      'properties': {'unit': S, 'edits': _EDITS, 'confirm': S},
+                      'required': ['unit', 'edits', 'confirm'], 'additionalProperties': False}),
+    'set_boot': ('POST', '/api/units/{unit}/enablement', True, ('enabled',), False, False,
+                 {'type': 'object',
+                  'properties': {'unit': S, 'enabled': {'type': 'boolean'}},
+                  'required': ['unit', 'enabled'], 'additionalProperties': False}),
+    'warm': ('POST', '/api/warm', True, ('logical', 'unit'), True, False,
+             {'type': 'object',
+              'properties': {'logical': S, 'unit': S, 'requester': S},
+              'additionalProperties': False,
+              'oneOf': [{'required': ['logical']}, {'required': ['unit']}]}),
+    'warm_cancel': ('POST', '/api/warm/cancel', True, (), False, False, _EMPTY_OBJ),
+    'operation_rollback': ('POST', '/api/rollouts/{rollout_id}/rollback', True, (), False, False,
+                           {'type': 'object', 'properties': {'rollout_id': S},
+                            'required': ['rollout_id'], 'additionalProperties': False}),
+    'operation_dismiss': ('POST', '/api/rollouts/{rollout_id}/dismiss', True, (), False, False,
+                          {'type': 'object', 'properties': {'rollout_id': S},
+                           'required': ['rollout_id'], 'additionalProperties': False}),
+}
+
+
+class TestFrozenCatalog(unittest.TestCase):
+    """MVP6-SPEC §4/§5 audit: the registry IS the frozen catalog, row for row."""
+
+    def test_catalog_names_and_order(self):
+        self.assertEqual(list(roundhouse_mcp.TOOLS.keys()), list(FROZEN_CATALOG.keys()))
+
+    def test_every_row_matches_the_frozen_table(self):
+        for name, (method, path, action, body_args,
+                   send_requester, has_shaper, schema) in FROZEN_CATALOG.items():
+            with self.subTest(tool=name):
+                row = roundhouse_mcp.TOOLS[name]
+                self.assertEqual(row['method'], method)
+                self.assertEqual(row['path'], path)
+                self.assertEqual(row['action'], action)
+                self.assertEqual(tuple(row['body_args']), body_args)
+                self.assertEqual(row['send_requester'], send_requester)
+                self.assertEqual(row['shaper'] is not None, has_shaper)
+                self.assertEqual(row['schema'], schema)
+
+    def test_body_args_are_declared_properties(self):
+        """A body_arg the schema does not declare can never be sent (dead wiring)."""
+        for name, row in roundhouse_mcp.TOOLS.items():
+            with self.subTest(tool=name):
+                props = set(row['schema'].get('properties', {}))
+                self.assertTrue(set(row['body_args']).issubset(props))
+
+    def test_unit_and_rollout_id_ride_the_path_never_the_body(self):
+        """§4: `unit` rides the path, never the body; same for rollout_id."""
+        for name, row in roundhouse_mcp.TOOLS.items():
+            with self.subTest(tool=name):
+                for key in ('unit', 'rollout_id'):
+                    if '{%s}' % key in row['path']:
+                        self.assertNotIn(key, row['body_args'])
+        # `warm` is the one tool where `unit` is a BODY arg (there is no {unit} in its path)
+        self.assertIn('unit', roundhouse_mcp.TOOLS['warm']['body_args'])
+        self.assertNotIn('{unit}', roundhouse_mcp.TOOLS['warm']['path'])
+
+    def test_requester_is_never_a_body_arg(self):
+        """recon 4: X-Roundhouse-Requester rides the header on /api/warm only."""
+        for name, row in roundhouse_mcp.TOOLS.items():
+            self.assertNotIn('requester', row['body_args'], name)
+
+    def test_no_action_tool_is_a_read_route(self):
+        """§5: GET rows carry no token (all GET routes are unauthenticated by design)."""
+        for name, row in roundhouse_mcp.TOOLS.items():
+            with self.subTest(tool=name):
+                self.assertEqual(row['action'], row['method'] == 'POST')
 
 
 class TestZeroWriteGuard(unittest.TestCase):
@@ -495,36 +820,51 @@ class TestZeroWriteGuard(unittest.TestCase):
                 self.assertIn(mode_arg, {'r'}, f"open() mode must be 'r', got {mode_arg}")
 
     def test_http_connection_only_in_call_roundhouse(self):
-        """HTTPConnection constructor only in call_roundhouse function."""
+        """I9 leg (e): EXACTLY ONE HTTPConnection construction site, and it is inside
+        `call_roundhouse`.
+
+        The previous version of this guard collected the call nodes, computed
+        `is_inside`, and then asserted nothing at all — a stray HTTPConnection seeded
+        anywhere in the file passed it silently. Every branch below ends in an assert.
+        """
         with open(Path(__file__).resolve().parent.parent / 'roundhouse_mcp.py', 'r') as f:
             tree = ast.parse(f.read())
 
-        http_calls = []
-        for node in ast.walk(tree):
-            if isinstance(node, ast.Call):
-                if isinstance(node.func, ast.Attribute):
-                    if (isinstance(node.func.value, ast.Name) and
-                        node.func.value.id == 'http' and
-                        node.func.attr == 'client'):
-                        http_calls.append(node)
-                    elif isinstance(node.func.value, ast.Attribute):
-                        if (isinstance(node.func.value.value, ast.Name) and
-                            node.func.value.value.id == 'http' and
-                            node.func.value.attr == 'client' and
-                            node.func.attr == 'HTTPConnection'):
-                            http_calls.append(node)
+        def is_http_connection(func):
+            # http.client.HTTPConnection(...)  /  client.HTTPConnection(...)
+            if isinstance(func, ast.Attribute) and func.attr in (
+                    'HTTPConnection', 'HTTPSConnection'):
+                return True
+            # a bare HTTPConnection(...) after `from http.client import HTTPConnection`
+            if isinstance(func, ast.Name) and func.id in (
+                    'HTTPConnection', 'HTTPSConnection'):
+                return True
+            return False
 
-        # Verify all HTTPConnection calls are in call_roundhouse
-        for call in http_calls:
-            # Find enclosing function
-            for node in ast.walk(tree):
-                if isinstance(node, ast.FunctionDef) and node.name == 'call_roundhouse':
-                    # Verify the call is inside this function
-                    is_inside = False
-                    for child in ast.walk(node):
-                        if child is call:
-                            is_inside = True
-                    # This is a simplified check; in practice we'd need proper scope analysis
+        # Map every node to the name of its enclosing top-level function ('<module>'
+        # for anything outside one), so the check is a lookup, not a nested walk.
+        enclosing = {}
+        for node in ast.walk(tree):
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                for child in ast.walk(node):
+                    enclosing.setdefault(child, node.name)
+
+        sites = [n for n in ast.walk(tree)
+                 if isinstance(n, ast.Call) and is_http_connection(n.func)]
+        where = sorted(enclosing.get(n, '<module>') for n in sites)
+
+        self.assertEqual(len(sites), 1,
+                         f'expected exactly one HTTPConnection site, found {len(sites)} '
+                         f'in {where}')
+        self.assertEqual(where, ['call_roundhouse'],
+                         f'HTTPConnection constructed outside call_roundhouse: {where}')
+
+        # ...and its host/port derive from the parsed --url, not from a literal.
+        site = sites[0]
+        self.assertTrue(site.args, 'HTTPConnection called with no host argument')
+        self.assertIsInstance(site.args[0], ast.Name,
+                              'HTTPConnection host must come from a parsed variable')
+        self.assertEqual(site.args[0].id, 'host')
 
 
 class TestStdlibImports(unittest.TestCase):
@@ -588,6 +928,66 @@ class TestTokenSource(unittest.TestCase):
                 mock_expand.return_value = '/nonexistent/path'
                 token = roundhouse_mcp.resolve_token()
                 self.assertIsNone(token)
+
+    def test_no_token_action_refuses_before_any_http_request(self):
+        """§7.8 / §3 handling order: step 3 (no token) fires BEFORE step 4 (HTTP).
+
+        This is also the live-row gotcha: against a read-only Roundhouse a TOKEN-LESS
+        registration answers `no_token`, never `read_only_mode` — the 403 lives on the
+        far side of an HTTP call that never happens. Both are structured refusals with
+        isError: false; docs/MCP.md must not promise the 403 without a token.
+        """
+        calls = []
+
+        def must_not_be_called(*a, **k):
+            calls.append(a)
+            raise AssertionError('an HTTP request was made without a token')
+
+        with patch.dict(os.environ, {}, clear=True), \
+             patch.object(roundhouse_mcp, 'call_roundhouse', must_not_be_called), \
+             patch.object(roundhouse_mcp.os.path, 'expanduser',
+                          lambda p: '/nonexistent/roundhouse/token'):
+            response = roundhouse_mcp.handle_message(
+                {'jsonrpc': '2.0', 'id': 1, 'method': 'tools/call',
+                 'params': {'name': 'set_boot',
+                            'arguments': {'unit': 'a.service', 'enabled': True}}},
+                {'url': 'http://127.0.0.1:8090', 'client_name': 'x'})
+        result = json.loads(response['result']['content'][0]['text'])
+        self.assertEqual(calls, [])
+        self.assertFalse(response['result']['isError'])
+        self.assertEqual(result['error'], 'no_token')
+        self.assertIsNone(result['http_status'])
+        self.assertIn('ROUNDHOUSE_TOKEN', result['hint'])
+
+    def test_read_tools_need_no_token(self):
+        """recon 7: every GET route is unauthenticated, so a token-less registration is
+        a fully functional read-only client (the live acceptance row's whole premise)."""
+        seen = []
+
+        def fake_call(method, path, body=None, token=None, requester=None):
+            seen.append((path, token))
+            return (200, {'units': []})
+
+        with patch.dict(os.environ, {}, clear=True), \
+             patch.object(roundhouse_mcp, 'call_roundhouse', fake_call), \
+             patch.object(roundhouse_mcp.os.path, 'expanduser',
+                          lambda p: '/nonexistent/roundhouse/token'):
+            for name, row in roundhouse_mcp.TOOLS.items():
+                if row['action']:
+                    continue
+                args = {}
+                if '{unit}' in row['path']:
+                    args['unit'] = 'a.service'
+                if '{rollout_id}' in row['path']:
+                    args['rollout_id'] = 'r-1'
+                response = roundhouse_mcp.handle_message(
+                    {'jsonrpc': '2.0', 'id': 1, 'method': 'tools/call',
+                     'params': {'name': name, 'arguments': args}},
+                    {'url': 'http://127.0.0.1:8090', 'client_name': 'x'})
+                self.assertFalse(response['result']['isError'], name)
+        self.assertEqual(len(seen), 7)
+        self.assertTrue(all(token is None for _p, token in seen),
+                        'a read tool attached a bearer token')
 
     def test_sanitize_requester(self):
         """Requester name is sanitized per H7 charset."""
@@ -764,6 +1164,83 @@ class TestRefusalFidelity(unittest.TestCase):
             elif 'ROUNDHOUSE_TOKEN' in os.environ:
                 del os.environ['ROUNDHOUSE_TOKEN']
 
+    def _assert_fidelity(self, mcp_result, is_error, http_status, http_body):
+        """The acceptance rule: tool-result JSON minus http_status == the HTTP body,
+        field for field, and a refusal is never an error."""
+        self.assertFalse(is_error, 'a refusal below 500 must carry isError: false')
+        self.assertEqual(mcp_result['http_status'], http_status)
+        stripped = {k: v for k, v in mcp_result.items() if k != 'http_status'}
+        self.assertEqual(stripped, http_body)
+
+    def test_consent_unfittable_422_fidelity(self):
+        """422 consent_unfittable through a REAL MCP SUBPROCESS: the full warm
+        arithmetic (estimate, headroom, shortfall, consenting, excluded_unmarked)
+        survives field-for-field. This is the SPEC Risk #1 pipe leg."""
+        # Squeeze memory so the plan cannot fit, and leave twin1 (READY, UNMARKED)
+        # standing so `excluded_unmarked` is non-empty — the claimant reasoning an
+        # agent needs in order to explain why nothing could be freed.
+        snap = self._default_snapshot()
+        snap['mem']['available_bytes'] = 64 * 1024 * 1024
+        type(self).snap = snap
+
+        http_status, http_body = self._request(
+            'POST', '/api/warm', data={'unit': 'on-demand.service'})
+        self.assertEqual(http_status, 422)
+        self.assertEqual(http_body['error'], 'consent_unfittable')
+        self.assertTrue(http_body['excluded_unmarked'],
+                        'fixture must leave an unmarked active unit to be excluded')
+        self.assertEqual([r['unit'] for r in http_body['excluded_unmarked']], ['twin1.service'])
+
+        client = McpPipeClient(f'http://127.0.0.1:{self.port}', token='test-token')
+        try:
+            client.initialize()
+            mcp_result, is_error = client.call_tool('warm', {'unit': 'on-demand.service'})
+        finally:
+            client.close()
+
+        self._assert_fidelity(mcp_result, is_error, 422, http_body)
+        # Named explicitly so a "helpful" summarising wrapper cannot pass by accident.
+        for field in ('estimate_bytes', 'estimate_source', 'mem_available_bytes',
+                      'headroom_bytes', 'freed_by', 'shortfall_bytes',
+                      'consenting', 'excluded_unmarked', 'detail', 'unit'):
+            self.assertIn(field, mcp_result, field)
+            self.assertEqual(mcp_result[field], http_body[field], field)
+
+    def test_not_on_demand_422_fidelity(self):
+        """422 not_on_demand: warming an unmarked unit is a refusal, not an error."""
+        http_status, http_body = self._request(
+            'POST', '/api/warm', data={'unit': 'plain.service'})
+        self.assertEqual(http_status, 422)
+        self.assertEqual(http_body['error'], 'not_on_demand')
+
+        mcp_result, is_error = self._call_mcp_tool('warm', {'unit': 'plain.service'})
+        self._assert_fidelity(mcp_result, is_error, 422, http_body)
+        self.assertEqual(mcp_result['unit'], 'plain.service')
+        self.assertIn('on-demand', mcp_result['detail'])
+
+    def test_operation_in_progress_409_fidelity(self):
+        """409 operation_in_progress: the slot holder's id and kind reach the agent."""
+        held = {
+            'rollout_id': 'sw-fixture-hold', 'kind': 'switch', 'unit': 'twin1.service',
+            'target': 'twin1.service', 'stops': [], 'stopped': [], 'target_started': False,
+            'phase': 'stopping', 'detail': 'stopping twin1.service (1/1)',
+            'failure': None, 'rollback': None, 'restored': False,
+            'started_at': 1.0, 'updated_at': 1.0, 'origin': 'human', 'requester': None,
+        }
+        self.engine.current = held
+        self.engine.rollouts[held['rollout_id']] = held
+        self.assertFalse(roundhouse._slot_free(held))
+
+        args = {'target': 'on-demand.service', 'stops': [], 'confirm': 'stale-confirm'}
+        http_status, http_body = self._request('POST', '/api/switch', data=args)
+        self.assertEqual(http_status, 409)
+        self.assertEqual(http_body['error'], 'operation_in_progress')
+
+        mcp_result, is_error = self._call_mcp_tool('switch_execute', args)
+        self._assert_fidelity(mcp_result, is_error, 409, http_body)
+        self.assertEqual(mcp_result['rollout_id'], 'sw-fixture-hold')
+        self.assertEqual(mcp_result['kind'], 'switch')
+
     def test_enable_collision_422_fidelity(self):
         """422 enable_collision: MCP result matches direct HTTP call."""
         # twin2 can't be enabled; twin1 already is
@@ -782,14 +1259,9 @@ class TestRefusalFidelity(unittest.TestCase):
             'set_boot',
             {'unit': 'twin2.service', 'enabled': True}
         )
-        self.assertFalse(is_error, "refusal should not be an error")
-        self.assertEqual(mcp_result['http_status'], 422)
+        self._assert_fidelity(mcp_result, is_error, 422, http_body)
         self.assertEqual(mcp_result['error'], 'enable_collision')
-        self.assertIn('claimants', mcp_result)
-        # Field-for-field equality
-        self.assertEqual(mcp_result['error'], http_body['error'])
-        if 'claimants' in http_body:
-            self.assertEqual(mcp_result.get('claimants'), http_body['claimants'])
+        self.assertTrue(mcp_result['claimants'], 'claimants must reach the agent')
 
     def test_read_only_mode_403_fidelity(self):
         """403 read_only_mode: MCP result matches direct HTTP call."""
@@ -813,8 +1285,7 @@ class TestRefusalFidelity(unittest.TestCase):
                 {'unit': 'plain.service', 'enabled': True},
                 token='test-token'
             )
-            self.assertFalse(is_error, "refusal should not be an error")
-            self.assertEqual(mcp_result['http_status'], 403)
+            self._assert_fidelity(mcp_result, is_error, 403, http_body)
             self.assertEqual(mcp_result['error'], 'read_only_mode')
         finally:
             roundhouse.ACTUATE_ARMED = True
@@ -852,35 +1323,44 @@ class TestRefusalFidelity(unittest.TestCase):
             mcp_result = json.loads(text)
             is_error = response['result'].get('isError', False)
 
-            self.assertFalse(is_error, "refusal should not be an error")
-            self.assertEqual(mcp_result['http_status'], 401)
+            self._assert_fidelity(mcp_result, is_error, 401, http_body)
         finally:
             if 'ROUNDHOUSE_TOKEN' in os.environ:
                 del os.environ['ROUNDHOUSE_TOKEN']
 
 
 class TestScriptedSession(unittest.TestCase):
-    """Scripted end-to-end session: initialize -> fleet_status -> switch_preview/execute ->
-    operation_status -> operation_rollback -> set_boot -> warm -> warm_state -> warm_cancel.
+    """MVP6.md's scripted-session acceptance row, end to end over REAL PIPES.
 
-    Tests against an in-process armed server with stubbed engine gateways.
-    Also tests read tools against a read-only instance returning structured refusals.
+    initialize -> fleet_status -> unit_detail -> switch_preview (tick a stop) ->
+    switch_execute with the confirm FROM the preview -> operation_status polled to
+    done -> a deliberately failing op -> operation_rollback -> restored ->
+    a second failing op -> operation_dismiss -> set_boot both ways ->
+    stale confirm -> 409 preview_stale -> warm -> warm_state -> warm_cancel.
+
+    The fleet is scripted from the lifecycle verbs (the recorder gateway mutates the
+    roster) rather than canned: the confirmed-OFF gate and the watch freshness gate
+    are timing rules and only mean something against a roster that changes when — and
+    only when — something was actually stopped or started.
     """
 
     HOST = 'testhost'
     ADVERTISE = 'advertise.example'
 
+    # unit -> (alias, port, on_demand, rung, enabled)
+    FLEET = (
+        ('main.service', 'main', 9121, False, 'READY', True),
+        ('alt.service', 'alt', 9122, False, 'OFF', False),
+        ('spare.service', 'spare', 9123, True, 'OFF', False),
+        ('extra.service', 'extra', 9124, False, 'OFF', False),
+    )
+
     @classmethod
     def setUpClass(cls):
         cls.temp_dir = tempfile.mkdtemp()
 
-        # Build a rich set of units for the full session
         cls.units = {}
-        for uname, alias, port, on_demand, enabled in (
-            ('main.service', 'main', 9121, False, True),
-            ('alt.service', 'alt', 9122, False, False),
-            ('spare.service', 'spare', 9123, True, False),
-        ):
+        for uname, alias, port, on_demand, _rung, enabled in cls.FLEET:
             u = _mvp5_unit(uname, alias, port, on_demand=on_demand, enabled=enabled)
             cls.units[u.name] = u
 
@@ -889,7 +1369,7 @@ class TestScriptedSession(unittest.TestCase):
         cls.watcher.units = cls.units
         cls.watcher.mem_store = None
         cls.watcher._cgroup_cache = {}
-        cls.watcher.snapshot.side_effect = lambda: copy.deepcopy(cls.snap)
+        cls.watcher.snapshot.side_effect = lambda: cls._live_snapshot()
 
         cls.event_bus = roundhouse.EventBus()
 
@@ -897,8 +1377,6 @@ class TestScriptedSession(unittest.TestCase):
         sock.bind(('127.0.0.1', 0))
         cls.port = sock.getsockname()[1]
         sock.close()
-
-        cls.snap = cls._default_snapshot()
 
         roundhouse.ACTUATE_ARMED = True
         roundhouse.TOKEN = 'test-token'
@@ -929,38 +1407,43 @@ class TestScriptedSession(unittest.TestCase):
         roundhouse.ACTUATE_ARMED = False
         roundhouse.TOKEN = None
 
+    # --- the scripted roster ---------------------------------------------------
+
     @classmethod
-    def _default_snapshot(cls):
-        def row(unit, rung, port, alias, on_demand, enabled=False):
-            return {
-                'unit': unit, 'description': '', 'retired': False, 'rung': rung,
-                'roster': 'cold', 'since': 0, 'start_ts_mono': '1000',
-                'detail': '', 'badges': [], 'stale': False, 'sensed_at': 0,
+    def _reset_rows(cls):
+        cls.rows = {}
+        for uname, alias, port, on_demand, rung, enabled in cls.FLEET:
+            cls.rows[uname] = {
+                'unit': uname, 'description': '', 'retired': False, 'rung': rung,
+                'roster': 'cold', 'since': 100.0 if rung == 'READY' else 0,
+                'start_ts_mono': str(port), 'detail': '', 'badges': [], 'stale': False,
                 'enabled': enabled, 'active_state': 'inactive', 'sub_state': 'dead',
                 'n_restarts': 0, 'port': port, 'port_source': 'flag', 'alias': alias,
                 'on_demand': on_demand, 'gate': None, 'model_file': '', 'quant_hint': None,
-                'ctx': None, 'mem': {},
-                'port_conflict': None, 'strategy_note': None,
+                'ctx': None, 'mem': {}, 'port_conflict': None, 'strategy_note': None,
             }
+        cls.unit_file_state = {u: ('enabled' if e else 'disabled')
+                               for u, _a, _p, _o, _r, e in cls.FLEET}
+        cls.start_plan = {}     # unit -> 'ready' (default) | 'failed'
+        cls.stop_plan = {}      # unit -> 'off' (default) | 'failed'
 
+    @classmethod
+    def _live_snapshot(cls):
+        """Like Watcher.snapshot(): lock-free, and `sensed_at` is always NOW — the
+        confirm-off gate demands a sample sensed after the stop command returned."""
+        now = time.time()
         return {
-            'host': cls.HOST,
-            'kernel': '6.1.0-test',
-            'now': 1000.0,
+            'host': cls.HOST, 'kernel': '6.1.0-test', 'now': now,
             'mem': {'total_bytes': 256 * _GIB, 'available_bytes': 200 * _GIB},
             'sources': {'journal': 'ok', 'systemctl': 'ok'},
             'self_port': cls.port,
             'self_unit': {'unit': 'roundhouse.service',
                           'unit_file_state': 'enabled', 'enabled': True},
-            'units': [
-                row('main.service', 'READY', 9121, 'main', False, enabled=True),
-                row('alt.service', 'OFF', 9122, 'alt', False, enabled=False),
-                row('spare.service', 'OFF', 9123, 'spare', True, enabled=False),
-            ],
+            'units': [dict(row, sensed_at=now) for row in cls.rows.values()],
         }
 
     def setUp(self):
-        type(self).snap = self._default_snapshot()
+        type(self)._reset_rows()
         roundhouse.ACTUATE_ARMED = True
         roundhouse.TOKEN = 'test-token'
         self.engine.current = None
@@ -969,128 +1452,318 @@ class TestScriptedSession(unittest.TestCase):
         self.engine.pending_warm = None
         self.engine.last_warm = None
         self.engine.warm_seq = 0
+        self.actuate_calls = []
 
-    def _call_mcp(self, method, params=None):
-        """Call MCP tool via in-process."""
-        os.environ['ROUNDHOUSE_TOKEN'] = 'test-token'
-        try:
-            state = {
-                'url': f'http://127.0.0.1:{self.port}',
-                'client_name': 'test-client'
-            }
-            msg = {
-                'jsonrpc': '2.0',
-                'id': 1,
-                'method': method,
-                'params': params or {}
-            }
-            response = roundhouse_mcp.handle_message(msg, state)
+        patches = [
+            patch.object(roundhouse, 'run_actuate', self._stub_actuate),
+            patch.object(roundhouse, 'run_ro', self._stub_run_ro),
+            # The fixtures name model files that do not exist, so the estimator would
+            # fall back to its 9 GiB default and the fit check would depend on the build
+            # box's free RAM. Memory arithmetic is TestSwitchPreflight's subject.
+            patch.object(roundhouse, '_estimate_start_bytes',
+                         lambda unit, profile, store: (64 * 1024 * 1024, 'test-injected')),
+            # A switch touches neither the git gateway nor the file writer; if the MCP
+            # layer ever grew its own actuation path, these would fire.
+            patch.object(roundhouse, 'run_git', self._forbidden('run_git')),
+            patch.object(roundhouse, '_atomic_write', self._forbidden('_atomic_write')),
+        ]
+        for p in patches:
+            p.start()
+            self.addCleanup(p.stop)
 
-            if method == 'tools/call':
-                # Parse the tool result text
-                if response.get('result') and response['result'].get('content'):
-                    text = response['result']['content'][0]['text']
-                    return json.loads(text), response['result'].get('isError', False)
-            return response.get('result', {}), response['result'].get('isError', False)
-        finally:
-            if 'ROUNDHOUSE_TOKEN' in os.environ:
-                del os.environ['ROUNDHOUSE_TOKEN']
+    @staticmethod
+    def _forbidden(name):
+        def boom(*a, **k):
+            raise AssertionError(f'{name} must never be called in this session: {a}')
+        return boom
+
+    def _stub_actuate(self, argv, units, timeout=90):
+        """The ONLY actuation gateway: records the verb and moves the scripted roster."""
+        self.actuate_calls.append(list(argv))
+        verb, name = argv[2], argv[-1]
+        cls = type(self)
+        row = cls.rows.get(name)
+        if verb == 'stop' and row is not None:
+            row['rung'] = 'FAILED' if cls.stop_plan.get(name) == 'failed' else 'OFF'
+        elif verb == 'start' and row is not None:
+            row['since'] = time.time()
+            row['start_ts_mono'] = str(int(time.time() * 1e6))
+            row['rung'] = 'FAILED' if cls.start_plan.get(name) == 'failed' else 'READY'
+        elif verb in ('enable', 'disable') and row is not None:
+            cls.unit_file_state[name] = 'enabled' if verb == 'enable' else 'disabled'
+            row['enabled'] = (verb == 'enable')
+        return ''
+
+    def _stub_run_ro(self, argv, timeout=None, **kwargs):
+        """handle_enablement's read-back (`systemctl show -p UnitFileState`)."""
+        name = argv[-1]
+        return f"UnitFileState={type(self).unit_file_state.get(name, 'disabled')}\n"
+
+    # --- helpers ---------------------------------------------------------------
+
+    def _client(self, token='test-token', client_name='pipe-client'):
+        client = McpPipeClient(f'http://127.0.0.1:{self.port}', token=token,
+                               client_name=client_name)
+        self.addCleanup(client.close)
+        return client
+
+    def _poll_operation(self, client, rollout_id, terminals, timeout=30.0):
+        deadline = time.time() + timeout
+        last = None
+        while time.time() < deadline:
+            last, is_error = client.call_tool('operation_status', {'rollout_id': rollout_id})
+            self.assertFalse(is_error)
+            self.assertEqual(last['http_status'], 200)
+            if last.get('phase') in terminals:
+                return last
+            time.sleep(0.2)
+        self.fail(f'operation {rollout_id} never settled; last: {last!r}')
+
+    def _preview_and_execute(self, client, target, stops):
+        """The two-step: preview, then execute with the confirm FROM the preview."""
+        preview, is_error = client.call_tool(
+            'switch_preview', {'target': target, 'stops': stops})
+        self.assertFalse(is_error)
+        self.assertEqual(preview['http_status'], 200,
+                         f'preview refused: {preview!r}')
+        self.assertTrue(preview.get('confirm'), 'preview carried no confirm')
+        self.assertTrue(all(c['ok'] for c in preview['checks']))
+        ticked = [c for c in preview['stop_candidates'] if c['ticked']]
+        self.assertEqual([c['unit'] for c in ticked], stops)
+
+        execute, is_error = client.call_tool(
+            'switch_execute',
+            {'target': target, 'stops': stops, 'confirm': preview['confirm']})
+        self.assertFalse(is_error)
+        self.assertEqual(execute['http_status'], 202, f'execute refused: {execute!r}')
+        self.assertTrue(execute.get('rollout_id'))
+        return preview, execute
+
+    # --- the session -----------------------------------------------------------
 
     def test_full_session_flow(self):
-        """Full MCP session: initialize -> fleet_status -> operations -> set_boot -> warm -> cancel."""
-        # Step 1: initialize
-        init_result, _ = self._call_mcp('initialize', {
-            'protocolVersion': '2025-06-18',
-            'capabilities': {},
-            'clientInfo': {'name': 'test-session', 'version': '1.0'}
-        })
-        self.assertIn('protocolVersion', init_result)
-        self.assertEqual(init_result['serverInfo']['name'], 'roundhouse-mcp')
+        client = self._client()
 
-        # Step 2: fleet_status (read-only tool)
-        fleet_result, _ = self._call_mcp('tools/call', {
-            'name': 'fleet_status',
-            'arguments': {}
-        })
-        self.assertIn('http_status', fleet_result)
-        self.assertEqual(fleet_result['http_status'], 200)
-        self.assertIn('host', fleet_result)
-        self.assertEqual(fleet_result['host'], self.HOST)
-        self.assertIn('units', fleet_result)
-        self.assertGreater(len(fleet_result['units']), 0)
+        # 1. initialize
+        init = client.initialize()
+        self.assertEqual(init['serverInfo']['name'], 'roundhouse-mcp')
+        self.assertEqual(init['protocolVersion'], '2025-06-18')
 
-        # Step 3: unit_detail (read-only tool)
-        detail_result, _ = self._call_mcp('tools/call', {
-            'name': 'unit_detail',
-            'arguments': {'unit': 'alt.service'}
-        })
-        self.assertEqual(detail_result['http_status'], 200)
+        # 2. fleet_status: armed, four units, no operation
+        fleet, is_error = client.call_tool('fleet_status')
+        self.assertFalse(is_error)
+        self.assertEqual(fleet['http_status'], 200)
+        self.assertEqual(fleet['host'], self.HOST)
+        self.assertEqual(fleet['mode'], 'actuate')
+        self.assertEqual(fleet['n_units'], 4)
+        self.assertIsNone(fleet['operation'])
+        self.assertEqual({u['unit'] for u in fleet['units']},
+                         {u for u, *_ in self.FLEET})
 
-        # Step 4: set_boot to enable
-        boot_on_result, _ = self._call_mcp('tools/call', {
-            'name': 'set_boot',
-            'arguments': {'unit': 'alt.service', 'enabled': True}
-        })
-        self.assertIn('http_status', boot_on_result)
-        # Could be 200 or 422 depending on current state
+        # 3. unit_detail
+        detail, is_error = client.call_tool('unit_detail', {'unit': 'main.service'})
+        self.assertFalse(is_error)
+        self.assertEqual(detail['http_status'], 200)
+        self.assertEqual(detail['unit'], 'main.service')
 
-        # Step 5: set_boot to disable
-        boot_off_result, _ = self._call_mcp('tools/call', {
-            'name': 'set_boot',
-            'arguments': {'unit': 'alt.service', 'enabled': False}
-        })
-        self.assertIn('http_status', boot_off_result)
+        # 4-5. switch_preview (tick main) -> switch_execute with THAT confirm
+        preview, execute = self._preview_and_execute(client, 'alt.service', ['main.service'])
+        first_id = execute['rollout_id']
 
-        # Step 6: warm (on-demand)
-        warm_result, _ = self._call_mcp('tools/call', {
-            'name': 'warm',
-            'arguments': {'unit': 'spare.service'}
-        })
-        self.assertIn('http_status', warm_result)
+        # 6. operation_status polled to done
+        settled = self._poll_operation(client, first_id, ('done', 'failed', 'restored'))
+        self.assertEqual(settled['phase'], 'done', settled.get('detail'))
+        self.assertEqual(settled['kind'], 'switch')
+        self.assertEqual(settled['stopped'], ['main.service'])
+        self.assertEqual(self.rows['alt.service']['rung'], 'READY')
+        self.assertEqual(self.rows['main.service']['rung'], 'OFF')
 
-        # Step 7: warm_state
-        warm_state_result, _ = self._call_mcp('tools/call', {
-            'name': 'warm_state',
-            'arguments': {}
-        })
-        self.assertEqual(warm_state_result['http_status'], 200)
+        # 7. the operation is visible on fleet_status (I5 `operation` passthrough)
+        fleet, _ = client.call_tool('fleet_status')
+        self.assertIsNotNone(fleet['operation'], 'fleet_status lost the operation record')
+        self.assertEqual(fleet['operation']['rollout_id'], first_id)
+        self.assertEqual(fleet['operation']['phase'], 'done')
 
-        # Step 8: warm_cancel
-        cancel_result, _ = self._call_mcp('tools/call', {
-            'name': 'warm_cancel',
-            'arguments': {}
-        })
-        self.assertIn('http_status', cancel_result)
+        # 8-10. a deliberately failing op -> rollback offered
+        type(self).start_plan['main.service'] = 'failed'
+        _preview2, execute2 = self._preview_and_execute(client, 'main.service', ['alt.service'])
+        failed_id = execute2['rollout_id']
+        failed = self._poll_operation(client, failed_id, ('failed', 'done', 'restored'))
+        self.assertEqual(failed['phase'], 'failed')
+        self.assertEqual(failed['failure']['reason'], 'unit_failed')
+        self.assertTrue(failed['rollback']['offered'],
+                        'a failed switch that stopped a unit must offer restore')
 
-        # Step 9: port_board (read-only tool)
-        port_result, _ = self._call_mcp('tools/call', {
-            'name': 'port_board',
-            'arguments': {}
-        })
-        self.assertEqual(port_result['http_status'], 200)
+        # 11-12. operation_rollback -> restored
+        rb, is_error = client.call_tool('operation_rollback', {'rollout_id': failed_id})
+        self.assertFalse(is_error)
+        self.assertEqual(rb['http_status'], 202)
+        self.assertEqual(rb['rollout_id'], failed_id)
+        restored = self._poll_operation(client, failed_id, ('restored', 'restore_failed'))
+        self.assertEqual(restored['phase'], 'restored', restored.get('detail'))
+        self.assertEqual(self.rows['alt.service']['rung'], 'READY',
+                         'the stopped unit was not put back')
+
+        # 13-16. a second failing op -> operation_dismiss releases the slot
+        type(self).start_plan['extra.service'] = 'failed'
+        _preview3, execute3 = self._preview_and_execute(client, 'extra.service', ['alt.service'])
+        dismiss_id = execute3['rollout_id']
+        failed3 = self._poll_operation(client, dismiss_id, ('failed', 'done', 'restored'))
+        self.assertEqual(failed3['phase'], 'failed')
+        self.assertTrue(failed3['rollback']['offered'])
+
+        dm, is_error = client.call_tool('operation_dismiss', {'rollout_id': dismiss_id})
+        self.assertFalse(is_error)
+        self.assertEqual(dm['http_status'], 200)
+        self.assertTrue(dm['ok'])
+        after = self._poll_operation(client, dismiss_id, ('failed',))
+        self.assertFalse(after['rollback']['offered'])
+        self.assertTrue(roundhouse._slot_free(self.engine.current),
+                        'dismiss must release the operation slot')
+
+        # 17. set_boot both ways
+        on, is_error = client.call_tool('set_boot', {'unit': 'alt.service', 'enabled': True})
+        self.assertFalse(is_error)
+        self.assertEqual(on['http_status'], 200)
+        self.assertTrue(on['enabled'])
+        self.assertFalse(on['was'])
+        self.assertTrue(on['changed'])
+
+        off, is_error = client.call_tool('set_boot', {'unit': 'alt.service', 'enabled': False})
+        self.assertEqual(off['http_status'], 200)
+        self.assertFalse(off['enabled'])
+        self.assertTrue(off['was'])
+        self.assertTrue(off['changed'])
+        self.assertIn(['systemctl', '--user', 'enable', '--', 'alt.service'],
+                      self.actuate_calls)
+        self.assertIn(['systemctl', '--user', 'disable', '--', 'alt.service'],
+                      self.actuate_calls)
+
+        # 18. two-step discipline: a fabricated confirm is 409 preview_stale, and the
+        #     wrapper neither re-previews nor retries (I4).
+        stale, is_error = client.call_tool(
+            'switch_execute',
+            {'target': 'spare.service', 'stops': [], 'confirm': 'deadbeef' * 8})
+        self.assertFalse(is_error)
+        self.assertEqual(stale['http_status'], 409)
+        self.assertEqual(stale['error'], 'preview_stale')
+        self.assertEqual(self.rows['spare.service']['rung'], 'OFF',
+                         'a refused execute must not have actuated anything')
+
+        # 19. warm -> warm_state -> warm_cancel, with the slot held so the request parks
+        held = {'rollout_id': 'sw-held', 'kind': 'switch', 'phase': 'stopping',
+                'unit': 'main.service', 'detail': 'held for the warm leg',
+                'failure': None, 'rollback': None, 'restored': False,
+                'stopped': [], 'target_started': False,
+                'started_at': time.time(), 'updated_at': time.time(),
+                'origin': 'human', 'requester': None}
+        self.engine.current = held
+        self.engine.rollouts[held['rollout_id']] = held
+
+        warm, is_error = client.call_tool('warm', {'unit': 'spare.service'})
+        self.assertFalse(is_error)
+        self.assertEqual(warm['http_status'], 202, warm)
+        self.assertTrue(warm['queued'])
+        self.assertEqual(warm['unit'], 'spare.service')
+
+        state, is_error = client.call_tool('warm_state')
+        self.assertFalse(is_error)
+        self.assertEqual(state['http_status'], 200)
+        self.assertIsNotNone(state['pending'])
+        self.assertEqual(state['pending']['unit'], 'spare.service')
+        # I6: the requester default is `mcp-<clientInfo.name>` (H7's charset has no ':')
+        self.assertEqual(state['pending']['requester'], 'mcp-pipe-client')
+
+        cancel, is_error = client.call_tool('warm_cancel')
+        self.assertFalse(is_error)
+        self.assertEqual(cancel['http_status'], 200)
+        self.assertTrue(cancel['cancelled'])
+        self.assertEqual(cancel['unit'], 'spare.service')
+
+        state, _ = client.call_tool('warm_state')
+        self.assertIsNone(state['pending'])
+        self.assertEqual(state['last']['disposition'], 'cancelled')
+
+        self.engine.current = None
+
+        # 20. every actuation went through the one gateway, and only with the four verbs
+        self.assertTrue(self.actuate_calls)
+        for argv in self.actuate_calls:
+            self.assertEqual(argv[:2], ['systemctl', '--user'])
+            self.assertIn(argv[2], ('stop', 'start', 'enable', 'disable'))
+
+    def test_explicit_requester_argument_overrides_the_default(self):
+        """§4: `warm`'s optional `requester` replaces the I6 default (both sanitized)."""
+        held = {'rollout_id': 'sw-held-2', 'kind': 'switch', 'phase': 'stopping',
+                'unit': 'main.service', 'detail': 'held', 'failure': None,
+                'rollback': None, 'restored': False, 'stopped': [],
+                'target_started': False, 'started_at': time.time(),
+                'updated_at': time.time(), 'origin': 'human', 'requester': None}
+        self.engine.current = held
+        self.engine.rollouts[held['rollout_id']] = held
+
+        client = self._client()
+        client.initialize()
+        warm, is_error = client.call_tool(
+            'warm', {'unit': 'spare.service', 'requester': 'bullpen:coder/1'})
+        self.assertFalse(is_error)
+        self.assertEqual(warm['http_status'], 202)
+
+        state, _ = client.call_tool('warm_state')
+        # ':' and '/' are outside the H7 charset and are dropped on both sides.
+        self.assertEqual(state['pending']['requester'], 'bullpencoder1')
+        self.engine.current = None
 
     def test_read_only_mode_structured_refusal(self):
-        """Read tools work against read-only; action tools return structured 403."""
+        """Read tools work against a read-only Roundhouse; every action tool answers a
+        structured `read_only_mode` refusal with isError: false (never an exception)."""
         roundhouse.ACTUATE_ARMED = False
+        client = self._client()
+        client.initialize()
         try:
-            # Read tools should still work
-            fleet_result, is_error = self._call_mcp('tools/call', {
-                'name': 'fleet_status',
-                'arguments': {}
-            })
-            self.assertFalse(is_error)
-            self.assertEqual(fleet_result['http_status'], 200)
+            read_calls = {
+                'fleet_status': {},
+                'unit_detail': {'unit': 'main.service'},
+                'port_board': {},
+                'deployments': {},
+                'routing_config': {},
+                'warm_state': {},
+            }
+            for tool, args in read_calls.items():
+                with self.subTest(tool=tool):
+                    result, is_error = client.call_tool(tool, args)
+                    self.assertFalse(is_error)
+                    self.assertEqual(result['http_status'], 200, result)
 
-            # Action tool should return structured refusal
-            boot_result, is_error = self._call_mcp('tools/call', {
-                'name': 'set_boot',
-                'arguments': {'unit': 'alt.service', 'enabled': True}
-            })
+            # operation_status is a read tool too, but wants an id: an unknown one is a
+            # structured 404, still not an error.
+            result, is_error = client.call_tool('operation_status', {'rollout_id': 'nope'})
             self.assertFalse(is_error)
-            self.assertEqual(boot_result['http_status'], 403)
-            self.assertEqual(boot_result['error'], 'read_only_mode')
+            self.assertEqual(result['http_status'], 404)
+
+            action_calls = {
+                'switch_preview': {'target': 'alt.service'},
+                'switch_execute': {'target': 'alt.service', 'confirm': 'x'},
+                'edit_preview': {'unit': 'alt.service', 'edits': {'ctx': '4096'}},
+                'edit_rollout': {'unit': 'alt.service', 'edits': {'ctx': '4096'},
+                                 'confirm': 'x'},
+                'set_boot': {'unit': 'alt.service', 'enabled': True},
+                'warm': {'unit': 'spare.service'},
+                'warm_cancel': {},
+                'operation_rollback': {'rollout_id': 'nope'},
+                'operation_dismiss': {'rollout_id': 'nope'},
+            }
+            for tool, args in action_calls.items():
+                with self.subTest(tool=tool):
+                    result, is_error = client.call_tool(tool, args)
+                    self.assertFalse(is_error, f'{tool} raised instead of refusing')
+                    self.assertEqual(result['http_status'], 403, result)
+                    self.assertEqual(result['error'], 'read_only_mode')
+            self.assertEqual(self.actuate_calls, [],
+                             'a read-only instance actuated something')
         finally:
             roundhouse.ACTUATE_ARMED = True
+
 
 
 class TestTwoStepDiscipline(unittest.TestCase):

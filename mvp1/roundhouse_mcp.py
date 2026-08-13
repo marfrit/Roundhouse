@@ -83,15 +83,20 @@ def shape_result(status, payload) -> tuple:
             True
         )
 
-    # Build base result
+    # Build base result. `http_status` is seeded first so it reads at the top of the
+    # pretty-printed block, and re-written after the body is merged in because I2 says
+    # the INJECTION wins on key collision (no route emits the key today; the rule is
+    # documented for the one that someday might).
     result = {'http_status': status}
 
     if isinstance(payload, dict):
         # JSON response
         result.update(payload)
     else:
-        # Raw text response
-        result['raw'] = payload
+        # Raw text response (recon 2: error_404/error_405 are text/plain)
+        result['raw'] = payload if payload is not None else ''
+
+    result['http_status'] = status
 
     # Determine error flag
     is_error = status >= 500
@@ -131,8 +136,10 @@ def shape_fleet_status(snapshot) -> dict:
     result['n_units'] = len(shaped_units)
     result['units'] = shaped_units
 
-    # Include operation (passthrough, may be null)
-    result['operation'] = snapshot.get('operation')
+    # I5: `operation` is the snapshot's `rollout` value verbatim (already the compact
+    # rollout_public_record, or null). take_snapshot emits the key as `rollout`; reading
+    # a key named `operation` here made every fleet_status report "no operation running".
+    result['operation'] = snapshot.get('rollout')
 
     return result
 
@@ -549,7 +556,19 @@ def handle_message(msg, conn_state) -> dict or None:
     global state
     state = conn_state
 
-    # Validate JSON-RPC structure
+    # Validate JSON-RPC structure. I11: the batch check comes FIRST — a top-level array
+    # is well-formed JSON, so answering it -32700 "parse error" would misreport why it
+    # was refused (and the check was unreachable below the isinstance(dict) guard).
+    if isinstance(msg, list):
+        return {
+            'jsonrpc': '2.0',
+            'id': None,
+            'error': {
+                'code': -32600,
+                'message': 'batch not supported'
+            }
+        }
+
     if not isinstance(msg, dict):
         return {
             'jsonrpc': '2.0',
@@ -562,18 +581,9 @@ def handle_message(msg, conn_state) -> dict or None:
 
     msg_id = msg.get('id')
     method = msg.get('method')
-    params = msg.get('params', {})
-
-    # Check for batch (array)
-    if isinstance(msg, list):
-        return {
-            'jsonrpc': '2.0',
-            'id': None,
-            'error': {
-                'code': -32600,
-                'message': 'batch not supported'
-            }
-        }
+    # `params: null` is legal JSON-RPC; `.get('params', {})` returns None for it, and
+    # every downstream membership test would then raise -> -32603. I11 says tolerate.
+    params = msg.get('params') or {}
 
     try:
         # Handle initialize
@@ -711,27 +721,17 @@ def handle_message(msg, conn_state) -> dict or None:
                 requester=requester
             )
 
-            # Shape result
-            result_dict = {'http_status': http_status} if http_status is not None else {}
+            # Shape result — I2/I8 live in shape_result and nowhere else. This used to
+            # be an inline second copy of that logic, so the taxonomy was proven by
+            # TestShaping against a function the server never called.
+            result_dict, is_error = shape_result(http_status, http_body)
 
-            if isinstance(http_body, dict):
-                result_dict.update(http_body)
-            elif http_body:
-                if http_status is None:
-                    # Transport error
-                    result_dict = {
-                        'error': 'roundhouse_unreachable',
-                        'url': state['url'],
-                        'detail': http_body
-                    }
-                else:
-                    result_dict['raw'] = http_body
-
-            # Apply shaper if present
-            if tool_row['shaper']:
+            # Apply shaper if present. ONLY on a 200: the I5 keep-list describes the
+            # /api/units snapshot, and running it over a refusal body or over I8's
+            # {error, url, detail} unreachable result drops every key it does not know
+            # — the agent would read a cheerful empty fleet instead of "server down".
+            if tool_row['shaper'] and http_status == 200:
                 result_dict = tool_row['shaper'](result_dict)
-
-            is_error = http_status is None or http_status >= 500
 
             # Pretty-print result as JSON string
             result_text = json.dumps(result_dict, indent=2, ensure_ascii=False)

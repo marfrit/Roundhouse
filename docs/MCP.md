@@ -16,10 +16,10 @@ To use Roundhouse tools in Claude Code, register the MCP server in your Claude C
       "args": [
         "/path/to/roundhouse_mcp.py",
         "--url",
-        "http://boltzmann.fritz.box:8091"
+        "http://boltzmann.fritz.box:8090"
       ],
       "env": {
-        "ROUNDHOUSE_TOKEN": ""
+        "ROUNDHOUSE_TOKEN": "paste-from-the-roundhouse-host"
       }
     }
   }
@@ -28,7 +28,7 @@ To use Roundhouse tools in Claude Code, register the MCP server in your Claude C
 
 **Remarks:**
 - `--url`: Roundhouse HTTP API endpoint (default: `http://127.0.0.1:8090`). Use a real hostname if behind a proxy or on a remote host.
-- `ROUNDHOUSE_TOKEN`: Bearer token for authentication. See token provisioning below.
+- `ROUNDHOUSE_TOKEN`: Bearer token for authentication. See token provisioning below. Omit the whole `env` block for a read-only registration — every read tool works without a token (see [Read-Only Mode](#read-only-mode-live-cluster-integration)); action tools then answer `no_token` instead of reaching Roundhouse at all.
 
 ## Token Provisioning
 
@@ -359,7 +359,7 @@ This pattern applies to all refusals: **every structured refusal (`422`, `409`, 
 - **Never pre-empts or retries** around a refusal; the agent decides what to do next.
 - Grants nothing the token doesn't already grant.
 
-**Read tools work against any mode** (actuate or read-only). **Action tools** (`switch_execute`, `edit_rollout`, `set_boot`, `warm`, `warm_cancel`, `operation_rollback`, `operation_dismiss`) require `--actuate` and a token. In read-only mode, action tools return a structured `read_only_mode` refusal (403) with `isError: false`, not an exception.
+**Read tools work against any mode** (actuate or read-only), with or without a token. **Action tools** (`switch_execute`, `edit_rollout`, `set_boot`, `warm`, `warm_cancel`, `operation_rollback`, `operation_dismiss`) require `--actuate` and a token. In read-only mode, action tools return a structured refusal with `isError: false`, never an exception — `read_only_mode` (403) when a token is presented, `no_token` when none is provisioned (see [Read-Only Mode](#read-only-mode-live-cluster-integration)).
 
 ---
 
@@ -378,16 +378,22 @@ To query Roundhouse against a live (read-only) instance without actuate privileg
         "http://boltzmann.fritz.box:8091"
       ],
       "env": {
-        "ROUNDHOUSE_TOKEN": "read-only-token-or-empty"
+        "ROUNDHOUSE_TOKEN": "any-non-empty-value"
       }
     }
   }
 }
 ```
 
-**Read tools work:** `fleet_status`, `unit_detail`, `port_board`, `deployments`, `routing_config`, `operation_status`, `warm_state`.
+**Read tools work with or without a token:** `fleet_status`, `unit_detail`, `port_board`, `deployments`, `routing_config`, `operation_status`, `warm_state`. Every GET route is unauthenticated by design (MVP2 E8), so a token-less registration is a fully functional read-only client — the `env` block above can be dropped entirely.
 
-**Action tools return 403:** Any attempt to call an action tool against a read-only instance returns:
+**Action tools refuse — but read which refusal you get.** The token check happens in the MCP server, *before* any HTTP request, so the two cases are distinguishable and both arrive with `isError: false`:
+
+| registration | `set_boot` against a read-only Roundhouse | why |
+|---|---|---|
+| no token provisioned | `{"http_status": null, "error": "no_token", "hint": "..."}` | the wrapper never leaves the process; no HTTP happens |
+| any token provisioned | `{"http_status": 403, "error": "read_only_mode", "detail": "launch with --actuate to enable rollouts"}` | Roundhouse's E8 gate checks armed-ness *before* it validates the bearer, so even a wrong token yields the 403 |
+
 ```json
 {
   "http_status": 403,
@@ -395,6 +401,8 @@ To query Roundhouse against a live (read-only) instance without actuate privileg
   "detail": "launch with --actuate to enable rollouts"
 }
 ```
+
+Either way the fleet is untouched. If you want the live instance to *say* `read_only_mode` rather than `no_token` — e.g. to prove the server-side gate rather than the client-side one — provision any non-empty token value; it is never accepted, only presented.
 
 This allows agents to safely integrate with live hosts without risk of unintended mutations.
 
@@ -444,3 +452,38 @@ This allows agents to safely integrate with live hosts without risk of unintende
 ```
 
 Every step's result includes `http_status` and complete structured data (or refusal), allowing the agent to reason about what happened and what to try next.
+
+---
+
+## Verifying a Registration: the MCP drill
+
+`mvp1/scripts/mcp-drill.sh` drives `roundhouse_mcp.py` as a real subprocess over real
+pipes and asserts every step's tool result. One MCP process holds the whole session,
+because framing drift and the `initialize`-derived requester tag only show up across a
+multi-message session. The drill adds no actuation of its own: everything it changes,
+it changes by calling an MCP tool, which calls a gated HTTP route.
+
+```bash
+# read leg only — safe against any instance, no token needed
+mvp1/scripts/mcp-drill.sh --url http://boltzmann.fritz.box:8090
+
+# full container drill: read + action + read-only legs
+mvp1/scripts/mcp-drill.sh \
+  --url http://boltzmann.fritz.box:8090 \
+  --token "$(incus exec roundhouse-test -- su -l roundhouse -c 'cat ~/.config/roundhouse/token')" \
+  --actions \
+  --target llama-server-fake-b.service \
+  --stops qwen3.6-coding.service \
+  --warm-unit llama-server-fake-b.service \
+  --unmarked llama-server-gemma4-q4km.service \
+  --read-only-url http://boltzmann.fritz.box:8095
+```
+
+Two fixture rules the drill cannot check for you:
+
+- `--unmarked` must name a unit that is **not** marked on-demand **and is currently
+  inactive**. The warm route answers `already_warm` before it ever reaches the consent
+  fence, so pointing it at a running unit proves nothing.
+- `--warm-unit` must be marked on-demand and inactive. The drill fires it while the
+  switch still holds the operation slot, so the request parks (202 `queued`) instead of
+  starting a second switch — that park is what `warm_state` and `warm_cancel` then act on.
