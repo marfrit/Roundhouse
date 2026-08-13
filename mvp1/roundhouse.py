@@ -30,6 +30,11 @@ import http.server
 import urllib.parse
 import subprocess
 import signal
+import hmac
+import hashlib
+import secrets
+import stat
+import difflib
 
 # Hard rail: never implemented
 PAID_OFFLOAD = None
@@ -1182,6 +1187,7 @@ class Watcher:
 
     def __post_init__(self):
         """Initialize per-unit state."""
+        self._badges = {}  # Cache of badges per unit
         for unit_name in self.units:
             self._state[unit_name] = {
                 'active_state': None,
@@ -1207,6 +1213,7 @@ class Watcher:
                 'current': None,
                 'last_peak': None
             }
+            self._badges[unit_name] = []
 
     def apply_systemctl_show(self, props: Dict[str, Dict[str, str]]) -> List[Dict]:
         """Apply systemctl show output.
@@ -1283,7 +1290,16 @@ class Watcher:
             new_rung = self._compute_rung(unit_name)
             self._state[unit_name]['_rung'] = new_rung
 
+            # Emit rung-change event
             if old_rung != new_rung:
+                events.append(self._make_rung_event(unit_name, new_rung))
+
+            # Compute badges and emit badge-change event (even if rung unchanged)
+            old_badges = self._badges.get(unit_name, [])
+            new_badges = self._compute_badges(unit_name, new_rung)
+            self._badges[unit_name] = new_badges
+
+            if old_badges != new_badges:
                 events.append(self._make_rung_event(unit_name, new_rung))
 
         return events
@@ -1702,6 +1718,17 @@ class Watcher:
                 elapsed = self.now() - busy_since
                 if elapsed > 30 * 60:  # 30 minutes
                     badges.append('long_running')
+
+        # Check for no_ready_marker: LOADING but past TimeoutStartSec without seeing ready marker
+        if rung == 'LOADING':
+            exec_main_start_ts = state.get('exec_main_start_ts')
+            if exec_main_start_ts:
+                unit = self.units.get(unit_name)
+                if unit:
+                    timeout_sec = parse_timeout_start_sec(unit.known.get('timeoutstartsec'))
+                    elapsed = self.now() - exec_main_start_ts
+                    if elapsed > timeout_sec:
+                        badges.append('no_ready_marker')
 
         return badges
 
@@ -2251,6 +2278,491 @@ class ThreadingHTTPServer(http.server.ThreadingHTTPServer):
     def take_snapshot(self):
         with self.watcher_lock:
             return self.watcher.snapshot()
+
+
+# ===== SECTION E: ACTUATION (armed only by --actuate; run_actuate + run_git are the only mutation gateways) =====
+
+# Module globals
+ACTUATE_ARMED = False
+ACTUATE_SYSTEMCTL_VERBS = {"stop", "start", "daemon-reload"}
+GIT_VERBS = {"version", "rev-parse", "status", "ls-files", "log", "show",
+             "diff", "add", "commit", "revert"}
+GIT_MUTATING_VERBS = {"add", "commit", "revert"}
+GIT_FORBIDDEN_TOKENS = {"push", "pull", "fetch", "remote", "clone", "init",
+                        "checkout", "reset", "clean", "submodule"}
+TOKEN_PATH = os.path.expanduser("~/.config/roundhouse/token")
+TOKEN = None
+HEADROOM_BYTES = 1 * 1024 * 1024 * 1024  # 1 GiB
+
+# Exceptions
+class ActuationError(Exception):
+    """Raised when actuation is not armed or a command fails."""
+    pass
+
+class EditError(Exception):
+    """Raised when edit validation fails."""
+    def __init__(self, reason: str, detail: str = None):
+        self.reason = reason
+        self.detail = detail
+        super().__init__(f"{reason}: {detail}" if detail else reason)
+
+class VerifyError(Exception):
+    """Raised when splice verification fails."""
+    def __init__(self, reason: str, detail: str = None):
+        self.reason = reason
+        self.detail = detail
+        super().__init__(f"{reason}: {detail}" if detail else reason)
+
+# Gateway functions
+def run_actuate(argv: List[str], units: Dict[str, 'UnitFile'], timeout: float = 90) -> str:
+    """Run a systemctl command via subprocess. Raises ActuationError unless armed and conditions met."""
+    if not ACTUATE_ARMED:
+        raise ActuationError("actuation not armed (--actuate not passed)")
+
+    # Check exact shape
+    if argv == ["systemctl", "--user", "daemon-reload"]:
+        pass  # Valid standalone command
+    elif len(argv) == 5 and argv[0] == "systemctl" and argv[1] == "--user" and argv[2] in ACTUATE_SYSTEMCTL_VERBS and argv[3] == "--":
+        unit = argv[4]
+        if unit not in units:
+            raise ActuationError(f"{unit} not in selected units")
+        if units[unit].retired:
+            raise ActuationError(f"{unit} is [RETIRED]")
+    else:
+        raise ActuationError(f"run_actuate: invalid shape {argv}")
+
+    try:
+        result = subprocess.run(argv, capture_output=True, text=True, timeout=timeout)
+        if result.returncode != 0:
+            raise ActuationError(f"{' '.join(argv)} rc={result.returncode}: {result.stderr.strip()}")
+        return result.stdout
+    except subprocess.TimeoutExpired:
+        raise ActuationError(f"{' '.join(argv)} timeout after {timeout}s")
+
+def run_git(args: List[str], unit_dir: str, timeout: float = 30, bootstrap: bool = False) -> subprocess.CompletedProcess:
+    """Run a git command. Raises ActuationError unless armed and conditions met."""
+    if not ACTUATE_ARMED and not bootstrap:
+        raise ActuationError("actuation not armed")
+
+    if bootstrap:
+        if args[0] not in ("version", "rev-parse", "status"):
+            raise ActuationError(f"bootstrap: only read-only verbs allowed, got {args}")
+    else:
+        if not args or args[0] not in GIT_VERBS:
+            raise ActuationError(f"git verb {args[0] if args else 'none'} not in allowlist")
+        if any(t in args for t in GIT_FORBIDDEN_TOKENS):
+            raise ActuationError(f"git forbidden token found in {args}")
+
+        if args[0] == "add":
+            if not (len(args) == 3 and args[1] == "--" and "/" not in args[2]):
+                raise ActuationError(f"git add must be exactly ['add', '--', 'basename'], got {args}")
+        elif args[0] == "revert":
+            if not ((len(args) == 3 and args[1:3] == ["--no-edit", args[2]]) or args == ["revert", "--abort"]):
+                raise ActuationError(f"git revert must be ['revert', '--no-edit', sha] or ['revert', '--abort'], got {args}")
+
+    # Build command
+    cmd = ["git", "-C", unit_dir] + args
+
+    # Set author env for mutating verbs
+    env = os.environ.copy()
+    if args and args[0] in GIT_MUTATING_VERBS:
+        hostname = socket.gethostname()
+        env["GIT_AUTHOR_NAME"] = "roundhouse"
+        env["GIT_AUTHOR_EMAIL"] = f"roundhouse@{hostname}"
+        env["GIT_COMMITTER_NAME"] = "roundhouse"
+        env["GIT_COMMITTER_EMAIL"] = f"roundhouse@{hostname}"
+
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, env=env)
+        return result
+    except subprocess.TimeoutExpired:
+        raise ActuationError(f"git {args[0]} timeout after {timeout}s")
+
+def git_startup_check(unit_dir: str):
+    """Check git is available and repo is valid. Raises ActuationError on failure."""
+    # Check git --version (bootstrap mode)
+    try:
+        result = run_git(["version"], unit_dir, timeout=5, bootstrap=True)
+        if result.returncode != 0:
+            print("--actuate requires git on PATH (read-only mode does not); install git and relaunch", file=sys.stderr)
+            sys.exit(2)
+    except ActuationError:
+        print("--actuate requires git on PATH (read-only mode does not); install git and relaunch", file=sys.stderr)
+        sys.exit(2)
+
+    # Check repo present
+    result = run_git(["rev-parse", "--show-toplevel"], unit_dir, bootstrap=True)
+    if result.returncode != 0:
+        print_git_init_instructions(unit_dir)
+        sys.exit(2)
+
+    repo_root = result.stdout.strip()
+    if os.path.realpath(repo_root) != os.path.realpath(unit_dir):
+        print_git_init_instructions(unit_dir)
+        sys.exit(2)
+
+    # Check worktree clean
+    result = run_git(["status", "--porcelain", "--untracked-files=no"], unit_dir, bootstrap=True)
+    if result.stdout.strip():
+        print(f"""--actuate refused: the unit-dir git worktree has uncommitted changes to tracked files
+(a previous rollout may have died mid-apply):
+  {result.stdout.strip()}
+Inspect:   git -C {unit_dir} diff
+Resolve:   commit the change, or discard it with
+           git -C {unit_dir} restore -- <file>
+Then run:  systemctl --user daemon-reload
+Relaunch with --actuate when the worktree is clean.""", file=sys.stderr)
+        sys.exit(2)
+
+def print_git_init_instructions(unit_dir: str):
+    """Print the git init instructions message."""
+    # Get the selected unit filenames
+    units = []
+    if os.path.isdir(unit_dir):
+        for f in os.listdir(unit_dir):
+            if f.endswith('.service'):
+                units.append(f)
+    units.sort()
+
+    unit_names = " ".join(units) if units else "<unit1>.service <unit2>.service ... <unitN>.service"
+
+    print(f"""--actuate refused: {unit_dir} is not a git repository (contract §git).
+Roundhouse never runs `git init` itself. Initialize it as the operator, once:
+
+  cd {unit_dir}
+  git init
+  printf '%s\\n' '*.bak*' '*.roundhouse-tmp' > .gitignore
+  git add .gitignore {unit_names}
+  git commit -m "roundhouse baseline: {len(units)} managed units"
+
+Then relaunch with --actuate.""", file=sys.stderr)
+
+def ensure_token() -> str:
+    """Ensure token exists and is properly permissioned. Returns the token."""
+    global TOKEN, TOKEN_PATH
+
+    # Create directory if needed
+    token_dir = os.path.dirname(TOKEN_PATH)
+    os.makedirs(token_dir, mode=0o700, exist_ok=True)
+
+    # Check if file exists and is readable
+    if os.path.exists(TOKEN_PATH):
+        # Check permissions
+        mode = os.stat(TOKEN_PATH).st_mode
+        if mode & 0o077:
+            print(f"token file {TOKEN_PATH} is group/world-readable; chmod 600 it and relaunch", file=sys.stderr)
+            sys.exit(2)
+
+        # Read token
+        with open(TOKEN_PATH, 'r') as f:
+            token_content = f.read().strip()
+
+        if not token_content:
+            # Empty file, regenerate
+            token = secrets.token_urlsafe(32)
+            _atomic_write(TOKEN_PATH, token.encode() + b'\n')
+            os.chmod(TOKEN_PATH, 0o600)
+            print(f"generated bearer token at {TOKEN_PATH} — paste its contents into the UI", file=sys.stderr)
+            TOKEN = token
+            return token
+
+        TOKEN = token_content
+        return token_content
+    else:
+        # Generate new token
+        token = secrets.token_urlsafe(32)
+        _atomic_write(TOKEN_PATH, token.encode() + b'\n')
+        os.chmod(TOKEN_PATH, 0o600)
+        print(f"generated bearer token at {TOKEN_PATH} — paste its contents into the UI", file=sys.stderr)
+        TOKEN = token
+        return token
+
+def check_bearer(handler) -> Optional[int]:
+    """Check authorization header. Returns HTTP status to fail with, or None if ok."""
+    if not ACTUATE_ARMED:
+        return 403
+
+    auth_header = handler.headers.get('Authorization', '')
+    if not auth_header.startswith('Bearer '):
+        return 401
+
+    token = auth_header[7:]  # Strip "Bearer "
+    if not hmac.compare_digest(token, TOKEN or ''):
+        return 401
+
+    return None
+
+def parse_timeout_start_sec(val: Optional[str]) -> int:
+    """Parse TimeoutStartSec value to seconds."""
+    if not val or not val.strip():
+        return 90
+
+    val = val.strip()
+
+    # Try plain seconds
+    if val.isdigit():
+        return int(val)
+
+    # Try with unit: <digits><unit>
+    m = re.match(r'^(\d+)\s*(s|sec|min)?$', val)
+    if m:
+        num = int(m.group(1))
+        unit = m.group(2)
+        if unit in ('min',):
+            return num * 60
+        return num
+
+    # Default
+    return 90
+
+# Edit and splice engine
+@dataclass
+class Edit:
+    """A field edit to be spliced into a file."""
+    field: str              # canonical name or "unknown:<flag-text>"
+    flag: str               # flag as written (e.g. "-c")
+    old_text: str           # current decoded value
+    new_text: str           # submitted value
+    span: tuple             # (start, end) of value bytes in raw
+    quote: str              # '' or "'"
+
+def plan_edits(unit: UnitFile, changes: Dict[str, str]) -> List[Edit]:
+    """Validate and plan edits from user changes."""
+    if not unit.exec_start:
+        raise EditError("no_exec_start", "unit has no ExecStart")
+
+    profile = extract_param_profile(unit.exec_start.engine_argv)
+    edits = []
+
+    for key, new_value in changes.items():
+        # Resolve the span
+        span_info = None
+        flag_text = None
+        old_text = None
+        quote = ''
+
+        # Known field
+        if key in profile['spans']:
+            span_info = profile['spans'][key]
+            if 'value' not in span_info:
+                raise EditError("field_not_editable", f"field {key} has no value span")
+            value_span = span_info['value']
+            flag_text = key
+        else:
+            # Unknown field
+            if not key.startswith("unknown:"):
+                raise EditError("field_not_editable", f"unknown field {key}")
+            flag_text = key[8:]  # Remove "unknown:" prefix
+
+            # Find matching unknown flag
+            found = False
+            for unk in profile['unknown_flags']:
+                if unk['flag'] == flag_text and unk['value_span']:
+                    span_info = unk
+                    value_span = unk['value_span']
+                    found = True
+                    break
+
+            if not found:
+                raise EditError("field_not_editable", f"flag {flag_text} not found or has no value")
+
+        # Get old text
+        start, end = value_span
+        old_raw = unit.raw[start:end]
+
+        # Determine quoting style
+        if old_raw.startswith(b"'"):
+            quote = "'"
+            old_bytes = old_raw[1:-1] if old_raw.endswith(b"'") else old_raw[1:]
+        else:
+            quote = ''
+            old_bytes = old_raw
+
+        old_text = old_bytes.decode('utf-8', errors='replace')
+
+        # Byte safety validate
+        if quote == '':
+            # Unquoted: must match alphanumeric + safe chars
+            if not re.match(r'^[A-Za-z0-9._:/=,+\-]*$', new_value):
+                raise EditError("invalid_value", f"unquoted value contains invalid chars: {new_value}")
+        elif quote == "'":
+            # Single-quoted: no ' or \ or newline
+            if "'" in new_value or "\\" in new_value or "\n" in new_value:
+                raise EditError("invalid_value", "single-quoted value cannot contain quotes, backslashes, or newlines")
+
+        # Remote scheme check
+        if "://" in new_value:
+            raise EditError("remote_scheme", f"value contains remote scheme: {new_value}")
+
+        # No-op check
+        if new_value == old_text:
+            continue  # Skip this edit
+
+        edits.append(Edit(
+            field=key,
+            flag=flag_text,
+            old_text=old_text,
+            new_text=new_value,
+            span=value_span,
+            quote=quote
+        ))
+
+    if not edits:
+        raise EditError("no_change", "no edits after filtering")
+
+    return edits
+
+def render_value_bytes(edit: Edit) -> bytes:
+    """Render an edit as raw bytes (quoted as needed)."""
+    return (edit.quote + edit.new_text + edit.quote).encode('utf-8')
+
+def splice(raw: bytes, edits: List[Edit], provenance: str) -> bytes:
+    """Splice edits into raw bytes at the recorded spans."""
+    # Sort edits by span start, descending (so earlier offsets stay valid)
+    sorted_edits = sorted(edits, key=lambda e: e.span[0], reverse=True)
+
+    # Assert spans are disjoint
+    for i, e1 in enumerate(sorted_edits):
+        for e2 in sorted_edits[i+1:]:
+            if not (e1.span[1] <= e2.span[0] or e2.span[1] <= e1.span[0]):
+                raise EditError("overlapping_spans", f"spans {e1.span} and {e2.span} overlap")
+
+    # Apply edits
+    new_raw = raw
+    for edit in sorted_edits:
+        start, end = edit.span
+        new_raw = new_raw[:start] + render_value_bytes(edit) + new_raw[end:]
+
+    # Append provenance
+    if new_raw and not new_raw.endswith(b'\n'):
+        new_raw += b'\n'
+    new_raw += b'# roundhouse: ' + provenance.encode('utf-8') + b'\n'
+
+    return new_raw
+
+def assert_span_invariants(unit: UnitFile) -> None:
+    """Assert MVP1 span invariants plus the splice-only-affects-spans invariant."""
+    raw = unit.raw
+
+    # (1) Lines reassemble to raw
+    line_bytes = b''.join(raw[l.start:l.end] for l in unit.lines)
+    assert line_bytes == raw, "line invariant failed"
+
+    # (2) ExecStart tokens are accurate
+    if unit.exec_start:
+        for token in unit.exec_start.tokens:
+            assert raw[token.start:token.end] == token.raw, f"token invariant failed for {token.text}"
+
+    # (3) Profile spans are accurate (simplified check)
+    if unit.exec_start:
+        profile = extract_param_profile(unit.exec_start.engine_argv)
+        for field, span_dict in profile['spans'].items():
+            if 'value' in span_dict:
+                start, end = span_dict['value']
+                assert start < end and end <= len(raw), f"span {field} out of bounds"
+
+def verify_splice(old_unit: UnitFile, new_raw: bytes, edits: List[Edit], provenance: str) -> UnitFile:
+    """Verify a splice is correct and return the new parsed unit."""
+    # Parse the new file
+    path = old_unit.path
+    new_unit = parse_unit(path, new_raw)
+
+    # Check (a): Profile equality except edited fields and spans
+    if old_unit.exec_start and new_unit.exec_start:
+        old_profile = extract_param_profile(old_unit.exec_start.engine_argv)
+        new_profile = extract_param_profile(new_unit.exec_start.engine_argv)
+
+        # Build normalized profile dicts (removing spans and raw_argv)
+        def normalize_profile(p):
+            d = {k: v for k, v in p.items() if k not in ('spans', 'raw_argv')}
+            d['unknown_flags'] = [(f['flag'], f['value']) for f in p['unknown_flags']]
+            return d
+
+        old_norm = normalize_profile(old_profile)
+        new_norm = normalize_profile(new_profile)
+
+        # Check edited fields are present, unedited fields are identical
+        edited_fields = {e.field for e in edits}
+        for key in old_norm:
+            if key not in edited_fields:
+                if old_norm.get(key) != new_norm.get(key):
+                    raise VerifyError("profile_changed", f"unedited field {key} changed")
+
+    # Check (b): Comments unchanged except for provenance
+    old_comments = [c['text'] for c in old_unit.comments]
+    new_comments = [c['text'] for c in new_unit.comments]
+    expected_prov = '# roundhouse: ' + provenance
+    if new_comments != old_comments + [expected_prov]:
+        raise VerifyError("comments_changed", "comments don't match expected")
+
+    # Check (c): Span invariants
+    assert_span_invariants(new_unit)
+
+    return new_unit
+
+def unified_diff_text(old: bytes, new: bytes, name: str) -> str:
+    """Generate unified diff text."""
+    old_lines = old.decode('utf-8', errors='replace').splitlines(keepends=True)
+    new_lines = new.decode('utf-8', errors='replace').splitlines(keepends=True)
+
+    diff = difflib.unified_diff(old_lines, new_lines, fromfile=f"{name} (old)", tofile=f"{name} (new)")
+    return ''.join(diff)
+
+def provenance_line(edits: List[Edit], now_utc: datetime) -> str:
+    """Generate a provenance line."""
+    iso_time = now_utc.strftime('%Y-%m-%dT%H:%M:%SZ')
+    # Use canonical field names, in file order (order by span start)
+    sorted_edits = sorted(edits, key=lambda e: e.span[0])
+    edits_text = ', '.join(f"{e.field} {e.old_text} -> {e.new_text}" for e in sorted_edits)
+    return f"{iso_time} {edits_text} via UI"
+
+def commit_message(unit_name: str, edits: List[Edit]) -> str:
+    """Generate a git commit message."""
+    unit_stem = unit_name.replace('.service', '')
+    # Use flag spelling, in file order
+    sorted_edits = sorted(edits, key=lambda e: e.span[0])
+    edits_text = '; '.join(f"{e.flag} {e.old_text} -> {e.new_text}" for e in sorted_edits)
+    return f"roundhouse: {unit_stem} {edits_text}"
+
+def compute_confirm(unit_name: str, old_raw: bytes, edits: List[Edit]) -> str:
+    """Compute the confirmation hash per §E5."""
+    old_hash = hashlib.sha256(old_raw).hexdigest()
+
+    edits_list = [
+        [e.field, e.old_text, e.new_text]
+        for e in sorted(edits, key=lambda x: x.field)
+    ]
+
+    data = {
+        "unit": unit_name,
+        "base": old_hash,
+        "edits": edits_list
+    }
+
+    canonical_json = json.dumps(data, separators=(',', ':'), sort_keys=True)
+    return hashlib.sha256(canonical_json.encode()).hexdigest()
+
+def _atomic_write(path: str, data: bytes) -> None:
+    """Atomically write data to path via tmp+fsync+replace."""
+    dir_path = os.path.dirname(path) or '.'
+
+    # Write to tmp file in same directory
+    tmp_path = path + '.roundhouse-tmp'
+    with open(tmp_path, 'wb') as f:
+        f.write(data)
+        f.flush()
+        os.fsync(f.fileno())
+
+    # Atomic replace
+    os.replace(tmp_path, path)
+
+    # Fsync directory (best effort)
+    try:
+        fd = os.open(dir_path, os.O_RDONLY)
+        os.fsync(fd)
+        os.close(fd)
+    except Exception:
+        pass
 
 
 # ===== SECTION D: MAIN / CLI =====
