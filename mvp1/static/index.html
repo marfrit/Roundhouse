@@ -286,21 +286,341 @@
             color: var(--amber);
             font-weight: bold;
         }
+
+        .mode-badge {
+            display: inline-block;
+            font-size: 0.8em;
+            margin-left: 1em;
+            padding: 0.25em 0.5em;
+            border-radius: 2px;
+        }
+
+        .mode-badge.read-only {
+            background: var(--neutral);
+            color: var(--bg);
+        }
+
+        .mode-badge.actuate {
+            background: var(--amber);
+            color: var(--bg);
+        }
+
+        .token-input-container {
+            display: none;
+            margin-left: 1em;
+            align-items: center;
+            gap: 0.5em;
+        }
+
+        .token-input-container.active {
+            display: flex;
+        }
+
+        #token {
+            padding: 0.25em 0.5em;
+            background: var(--border);
+            color: var(--fg);
+            border: 1px solid var(--border);
+            border-radius: 2px;
+            font-family: monospace;
+            font-size: 0.9em;
+        }
+
+        #token.error {
+            border-color: var(--red);
+        }
+
+        #token-error-msg {
+            color: var(--red);
+            font-size: 0.8em;
+            display: none;
+        }
+
+        .rollout-stepper {
+            display: none;
+            margin-bottom: 1em;
+            padding: 0.75em;
+            background: var(--border);
+            border-radius: 2px;
+        }
+
+        .rollout-stepper.active {
+            display: block;
+        }
+
+        .stepper-phases {
+            display: flex;
+            gap: 0.5em;
+            margin-bottom: 0.5em;
+            flex-wrap: wrap;
+            align-items: center;
+        }
+
+        .phase-chip {
+            display: inline-block;
+            padding: 0.25em 0.5em;
+            border-radius: 2px;
+            background: var(--border);
+            color: var(--fg);
+            font-size: 0.8em;
+            border: 1px solid var(--border);
+        }
+
+        .phase-chip.current {
+            border: 1px solid var(--fg);
+            animation: pulse 1s infinite;
+        }
+
+        .phase-chip.done {
+            background: var(--green);
+            color: var(--bg);
+        }
+
+        .phase-chip.failed {
+            background: var(--red);
+            color: var(--bg);
+        }
+
+        .phase-chip.rolled_back {
+            background: var(--neutral);
+            color: var(--bg);
+        }
+
+        .stepper-detail {
+            font-size: 0.9em;
+            margin-bottom: 0.5em;
+        }
+
+        .rollback-button-container {
+            margin-top: 0.5em;
+            display: none;
+        }
+
+        .rollback-button-container.active {
+            display: block;
+        }
+
+        .edit-form-container {
+            display: none;
+        }
+
+        .edit-form-container.active {
+            display: block;
+            margin-top: 1em;
+        }
+
+        .edit-form-two-column {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 1em;
+            margin-bottom: 1em;
+        }
+
+        @media (max-width: 1200px) {
+            .edit-form-two-column {
+                grid-template-columns: 1fr;
+            }
+        }
+
+        .edit-form-left {
+            display: flex;
+            flex-direction: column;
+            gap: 0.5em;
+        }
+
+        .form-row {
+            display: flex;
+            flex-direction: column;
+            gap: 0.25em;
+        }
+
+        .form-row label {
+            color: var(--neutral);
+            font-size: 0.9em;
+        }
+
+        .form-row input {
+            padding: 0.25em 0.5em;
+            background: var(--border);
+            color: var(--fg);
+            border: 1px solid var(--border);
+            border-radius: 2px;
+            font-family: monospace;
+            font-size: 0.9em;
+        }
+
+        .form-row input:disabled {
+            color: var(--neutral);
+            background: var(--bg);
+            border: 1px dashed var(--border);
+            cursor: not-allowed;
+        }
+
+        .form-row .unknown-tag {
+            color: var(--amber);
+            font-size: 0.8em;
+        }
+
+        .gate-notice {
+            padding: 0.5em;
+            background: var(--border);
+            border-left: 2px solid var(--amber);
+            margin-bottom: 0.5em;
+            font-size: 0.9em;
+            color: var(--amber);
+        }
+
+        .edit-form-right {
+            display: flex;
+            flex-direction: column;
+            gap: 0.5em;
+        }
+
+        .form-buttons {
+            display: flex;
+            gap: 0.5em;
+            margin-top: 1em;
+        }
+
+        button {
+            padding: 0.5em 1em;
+            background: var(--border);
+            border: 1px solid var(--border);
+            color: var(--fg);
+            cursor: pointer;
+            border-radius: 2px;
+            font-family: monospace;
+            font-size: 0.9em;
+        }
+
+        button:hover {
+            background: var(--fg);
+            color: var(--bg);
+        }
+
+        button:disabled {
+            cursor: not-allowed;
+            opacity: 0.5;
+        }
+
+        .modal {
+            display: none;
+            position: fixed;
+            z-index: 1000;
+            left: 0;
+            top: 0;
+            width: 100%;
+            height: 100%;
+            background-color: rgba(0, 0, 0, 0.5);
+        }
+
+        .modal.active {
+            display: flex;
+            align-items: center;
+            justify-content: center;
+        }
+
+        .modal-content {
+            background: var(--bg);
+            padding: 1em;
+            border: 1px solid var(--border);
+            border-radius: 3px;
+            max-width: 90%;
+            max-height: 90vh;
+            overflow-y: auto;
+            max-width: 800px;
+        }
+
+        .modal-heading {
+            font-weight: bold;
+            margin-bottom: 0.5em;
+        }
+
+        .modal-section {
+            margin-bottom: 1em;
+        }
+
+        .diff-output {
+            background: var(--border);
+            padding: 0.5em;
+            border-radius: 2px;
+            margin-bottom: 0.5em;
+            overflow-x: auto;
+        }
+
+        .diff-output pre {
+            margin: 0;
+            font-size: 0.85em;
+            line-height: 1.4;
+        }
+
+        .preflight-list {
+            margin: 0.5em 0;
+        }
+
+        .preflight-item {
+            padding: 0.25em 0;
+            font-size: 0.9em;
+        }
+
+        .preflight-item.ok {
+            color: var(--green);
+        }
+
+        .preflight-item.fail {
+            color: var(--red);
+        }
+
+        .preflight-item.notice {
+            color: var(--amber);
+        }
+
+        .edit-button {
+            margin-top: 0.5em;
+        }
+
+        .retired-note {
+            padding: 0.5em;
+            background: var(--border);
+            color: var(--neutral);
+            border-left: 2px solid var(--neutral);
+            margin-top: 0.5em;
+        }
     </style>
 </head>
 <body>
     <div class="header">
         <div class="header-line">
-            <span class="header-title">ROUNDHOUSE · <span id="hostname">?</span> · kernel <span id="kernel">?</span></span>
-            <div class="mem-gauge">
-                mem
-                <div class="gauge-bar">
-                    <div class="gauge-fill" id="mem-fill"></div>
+            <span class="header-title">ROUNDHOUSE · <span id="hostname">?</span> · kernel <span id="kernel">?</span>
+                <span class="mode-badge" id="mode-badge"></span>
+            </span>
+            <div style="display: flex; align-items: center;">
+                <div class="token-input-container" id="token-container">
+                    <label for="token">token:</label>
+                    <input type="password" id="token" placeholder="~/.config/roundhouse/token">
+                    <span id="token-error-msg"></span>
                 </div>
-                <span id="mem-text">? / ?</span>
+                <div class="mem-gauge">
+                    mem
+                    <div class="gauge-bar">
+                        <div class="gauge-fill" id="mem-fill"></div>
+                    </div>
+                    <span id="mem-text">? / ?</span>
+                </div>
             </div>
         </div>
         <div class="degraded-banner" id="degraded-banner"></div>
+    </div>
+
+    <div class="rollout-stepper" id="rollout-stepper">
+        <div class="stepper-phases" id="stepper-phases"></div>
+        <div class="stepper-detail" id="stepper-detail"></div>
+        <div class="rollback-button-container" id="rollback-container">
+            <button onclick="rollback()" id="rollback-button">roll back to previous config</button>
+            <span style="margin-left: 0.5em; font-size: 0.9em;">
+                <a href="#" id="dismiss-link" onclick="dismiss(event)" style="color: var(--fg); text-decoration: underline;">dismiss</a>
+            </span>
+        </div>
     </div>
 
     <div class="section" id="active-section">
@@ -339,8 +659,30 @@
     </div>
 
     <div class="detail-pane" id="detail-pane">
-        <button onclick="closeDetail()" style="float: right; background: var(--border); border: none; color: var(--fg); cursor: pointer; padding: 0.25em 0.5em;">Close</button>
+        <button onclick="closeDetail()" style="float: right; background: var(--border); border: none; color: var(--fg); cursor: pointer; padding: 0.25em 0.5em; border: 1px solid var(--border);">Close</button>
         <div id="detail-content"></div>
+        <div class="edit-form-container" id="edit-form-container"></div>
+    </div>
+
+    <div class="modal" id="diff-modal">
+        <div class="modal-content">
+            <div class="modal-heading">Rollout Preview</div>
+            <div class="modal-section">
+                <div class="modal-heading" style="font-weight: normal; font-size: 0.9em;">Diff</div>
+                <div class="diff-output">
+                    <pre id="diff-text" class="diff"></pre>
+                </div>
+            </div>
+            <div class="modal-section">
+                <div class="modal-heading" style="font-weight: normal; font-size: 0.9em;">Preflight checks</div>
+                <div class="preflight-list" id="preflight-list"></div>
+                <div id="notices-list"></div>
+            </div>
+            <div class="form-buttons">
+                <button id="apply-button" onclick="applyRollout()" disabled>apply</button>
+                <button onclick="closeDiffModal()">cancel</button>
+            </div>
+        </div>
     </div>
 
     <script>
@@ -351,15 +693,24 @@
             mem: { total_bytes: 0, available_bytes: 0 },
             sources: { journal: 'ok', systemctl: 'ok' },
             units: [],
-            ports: {}
+            ports: {},
+            mode: 'read-only',
+            rollout: null,
+            self_port: 8090
         };
+
+        let token = '';
+        let currentEditUnit = null;
+        let pendingDiffData = null;
+        let pendingRolloutId = null;
 
         const eventSource = new EventSource('/api/events');
 
         eventSource.addEventListener('snapshot', (e) => {
             const data = JSON.parse(e.data);
-            state = data;
+            Object.assign(state, data);
             render();
+            renderRolloutStepper();
             // The banner reflects sensing health, not just the SSE connection:
             // a dead journal tail with a healthy connection must still show.
             const downSources = Object.entries(data.sources || {})
@@ -396,6 +747,12 @@
             }
         });
 
+        eventSource.addEventListener('rollout', (e) => {
+            const data = JSON.parse(e.data);
+            state.rollout = data;
+            renderRolloutStepper();
+        });
+
         eventSource.onerror = () => {
             showDegradedBanner('sensing degraded (connection lost)');
         };
@@ -409,6 +766,20 @@
         function renderHeader() {
             document.getElementById('hostname').textContent = state.host || '?';
             document.getElementById('kernel').textContent = state.kernel || '?';
+
+            // Mode badge
+            const modeBadge = document.getElementById('mode-badge');
+            const mode = state.mode || 'read-only';
+            modeBadge.textContent = mode === 'actuate' ? '[ACTUATE]' : '[READ-ONLY]';
+            modeBadge.className = 'mode-badge ' + (mode === 'actuate' ? 'actuate' : 'read-only');
+
+            // Token input
+            const tokenContainer = document.getElementById('token-container');
+            if (mode === 'actuate') {
+                tokenContainer.classList.add('active');
+            } else {
+                tokenContainer.classList.remove('active');
+            }
 
             const total = state.mem.total_bytes || 1;
             const used = (state.mem.total_bytes || 0) - (state.mem.available_bytes || 0);
@@ -633,10 +1004,36 @@
             const content = document.getElementById('detail-content');
             content.replaceChildren();  // Clear
 
-            // Title
+            currentEditUnit = unit;
+
+            // Title with edit button
+            const titleDiv = document.createElement('div');
+            titleDiv.style.display = 'flex';
+            titleDiv.style.justifyContent = 'space-between';
+            titleDiv.style.alignItems = 'center';
+
             const title = document.createElement('h3');
             title.textContent = unit.unit;
-            content.appendChild(title);
+            title.style.margin = '0';
+            titleDiv.appendChild(title);
+
+            const mode = state.mode || 'read-only';
+            if (mode === 'actuate' && !unit.retired) {
+                const editBtn = document.createElement('button');
+                editBtn.textContent = 'edit';
+                editBtn.className = 'edit-button';
+                editBtn.onclick = () => showEditForm(unit);
+                titleDiv.appendChild(editBtn);
+            }
+
+            if (unit.retired) {
+                const retiredNote = document.createElement('div');
+                retiredNote.className = 'retired-note';
+                retiredNote.textContent = '[RETIRED] — not editable';
+                titleDiv.appendChild(retiredNote);
+            }
+
+            content.appendChild(titleDiv);
 
             // WHAT RUNS table
             const whatRunsHeading = document.createElement('h4');
@@ -792,6 +1189,433 @@
 
         // Initial render
         render();
+
+        // Event listener for token input
+        document.getElementById('token').addEventListener('input', (e) => {
+            token = e.target.value;
+            e.target.classList.remove('error');
+            document.getElementById('token-error-msg').style.display = 'none';
+        });
+
+        function makeAuthHeaders() {
+            const headers = { 'Content-Type': 'application/json' };
+            if (token) {
+                headers['Authorization'] = 'Bearer ' + token;
+            }
+            return headers;
+        }
+
+        function showTokenError() {
+            const input = document.getElementById('token');
+            input.classList.add('error');
+            const msg = document.getElementById('token-error-msg');
+            msg.textContent = 'token rejected';
+            msg.style.display = 'inline';
+        }
+
+        function showEditForm(unit) {
+            const container = document.getElementById('edit-form-container');
+            container.replaceChildren();
+            container.classList.add('active');
+
+            const profile = unit.param_profile || {};
+            const spans = profile.spans || {};
+            const unknownFlags = profile.unknown_flags || [];
+
+            // Create fields array and sort by span start
+            const fields = [];
+            for (const [fieldName, spanData] of Object.entries(spans)) {
+                if (spanData.value) {
+                    const flag = spanData.flag;
+                    const value = spanData.value;
+                    const start = value[0];
+                    fields.push({
+                        type: 'known',
+                        field: fieldName,
+                        flag: flag,
+                        start: start,
+                        spanData: spanData
+                    });
+                }
+            }
+
+            for (const unk of unknownFlags) {
+                if (unk.value_span) {
+                    fields.push({
+                        type: 'unknown',
+                        field: 'unknown:' + unk.flag,
+                        flag: unk.flag,
+                        start: unk.value_span[0],
+                        unkData: unk
+                    });
+                }
+            }
+
+            // Sort by start position
+            fields.sort((a, b) => a.start - b.start);
+
+            // Build form HTML
+            const formContainer = document.createElement('div');
+            formContainer.className = 'edit-form-two-column';
+
+            const leftDiv = document.createElement('div');
+            leftDiv.className = 'edit-form-left';
+
+            // Gate notice
+            if (unit.gate && unit.gate.kind === 'STANDBY') {
+                const notice = document.createElement('div');
+                notice.className = 'gate-notice';
+                notice.textContent = 'Unit is kernel-gated (STANDBY): the edit can be applied but the unit cannot be started on this kernel';
+                leftDiv.appendChild(notice);
+            }
+
+            // Form fields
+            for (const field of fields) {
+                const row = document.createElement('div');
+                row.className = 'form-row';
+
+                const label = document.createElement('label');
+                let labelText = field.field;
+                if (field.type === 'known' && field.spanData.flag) {
+                    labelText += ' (' + field.spanData.flag + ')';
+                } else if (field.type === 'unknown') {
+                    labelText = field.flag;
+                }
+                label.textContent = labelText;
+                row.appendChild(label);
+
+                const input = document.createElement('input');
+                input.type = 'text';
+                input.id = 'field_' + field.field.replace(/[^a-z0-9_]/gi, '_');
+                input.disabled = false;
+
+                if (field.type === 'known') {
+                    const fieldTypeInfo = getFieldTypeInfo(field.field);
+                    if (fieldTypeInfo.type === 'number') {
+                        input.type = 'number';
+                        input.step = fieldTypeInfo.step || '1';
+                    }
+                    // Get current value - need to parse from raw bytes
+                    input.value = field.spanData.value_text || '';
+                } else if (field.type === 'unknown') {
+                    input.value = field.unkData.value || '';
+                    const tag = document.createElement('span');
+                    tag.className = 'unknown-tag';
+                    tag.textContent = 'unknown';
+                    row.appendChild(tag);
+                }
+
+                row.appendChild(input);
+                leftDiv.appendChild(row);
+            }
+
+            // Value-less flag handling
+            for (const spanData of Object.values(spans)) {
+                if (!spanData.value) {
+                    const row = document.createElement('div');
+                    row.className = 'form-row';
+                    const input = document.createElement('input');
+                    input.type = 'text';
+                    input.disabled = true;
+                    input.title = 'flag add/remove is not an MVP2 edit';
+                    input.value = spanData.flag || '';
+                    row.appendChild(input);
+                    leftDiv.appendChild(row);
+                }
+            }
+
+            // Right side: operator notes
+            const rightDiv = document.createElement('div');
+            rightDiv.className = 'edit-form-right';
+            const notesHeading = document.createElement('h4');
+            notesHeading.textContent = "OPERATOR'S NOTES";
+            notesHeading.style.margin = '0 0 0.5em 0';
+            rightDiv.appendChild(notesHeading);
+
+            const notesPre = document.createElement('pre');
+            notesPre.className = 'operator-notes';
+            if (unit.comments && unit.comments.length > 0) {
+                const noteText = unit.comments.map(c => c.text).join('\n');
+                notesPre.textContent = noteText;
+            } else {
+                notesPre.textContent = '(no operator notes)';
+            }
+            rightDiv.appendChild(notesPre);
+
+            formContainer.appendChild(leftDiv);
+            formContainer.appendChild(rightDiv);
+            container.appendChild(formContainer);
+
+            // Buttons
+            const buttons = document.createElement('div');
+            buttons.className = 'form-buttons';
+            const submitBtn = document.createElement('button');
+            submitBtn.textContent = 'preview';
+            submitBtn.onclick = () => previewEdit(unit);
+            const cancelBtn = document.createElement('button');
+            cancelBtn.textContent = 'cancel';
+            cancelBtn.onclick = () => container.classList.remove('active');
+            buttons.appendChild(submitBtn);
+            buttons.appendChild(cancelBtn);
+            container.appendChild(buttons);
+        }
+
+        function getFieldTypeInfo(field) {
+            const fieldTypes = {
+                'ctx': 'number',
+                'port': 'number',
+                'threads': 'number',
+                'threads_batch': 'number',
+                'n_predict': 'number',
+                'reasoning_budget': 'number',
+                'cpu_strict': 'number',
+                'cpu_strict_batch': 'number'
+            };
+            const floatFields = ['flash_attn'];
+            if (floatFields.includes(field)) return { type: 'number', step: 'any' };
+            if (fieldTypes[field]) return { type: 'number', step: '1' };
+            return { type: 'text' };
+        }
+
+        function collectFormValues(unit) {
+            const edits = {};
+            const profile = unit.param_profile || {};
+            const spans = profile.spans || {};
+
+            for (const [fieldName, spanData] of Object.entries(spans)) {
+                if (spanData.value) {
+                    const inputId = 'field_' + fieldName.replace(/[^a-z0-9_]/gi, '_');
+                    const input = document.getElementById(inputId);
+                    if (input && input.value !== (spanData.value_text || '')) {
+                        edits[fieldName] = input.value;
+                    }
+                }
+            }
+
+            const unknownFlags = profile.unknown_flags || [];
+            for (const unk of unknownFlags) {
+                if (unk.value_span) {
+                    const inputId = 'field_unknown_' + unk.flag.replace(/[^a-z0-9_]/gi, '_');
+                    const input = document.getElementById('field_unknown:' + unk.flag.replace(/[^a-z0-9_]/gi, '_'));
+                    if (input && input.value !== (unk.value || '')) {
+                        edits['unknown:' + unk.flag] = input.value;
+                    }
+                }
+            }
+
+            return edits;
+        }
+
+        function previewEdit(unit) {
+            const edits = collectFormValues(unit);
+            if (Object.keys(edits).length === 0) {
+                alert('No changes made');
+                return;
+            }
+
+            const body = JSON.stringify({ edits });
+            fetch('/api/units/' + encodeURIComponent(unit.unit) + '/edit', {
+                method: 'POST',
+                headers: makeAuthHeaders(),
+                body: body
+            })
+                .then(r => {
+                    if (r.status === 401) {
+                        showTokenError();
+                        throw new Error('Unauthorized');
+                    }
+                    return r.json().then(data => ({ status: r.status, data }));
+                })
+                .then(({ status, data }) => {
+                    if (status === 200) {
+                        pendingDiffData = data;
+                        pendingRolloutId = null;
+                        showDiffModal(data);
+                    } else if (status === 422) {
+                        alert('Preflight check failed:\n' + (data.checks || JSON.stringify(data)));
+                    } else {
+                        alert('Error: ' + (data.error || 'unknown error'));
+                    }
+                })
+                .catch(e => console.error('Error:', e));
+        }
+
+        function showDiffModal(data) {
+            const modal = document.getElementById('diff-modal');
+            document.getElementById('diff-text').textContent = data.diff || '';
+
+            const preflight = data.preflight || { ok: false, checks: [] };
+            const preflight_list = document.getElementById('preflight-list');
+            preflight_list.replaceChildren();
+
+            for (const check of preflight.checks || []) {
+                const item = document.createElement('div');
+                item.className = 'preflight-item ' + (check.ok ? 'ok' : 'fail');
+                item.textContent = (check.ok ? '✓ ' : '✗ ') + check.check + ': ' + (check.detail || '');
+                preflight_list.appendChild(item);
+            }
+
+            const notices = data.notices || [];
+            const noticesList = document.getElementById('notices-list');
+            noticesList.replaceChildren();
+            for (const notice of notices) {
+                const item = document.createElement('div');
+                item.className = 'preflight-item notice';
+                item.textContent = '⚠ ' + notice;
+                noticesList.appendChild(item);
+            }
+
+            const applyBtn = document.getElementById('apply-button');
+            applyBtn.disabled = !preflight.ok;
+
+            modal.classList.add('active');
+        }
+
+        function closeDiffModal() {
+            document.getElementById('diff-modal').classList.remove('active');
+        }
+
+        function applyRollout() {
+            if (!pendingDiffData || !currentEditUnit) return;
+
+            const edits = collectFormValues(currentEditUnit);
+            const body = JSON.stringify({
+                edits: edits,
+                confirm: pendingDiffData.confirm
+            });
+
+            fetch('/api/units/' + encodeURIComponent(currentEditUnit.unit) + '/rollout', {
+                method: 'POST',
+                headers: makeAuthHeaders(),
+                body: body
+            })
+                .then(r => {
+                    if (r.status === 401) {
+                        showTokenError();
+                        throw new Error('Unauthorized');
+                    }
+                    return r.json().then(data => ({ status: r.status, data }));
+                })
+                .then(({ status, data }) => {
+                    if (status === 202) {
+                        closeDiffModal();
+                        document.getElementById('edit-form-container').classList.remove('active');
+                        state.rollout = data;
+                        renderRolloutStepper();
+                    } else if (status === 409) {
+                        if (data.error === 'preview_stale') {
+                            alert('File changed on disk — re-previewing');
+                            previewEdit(currentEditUnit);
+                        } else {
+                            alert('Error: ' + data.error);
+                        }
+                    } else {
+                        alert('Error: ' + (data.error || 'unknown error'));
+                    }
+                })
+                .catch(e => console.error('Error:', e));
+        }
+
+        function renderRolloutStepper() {
+            const stepper = document.getElementById('rollout-stepper');
+            const rollout = state.rollout;
+
+            if (!rollout) {
+                stepper.classList.remove('active');
+                return;
+            }
+
+            stepper.classList.add('active');
+
+            const phases = ['preflight', 'applying', 'reloading', 'starting', 'watching', 'done'];
+            const currentPhase = rollout.phase || 'preflight';
+
+            const phasesDiv = document.getElementById('stepper-phases');
+            phasesDiv.replaceChildren();
+
+            for (const phase of phases) {
+                const chip = document.createElement('div');
+                chip.className = 'phase-chip';
+                chip.textContent = phase;
+
+                if (phase === currentPhase) {
+                    chip.classList.add('current');
+                }
+                if (phase === 'done' && rollout.ok) {
+                    chip.classList.add('done');
+                }
+                if (rollout.failure && (phase === currentPhase || (phase === 'done' && rollout.phase === 'failed'))) {
+                    chip.classList.add('failed');
+                }
+                if (rollout.phase === 'rolled_back') {
+                    chip.classList.add('rolled_back');
+                }
+
+                phasesDiv.appendChild(chip);
+            }
+
+            if (rollout.phase === 'rolling_back') {
+                const rollbackChip = document.createElement('div');
+                rollbackChip.className = 'phase-chip current';
+                rollbackChip.textContent = 'rolling_back';
+                phasesDiv.appendChild(rollbackChip);
+            }
+
+            const detailDiv = document.getElementById('stepper-detail');
+            detailDiv.textContent = (rollout.detail || '');
+
+            const rollbackContainer = document.getElementById('rollback-container');
+            if (rollout.failure && rollout.rollback && rollout.rollback.offered) {
+                rollbackContainer.classList.add('active');
+            } else {
+                rollbackContainer.classList.remove('active');
+            }
+        }
+
+        function rollback() {
+            if (!state.rollout) return;
+            const id = state.rollout.rollout_id;
+            fetch('/api/rollouts/' + encodeURIComponent(id) + '/rollback', {
+                method: 'POST',
+                headers: makeAuthHeaders(),
+                body: '{}'
+            })
+                .then(r => {
+                    if (r.status === 401) {
+                        showTokenError();
+                    }
+                    return r.json();
+                })
+                .then(data => {
+                    if (data.error) {
+                        alert('Error: ' + data.error);
+                    }
+                })
+                .catch(e => console.error('Error:', e));
+        }
+
+        function dismiss(e) {
+            e.preventDefault();
+            if (!state.rollout) return;
+            const id = state.rollout.rollout_id;
+            fetch('/api/rollouts/' + encodeURIComponent(id) + '/dismiss', {
+                method: 'POST',
+                headers: makeAuthHeaders(),
+                body: '{}'
+            })
+                .then(r => {
+                    if (r.status === 401) {
+                        showTokenError();
+                    }
+                    return r.json();
+                })
+                .then(data => {
+                    if (data.error) {
+                        alert('Error: ' + data.error);
+                    }
+                })
+                .catch(e => console.error('Error:', e));
+        }
     </script>
 </body>
 </html>
