@@ -1071,19 +1071,52 @@ class TestWriteGuards(unittest.TestCase):
                                 if not found:
                                     self.fail(f"Path.open with write mode found outside {write_funcs}")
 
-    def test_outbound_connect_confined(self):
-        """§6.1 guard: socket.create_connection and socket.socket() only in _probe_peer.
+    def test_listener_construction_confined(self):
+        """§6.1 guard: ThreadingHTTPServer construction only in _make_listener (§L8).
 
-        Three legs:
-        (a) socket.create_connection and socket.socket() must be in PROBE_CALLSITES
-        (b) Exactly one create_connection exists (in _probe_peer's default argument)
-        (c) No send/recv/makefile within _probe_peer (connect-and-close only)
+        Every ast.Call whose func resolves to ThreadingHTTPServer has _enclosing_func
+        in SERVER_CALLSITES = {'_make_listener'}; exactly ONE such call exists
+        (the class definition is not a Call and needs no exemption).
         """
         import ast
         source, tree = self._tree()
         parents = self._parents(tree)
 
-        PROBE_CALLSITES = {'_probe_peer'}
+        SERVER_CALLSITES = {'_make_listener'}
+        server_call_count = 0
+        violations = []
+
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Call):
+                # Check if this is a ThreadingHTTPServer(...) call
+                if isinstance(node.func, ast.Name) and node.func.id == 'ThreadingHTTPServer':
+                    server_call_count += 1
+                    func_name = self._enclosing_func(node, parents)
+                    if func_name not in SERVER_CALLSITES:
+                        violations.append((node.lineno, 'ThreadingHTTPServer', func_name))
+
+        self.assertEqual(violations, [],
+                        f"ThreadingHTTPServer construction outside {SERVER_CALLSITES}: {violations}")
+
+        self.assertEqual(server_call_count, 1,
+                        f"Found {server_call_count} ThreadingHTTPServer(...) calls; "
+                        "expected exactly 1 (in _make_listener)")
+
+    def test_outbound_connect_confined(self):
+        """§6.1 guard evolved: socket.create_connection and socket.socket() only in PROBE_CALLSITES.
+
+        Five legs (§L8):
+        (a) socket.create_connection and socket.socket() must be in PROBE_CALLSITES
+        (b) Exactly one create_connection exists (in _probe_peer's default argument)
+        (c) No send/recv/makefile within _probe_peer (connect-and-close only)
+        (d) No connect-attrs inside _presence_probe (bind-only)
+        (e) No bind attrs inside _probe_peer (connect-only)
+        """
+        import ast
+        source, tree = self._tree()
+        parents = self._parents(tree)
+
+        PROBE_CALLSITES = {'_probe_peer', '_presence_probe'}
         CONNECT_ATTRS = {'create_connection', 'connect', 'connect_ex'}
         FORBIDDEN_SOCKET_METHODS = {'send', 'sendall', 'sendto', 'recv', 'recv_into', 'makefile', 'sendfile'}
         # sqlite3.connect opens a FILE, not a socket; it is the one benign `connect`
@@ -1093,7 +1126,9 @@ class TestWriteGuards(unittest.TestCase):
 
         violations_callsite = []
         create_connection_count = 0
-        forbidden_in_probe = []
+        forbidden_in_probe_peer = []
+        connect_attrs_in_presence = []
+        bind_attrs_in_probe_peer = []
 
         for node in ast.walk(tree):
             # (a) every connect-shaped attribute, whoever owns it, must sit in a probe
@@ -1118,11 +1153,23 @@ class TestWriteGuards(unittest.TestCase):
                         if func_name not in PROBE_CALLSITES:
                             violations_callsite.append((node.lineno, 'socket.socket', func_name))
 
-            # Check for forbidden socket methods within _probe_peer
+            # (c) Check for forbidden socket methods within _probe_peer
             if isinstance(node, ast.Attribute) and node.attr in FORBIDDEN_SOCKET_METHODS:
                 func_name = self._enclosing_func(node, parents)
                 if func_name == '_probe_peer':
-                    forbidden_in_probe.append((node.lineno, node.attr))
+                    forbidden_in_probe_peer.append((node.lineno, node.attr))
+
+            # (d) Check for connect-attrs inside _presence_probe (should have none)
+            if isinstance(node, ast.Attribute) and node.attr in CONNECT_ATTRS:
+                func_name = self._enclosing_func(node, parents)
+                if func_name == '_presence_probe':
+                    connect_attrs_in_presence.append((node.lineno, node.attr))
+
+            # (e) Check for bind attrs inside _probe_peer (should have none)
+            if isinstance(node, ast.Attribute) and node.attr == 'bind':
+                func_name = self._enclosing_func(node, parents)
+                if func_name == '_probe_peer':
+                    bind_attrs_in_probe_peer.append((node.lineno, node.attr))
 
         # Assertions
         self.assertEqual(violations_callsite, [],
@@ -1135,9 +1182,17 @@ class TestWriteGuards(unittest.TestCase):
                         f"Found {create_connection_count} socket.create_connection nodes; "
                         "expected exactly 1 (the _probe_peer default argument)")
 
-        self.assertEqual(forbidden_in_probe, [],
-                        f"Forbidden socket methods in _probe_peer: {forbidden_in_probe} — "
+        self.assertEqual(forbidden_in_probe_peer, [],
+                        f"Forbidden socket methods in _probe_peer: {forbidden_in_probe_peer} — "
                         "connect-and-close means no send/recv")
+
+        self.assertEqual(connect_attrs_in_presence, [],
+                        f"Connect-attrs in _presence_probe: {connect_attrs_in_presence} — "
+                        "_presence_probe binds, never connects")
+
+        self.assertEqual(bind_attrs_in_probe_peer, [],
+                        f"Bind attrs in _probe_peer: {bind_attrs_in_probe_peer} — "
+                        "_probe_peer connects, never binds")
 
     # ---- MVP8 §8.1: the federated HTTP client is confined and cannot be weakened ----
 

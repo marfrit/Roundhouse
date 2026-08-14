@@ -39,6 +39,7 @@ import hashlib
 import secrets
 import stat
 import difflib
+import errno
 
 # Hard rail: never implemented
 PAID_OFFLOAD = None
@@ -3594,13 +3595,14 @@ class ThreadingHTTPServer(http.server.ThreadingHTTPServer):
     def __init__(self, host_port, handler_class, watcher, event_bus, port,
                  watcher_lock=None, rollout_engine=None, advertise_host=None,
                  peer_watch=None, address_family=None,
-                 peer_interval=None):
+                 peer_interval=None, bind_watch=None):
         self.watcher = watcher
         self.event_bus = event_bus
         self.port = port
         self.rollout_engine = rollout_engine
         self.advertise_host = advertise_host
         self.peer_watch = peer_watch
+        self.bind_watch = bind_watch
         # /api/peers reports the cadence it is actually running at (§5.1), so the
         # drill's 5 s and production's 60 s are both true on the wire. Resolved
         # here, not in the signature: Section F's constants are defined below this
@@ -3633,6 +3635,8 @@ class ThreadingHTTPServer(http.server.ThreadingHTTPServer):
             # serves /api/peers — rows_unlocked must NOT re-acquire (watcher_lock is
             # non-reentrant; recon 3). No PeerWatch declared → the key is [], never absent.
             snapshot['peers'] = self.peer_watch.rows_unlocked() if self.peer_watch else []
+            # §L4: listeners merge here, under the same lock, same pattern as peers.
+            snapshot['listeners'] = self.bind_watch.rows_unlocked() if self.bind_watch else []
             return snapshot
 
 
@@ -3653,6 +3657,12 @@ FLEET_UNIT_KEEP = ('unit', 'rung', 'port', 'alias', 'enabled', 'on_demand', 'ret
 # The contract's Part 2.5 statement, made machine-visible on /api/peers (§5.1). Frozen.
 PEER_MEANS = ('reachable, not healthy: a TCP connect proves something is listening '
               'on that port and nothing more')
+
+# Optional-bind watch constants (§L1, §L3, §L4)
+BIND_RETRY_SEC = 30
+BIND_OPTIONAL_MAX = 8
+RESOLVE_ADDR_MAX = 4
+FLEET_CANDIDATE_MAX = 3
 
 
 def bind_display(addr: str, family: int) -> str:
@@ -3745,6 +3755,434 @@ def parse_bind_list(values: Optional[List[str]]) -> tuple[List[tuple[str, int]],
         errors.append(f"'::' already covers '{other}' — bind one or the other")
 
     return canonical_list, errors
+
+
+def parse_bind_optional(values: Optional[List[str]], mandatory: List[tuple[str, int]]) -> tuple[List[dict], List[str]]:
+    """Parse --bind-optional repeatable/comma-list arguments per §3.1.
+
+    Returns: ([{token, kind, addr, family}, ...], [errors, ...])
+    kind: 'literal' | 'name'
+    addr: canonical address for literals, None for names
+    family: socket.AF_INET/AF_INET6 for literals, None for names
+
+    Errors collected; caller exits with all listed (§3.1).
+    """
+    if values is None:
+        return [], []
+
+    errors = []
+    decls = []
+    seen_literals = set()
+    seen_names_lower = set()
+    mandatory_canonical = {addr for addr, fam in mandatory}
+    mandatory_ipv4_wildcard = any(addr == '0.0.0.0' for addr, fam in mandatory)
+    mandatory_ipv6_wildcard = any(addr == '::' for addr, fam in mandatory)
+
+    # Flatten repeats and comma lists
+    flat = []
+    for val in values:
+        tokens = [t.strip() for t in val.split(',')]
+        for token in tokens:
+            if not token:
+                errors.append(f"empty bind address in '{val}'")
+            else:
+                flat.append(token)
+
+    # Classify and validate each token
+    for token in flat:
+        # Try to parse as literal (strip brackets if present)
+        host = token
+        if host.startswith('[') and host.endswith(']'):
+            host = host[1:-1]
+
+        # Attempt literal parse (IPv4 then IPv6)
+        family = None
+        try:
+            socket.inet_pton(socket.AF_INET, host)
+            family = socket.AF_INET
+        except socket.error:
+            try:
+                socket.inet_pton(socket.AF_INET6, host)
+                family = socket.AF_INET6
+            except socket.error:
+                family = None
+
+        if family is not None:
+            # It's a literal IP address
+            # Canonicalize
+            if family == socket.AF_INET:
+                packed = socket.inet_pton(socket.AF_INET, host)
+                canonical = socket.inet_ntop(socket.AF_INET, packed)
+            else:
+                packed = socket.inet_pton(socket.AF_INET6, host)
+                canonical = socket.inet_ntop(socket.AF_INET6, packed)
+
+            # Check if it's a wildcard
+            if canonical == '0.0.0.0' or canonical == '::':
+                errors.append(f"'{token}': a wildcard cannot be absent — optional binds are for addresses that come and go; bind it with --bind or not at all")
+                continue
+
+            # Check for duplicate literals
+            if canonical in seen_literals:
+                errors.append(f"duplicate bind address: {canonical}")
+                continue
+            seen_literals.add(canonical)
+
+            # Check if in mandatory list
+            if canonical in mandatory_canonical:
+                errors.append(f"'{canonical}' is declared both --bind and --bind-optional — an address is mandatory or optional, not both")
+                continue
+
+            # Check if family is wildcard-covered by mandatory
+            if family == socket.AF_INET and mandatory_ipv4_wildcard:
+                errors.append(f"'0.0.0.0' already covers '{canonical}' — an optional bind behind a wildcard can never matter")
+                continue
+            if family == socket.AF_INET6 and mandatory_ipv6_wildcard:
+                errors.append(f"'::' already covers '{canonical}' — an optional bind behind a wildcard can never matter")
+                continue
+
+            decls.append({
+                'token': token,
+                'kind': 'literal',
+                'addr': canonical,
+                'family': family
+            })
+        else:
+            # Check if it looks like a literal that failed to parse (all digits/dots or contains colon)
+            if re.match(r'^[0-9.]+$', token) or ':' in token:
+                errors.append(f"'{token}': not a valid IP literal")
+                continue
+
+            # It's a name candidate - validate charset
+            if len(token) > 253:
+                errors.append(f"'{token}': hostname too long (> 253 chars)")
+                continue
+            if not re.match(r'^[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?$', token):
+                errors.append(f"'{token}': not a valid address or hostname")
+                continue
+
+            # Check for duplicate names (case-folded)
+            name_lower = token.lower()
+            if name_lower in seen_names_lower:
+                errors.append(f"duplicate hostname: {token}")
+                continue
+            seen_names_lower.add(name_lower)
+
+            decls.append({
+                'token': token,
+                'kind': 'name',
+                'addr': None,
+                'family': None
+            })
+
+    # Check cap
+    if len(decls) > BIND_OPTIONAL_MAX:
+        errors.append(f"too many optional binds ({len(decls)} > {BIND_OPTIONAL_MAX}): each is a listener and a per-cycle presence probe")
+
+    return decls, errors
+
+
+def validate_bind_retry(v: int) -> List[str]:
+    """L3: `--bind-retry SECONDS` (default 30, min 1).
+
+    Below 1 the cadence loop stops being a cadence. Configuration error, batched
+    with the other startup refusals.
+    """
+    if v < 1:
+        return [f'--bind-retry must be at least 1 second (got {v})']
+    return []
+
+
+def _make_listener(addr: str, family: int, port: int, server_kwargs: dict):
+    """THE one listener-construction site (SERVER_CALLSITES, §6.1) — cmd_serve's
+    mandatory loop and BindWatch.cycle both build every server here.
+
+    Args:
+        addr: canonical address (IPv4/IPv6 literal or name)
+        family: socket.AF_INET or socket.AF_INET6
+        port: listening port
+        server_kwargs: shared kwargs for ThreadingHTTPServer ctor
+    """
+    return ThreadingHTTPServer((addr, port), RoundhouseRequestHandler,
+                               address_family=family, **server_kwargs)
+
+
+def _presence_probe(addr: str, family: int, sock_factory=socket.socket) -> tuple[bool, Optional[str]]:
+    """THE one bind-probe site (PROBE_CALLSITES, §6.1). Binds port 0, never connects.
+
+    Returns (present: bool, error: Optional[str]) — only EADDRNOTAVAIL means absent;
+    any other failure reports but reads PRESENT (never tear down a door on a weird errno).
+
+    Args:
+        addr: canonical address to probe
+        family: socket.AF_INET or socket.AF_INET6
+        sock_factory: injectable socket factory (for testing)
+    """
+    s = sock_factory(family, socket.SOCK_STREAM)
+    try:
+        s.bind((addr, 0))
+        return (True, None)
+    except OSError as e:
+        if e.errno == errno.EADDRNOTAVAIL:
+            return (False, None)
+        return (True, f'[Errno {e.errno}] {e.strerror}')
+    finally:
+        s.close()
+
+
+class BindWatch:
+    """Monitor and reconcile optional listener lifecycle per §3.3-3.4.
+
+    Maintains one row per optional+mandatory declaration, idempotent cycle,
+    join-before-close shutdown ordering. Single-writer for servers dict until
+    thread is joined (§L3).
+    """
+
+    def __init__(self, mandatory: List[tuple[str, int]], optional_decls: List[dict],
+                 port: int, server_kwargs: dict, lock: threading.Lock, event_bus: queue.Queue,
+                 shutdown_event: threading.Event, now=time.time, resolver=socket.getaddrinfo,
+                 presence=_presence_probe, make_listener=_make_listener):
+        """Initialize BindWatch with mandatory and optional declarations.
+
+        Args:
+            mandatory: list of (addr, family) tuples
+            optional_decls: list of dicts from parse_bind_optional
+            port: listening port (same for all)
+            server_kwargs: kwargs dict for _make_listener
+            lock: watcher_lock (non-reentrant, for row updates)
+            event_bus: event queue
+            shutdown_event: threading.Event to signal shutdown
+            now: time source (injectable for testing)
+            resolver: name resolver (injectable for testing)
+            presence: presence probe function (injectable for testing)
+            make_listener: listener factory (injectable for testing)
+        """
+        self.mandatory = mandatory
+        self.optional_decls = optional_decls
+        self.port = port
+        self.server_kwargs = server_kwargs
+        self.lock = lock
+        self.event_bus = event_bus
+        self.shutdown_event = shutdown_event
+        self.now = now
+        self.resolver = resolver
+        self.presence = presence
+        self.make_listener = make_listener
+
+        # Servers registry: {addr: (server, thread, family)} — bind-watch-thread-private
+        self.servers = {}
+
+        # Build rows: mandatory first (all bound), then optional (state varies)
+        self.rows_list = []
+        self.wildcard_families = set()
+
+        # Add mandatory rows
+        for addr, family in mandatory:
+            if addr == '0.0.0.0':
+                self.wildcard_families.add(socket.AF_INET)
+            elif addr == '::':
+                self.wildcard_families.add(socket.AF_INET6)
+
+            self.rows_list.append({
+                'addr': addr,
+                'port': port,
+                'kind': 'mandatory',
+                'state': 'bound',
+                'since': now(),
+                'last_error': None,
+                'resolved': None
+            })
+
+        # Add optional rows
+        for decl in optional_decls:
+            if decl['kind'] == 'literal':
+                self.rows_list.append({
+                    'addr': decl['addr'],
+                    'port': port,
+                    'kind': 'optional',
+                    'state': 'absent',
+                    'since': now(),
+                    'last_error': None,
+                    'resolved': None
+                })
+            else:  # name
+                self.rows_list.append({
+                    'addr': decl['token'],  # Store the declared name
+                    'port': port,
+                    'kind': 'optional',
+                    'state': 'absent',
+                    'since': now(),
+                    'last_error': None,
+                    'resolved': []  # Name rows have resolved address list
+                })
+
+    def rows_unlocked(self) -> List[dict]:
+        """Return current listener rows (declaration order). CALLER HOLDS lock.
+
+        L4 shape: {addr, port, kind, state, since, last_error, resolved}
+        """
+        return [dict(row) for row in self.rows_list]
+
+    def cycle(self):
+        """One reconciliation pass; idempotent per §3.3.
+
+        Phases (no lock held except end-of-cycle publish):
+        1. Desire: compute desired set (literals always, names resolved)
+        2. Remove: tear down addresses no longer desired or absent
+        3. Add: bind new desired addresses
+        4. Publish: update rows and emit SSE listener events under lock
+        """
+        desired = {}  # addr -> (family, decl_idx)
+        name_resolutions = {}  # name_token -> [(addr, family), ...]
+        current_ts = self.now()
+        changes = {}  # addr -> (old_state, new_state, error, resolved)
+
+        # Phase 1: Desire - compute what we want bound
+        for decl_idx, decl in enumerate(self.optional_decls):
+            if decl['kind'] == 'literal':
+                canonical = decl['addr']
+                family = decl['family']
+                # Literals are always desired
+                if canonical not in desired:  # First declaration wins
+                    desired[canonical] = (family, decl_idx)
+            else:  # name
+                name = decl['token']
+                try:
+                    # Resolve the name
+                    results = self.resolver(name, None, type=socket.SOCK_STREAM)
+                    # Deduplicate and canonicalize
+                    resolved_set = {}
+                    for family, socktype, proto, canonname, sockaddr in results:
+                        if family == socket.AF_INET:
+                            addr = sockaddr[0]
+                        elif family == socket.AF_INET6:
+                            addr = sockaddr[0]
+                        else:
+                            continue
+                        if addr not in resolved_set:
+                            resolved_set[addr] = family
+
+                    # Cap at RESOLVE_ADDR_MAX
+                    resolved_addrs = list(resolved_set.items())[:RESOLVE_ADDR_MAX]
+                    name_resolutions[name] = resolved_addrs
+
+                    # Add to desired (first decl wins, filter wildcards and mandatory)
+                    for addr, family in resolved_addrs:
+                        if addr not in desired:
+                            # Skip if family is wildcard-covered
+                            if family in self.wildcard_families:
+                                continue
+                            # Skip if in mandatory set
+                            if any(maddr == addr for maddr, _ in self.mandatory):
+                                continue
+                            desired[addr] = (family, decl_idx)
+                except (socket.gaierror, Exception):
+                    name_resolutions[name] = []
+
+        # Phase 2: Remove - addresses no longer desired or now absent
+        to_remove = []
+        for addr in list(self.servers.keys()):
+            if addr not in desired:
+                to_remove.append((addr, 'resolution changed', None))
+            else:
+                # Check if present via probe
+                family, _ = desired[addr]
+                present, error = self.presence(addr, family)
+                if not present:
+                    to_remove.append((addr, 'address gone', None))
+
+        for addr, reason, _ in to_remove:
+            try:
+                srv, thread, family = self.servers[addr]
+                srv.shutdown()
+                srv.server_close()
+                if thread:
+                    thread.join(timeout=5.0)
+                del self.servers[addr]
+                print(f"Roundhouse optional bind released {bind_display(addr, family)}:{self.port} ({reason})", flush=True)
+            except Exception:
+                pass
+
+        # Phase 3: Add - new desired addresses
+        for addr, (family, decl_idx) in desired.items():
+            if addr not in self.servers:
+                try:
+                    srv = self.make_listener(addr, family, self.port, self.server_kwargs)
+                    # Phase 3 race gate: if shutdown was set during bind, close and return
+                    if self.shutdown_event.is_set():
+                        srv.server_close()
+                        return
+                    # Start daemon thread
+                    thread_name = f'http-opt-{addr}'
+                    thread = threading.Thread(target=srv.serve_forever, daemon=True,
+                                             name=thread_name)
+                    thread.start()
+                    self.servers[addr] = (srv, thread, family)
+                    print(f"Roundhouse optional bind bound http://{bind_display(addr, family)}:{self.port}", flush=True)
+                except OSError as e:
+                    # Classify error per L2: only EADDRNOTAVAIL is absence
+                    if e.errno == errno.EADDRNOTAVAIL:
+                        changes[addr] = ('absent', 'absent', None, None)
+                    else:
+                        changes[addr] = ('absent', 'error', f'[Errno {e.errno}] {e.strerror}', None)
+
+        # Phase 4: Publish updates under lock
+        with self.lock:
+            for row_idx, row in enumerate(self.rows_list):
+                if row['kind'] == 'mandatory':
+                    continue
+
+                # Determine new state for this row
+                addr = row['addr']
+                old_state = row['state']
+                new_state = old_state
+                last_error = None
+                resolved = None
+
+                # Check if this is a name row or literal row
+                is_name_row = any(decl['token'] == addr and decl['kind'] == 'name'
+                                 for decl in self.optional_decls)
+
+                if is_name_row:
+                    # Name row: check resolved addresses
+                    resolved_list = [r[0] for r in name_resolutions.get(addr, [])]
+                    resolved = resolved_list
+
+                    # Name row is bound if any resolved address is bound
+                    bound_addrs = [r[0] for r in name_resolutions.get(addr, [])
+                                   if r[0] in self.servers]
+                    if bound_addrs:
+                        new_state = 'bound'
+                    elif resolved_list:
+                        # Resolved but not bound - check errors
+                        new_state = 'error'
+                    else:
+                        # Resolution failed
+                        new_state = 'absent'
+                else:
+                    # Literal row
+                    if addr in self.servers:
+                        new_state = 'bound'
+                    elif addr in changes:
+                        new_state = changes[addr][1]
+                        last_error = changes[addr][2]
+                    else:
+                        new_state = 'absent'
+
+                # Update row
+                row['state'] = new_state
+                row['last_error'] = last_error
+                if is_name_row:
+                    row['resolved'] = resolved if resolved else []
+
+                # Emit event on transition
+                if old_state != new_state:
+                    row['since'] = current_ts
+                    payload = {
+                        **row,
+                        'prev_state': old_state
+                    }
+                    self.event_bus.put_nowait(('listener', payload))
 
 
 def parse_peer_decls(values: Optional[List[str]]) -> tuple[dict[str, tuple[str, int]], List[str]]:
@@ -7977,6 +8415,10 @@ def main():
     parser.add_argument('--actuate', action='store_true', help='Enable rollouts (requires git)')
     parser.add_argument('--bind', action='append', default=None,
                         help='Bind address(es); repeatable and/or comma-separated; default 0.0.0.0')
+    parser.add_argument('--bind-optional', action='append', default=None,
+                        help='Optional bind address(es) ADDR|NAME; repeatable and/or comma-separated; default none')
+    parser.add_argument('--bind-retry', type=int, default=BIND_RETRY_SEC,
+                        help=f'Optional bind re-probe cadence in seconds (default: {BIND_RETRY_SEC})')
     parser.add_argument('--peer', action='append', default=None,
                         help='Peer declaration NAME=HOST:PORT; repeatable, max 8')
     parser.add_argument('--fleet-peer', action='append', default=None,
@@ -8376,13 +8818,15 @@ def cmd_serve(args):
     journal_thread = threading.Thread(target=journal_with_backfill, daemon=True)
     journal_thread.start()
 
-    # Parse and validate --bind, --peer, and --fleet-peer arguments (§3.1, §4.1, §3.1 K1)
+    # Parse and validate --bind, --bind-optional, --peer, and --fleet-peer arguments (§3.1, §L1, §4.1, K1)
     bind_list, bind_errors = parse_bind_list(args.bind)
+    optional_decls, optional_errors = parse_bind_optional(args.bind_optional, bind_list)
     peer_decls, peer_errors = parse_peer_decls(args.peer)
     fleet_decls, fleet_errors = parse_fleet_peer_decls(args.fleet_peer)
+    bind_retry_errors = validate_bind_retry(args.bind_retry)
 
     # Collect all errors (J3: every parse/validation offense is reported before the exit)
-    all_errors = bind_errors + peer_errors + fleet_errors + validate_peer_interval(args.peer_interval)
+    all_errors = bind_errors + optional_errors + peer_errors + fleet_errors + validate_peer_interval(args.peer_interval) + bind_retry_errors
     if all_errors:
         for error in all_errors:
             print(error, file=sys.stderr)
@@ -8419,26 +8863,32 @@ def cmd_serve(args):
     # Create PeerWatch (before servers, before threads — J6 construction order, K1)
     peer_watch = PeerWatch(all_declared, watcher_lock, event_bus, fleet=fleet_urls) if all_declared else None
 
-    # Start HTTP servers (all-or-nothing multi-bind loop per §3.3, J1)
+    # Start HTTP servers (all-or-nothing multi-bind loop per §3.3, J1, §L3)
     try:
+        # Build server_kwargs once (§3.2 — passed to _make_listener and BindWatch)
+        server_kwargs = {
+            'watcher': watcher,
+            'event_bus': event_bus,
+            'port': port,
+            'watcher_lock': watcher_lock,
+            'rollout_engine': rollout_engine,
+            'advertise_host': advertise_host,
+            'peer_watch': peer_watch,
+            'peer_interval': args.peer_interval
+        }
+
+        # Create BindWatch (always, owns both mandatory and optional rows; §L3)
+        bind_watch = BindWatch(bind_list, optional_decls, port, server_kwargs,
+                               watcher_lock, event_bus, shutdown_event)
+        server_kwargs['bind_watch'] = bind_watch
+
+        # Bind mandatory listeners (all-or-nothing per §3.3, J1)
         servers = []
         failures = []
 
         for addr, family in bind_list:
             try:
-                server = ThreadingHTTPServer(
-                    (addr, port),
-                    RoundhouseRequestHandler,
-                    watcher,
-                    event_bus,
-                    port,
-                    watcher_lock=watcher_lock,
-                    rollout_engine=rollout_engine,
-                    advertise_host=advertise_host,
-                    peer_watch=peer_watch,
-                    address_family=family,
-                    peer_interval=args.peer_interval
-                )
+                server = _make_listener(addr, family, port, server_kwargs)
                 servers.append((server, bind_display(addr, family)))
             except OSError as e:
                 # Track failure but continue to try other addresses
@@ -8475,7 +8925,7 @@ def cmd_serve(args):
         signal.signal(signal.SIGTERM, signal_handler)
         signal.signal(signal.SIGINT, signal_handler)
 
-        # Start listener threads (daemon, one per server — J1)
+        # Start listener threads (daemon, one per mandatory server — J1)
         listener_threads = []
         for srv in servers:
             # An AF_INET6 sockaddr is (host, port, flowinfo, scope_id) — index, never
@@ -8484,6 +8934,21 @@ def cmd_serve(args):
             t = threading.Thread(target=srv.serve_forever, daemon=True, name=thread_name)
             t.start()
             listener_threads.append(t)
+
+        # Start bind watch thread (only if optional decls exist; §L3)
+        bind_watch_thread = None
+        if optional_decls:
+            def bind_watch_loop():
+                # First round immediately (§L3)
+                bind_watch.cycle()
+                # Then cadence
+                while not shutdown_event.is_set():
+                    if shutdown_event.wait(args.bind_retry):
+                        break  # shutdown_event was set
+                    bind_watch.cycle()
+
+            bind_watch_thread = threading.Thread(target=bind_watch_loop, daemon=True, name='bind-watch')
+            bind_watch_thread.start()
 
         # Start peer watch thread (J6 — after all binds succeed, before we wait for shutdown)
         peer_thread = None
@@ -8504,13 +8969,29 @@ def cmd_serve(args):
         while not shutdown_event.is_set():
             shutdown_event.wait(1.0)
 
-        # Shutdown: call shutdown() then server_close() on all servers in order (J1)
+        # Shutdown sequence per §3.4 (join bind-watch before closing)
+        # (1) Join bind-watch thread with timeout (the thread may be hanging in getaddrinfo)
+        if bind_watch_thread:
+            bind_watch_thread.join(timeout=10.0)
+
+        # (2) Shutdown and close mandatory servers in order (J1)
         for srv in servers:
             srv.shutdown()
         for srv in servers:
             srv.server_close()
 
-        # Join listener threads with timeout
+        # (3) Shutdown and close optional servers (safe to read: thread is joined or abandoned — §L3)
+        for addr in list(bind_watch.servers.keys()):
+            try:
+                srv, thread, family = bind_watch.servers[addr]
+                srv.shutdown()
+                srv.server_close()
+                if thread:
+                    thread.join(timeout=5.0)
+            except Exception:
+                pass
+
+        # (4) Join listener threads with timeout
         for t in listener_threads:
             t.join(timeout=5.0)
 
