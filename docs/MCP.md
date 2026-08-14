@@ -53,7 +53,7 @@ Or set the env var in Claude Code's `.mcp.json`:
 }
 ```
 
-## The 17-Tool Catalog
+## The 18-Tool Catalog
 
 ### Read Tools (work in any mode: actuate or read-only)
 
@@ -220,7 +220,90 @@ Or set the env var in Claude Code's `.mcp.json`:
 - `consecutive_failures`: Counter toward hysteresis gate; resets to 0 on success.
 - `last_error`: Human-readable reason for last failure, or null if never failed.
 
-**Boundary:** the catalog is frozen at 17 as of MVP7. `peer_status` is a read, and peers are never MCP action targets — Roundhouse does not start, stop, wake, or otherwise touch another host (MVP7 contract, Out of scope). The watch is sensing only: peer state feeds no placement, no warm decision, and no operation slot.
+**Remarks:**
+- `means`: Frozen verbatim, and it is the point of the tool — a TCP connect proves listening; it proves nothing about serving, health, or the fleet behind the port.
+- `probe`: What the watch actually does — a TCP connect with a 2 s timeout, re-resolving the name every round. `cadence_seconds` reflects the cadence the server is running at, not a constant.
+- `state`: One of `up` (first successful connect), `down` (two consecutive failures), or `unknown` (never probed yet).
+- `since`: Epoch timestamp of the last state transition.
+- `consecutive_failures`: Counter toward hysteresis gate; resets to 0 on success.
+- `last_error`: Human-readable reason for last failure, or null if never failed.
+
+**Boundary:** the catalog is frozen at 18 as of MVP8. `peer_status` is a read, and peers are never MCP action targets — Roundhouse does not start, stop, wake, or otherwise touch another host (MVP7 contract, Out of scope). The watch is sensing only: peer state feeds no placement, no warm decision, and no operation slot. `fleet_roster` (MVP8) aggregates this host's units with fetched units from declared fleet peers, tagged by source host.
+
+#### 9. `fleet_roster`
+**Description:** Fleet roster across this host and its declared fleet peers: every unit tagged with its source host, plus per-peer mode, fetch time, and staleness. Reads only — peer units cannot be actuated from here.
+
+**Example Call:**
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 1,
+  "method": "tools/call",
+  "params": {
+    "name": "fleet_roster",
+    "arguments": {}
+  }
+}
+```
+
+**Example Result (excerpt):**
+```json
+{
+  "http_status": 200,
+  "host": "boltzmann",
+  "mode": "actuate",
+  "generated_at": 1755160000.0,
+  "fetch": {
+    "timeout_seconds": 4.0,
+    "max_bytes": 4194304,
+    "cadence_seconds": 60
+  },
+  "units": [
+    {
+      "unit": "qwen3.6-coding.service",
+      "rung": "READY",
+      "port": 8085,
+      "alias": "qwen3.6-coding",
+      "enabled": true,
+      "on_demand": false,
+      "retired": false,
+      "strategy_note": null,
+      "badges": [],
+      "source": "boltzmann",
+      "stale": false
+    },
+    {
+      "unit": "qwen3.6-coding.service",
+      "rung": "READY",
+      "port": 8085,
+      "alias": "qwen3.6-coding",
+      "enabled": true,
+      "on_demand": false,
+      "retired": false,
+      "strategy_note": null,
+      "badges": [],
+      "source": "ampere",
+      "stale": false
+    }
+  ],
+  "peers": [
+    {
+      "name": "ampere",
+      "kind": "roundhouse",
+      "url": "https://ampere.fritz.box:8099",
+      "state": "up",
+      "mode": "read-only",
+      "fed_state": "fresh",
+      "stale": false,
+      "reason": null,
+      "fetched_at": 1755159990.0,
+      "attempted_at": 1755159990.0,
+      "unit_count": 1,
+      "invalid_entries": 0
+    }
+  ]
+}
+```
 
 ---
 

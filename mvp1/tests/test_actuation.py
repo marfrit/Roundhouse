@@ -882,7 +882,7 @@ class TestRoutesAuth(unittest.TestCase):
         self.assertEqual(rec['phase'], 'watching')
         self.assertNotIn('old_raw', rec)
         self.assertEqual(set(rec), {
-            'rollout_id', 'kind', 'unit', 'phase', 'detail', 'edits', 'was_active', 'commit',
+            'host', 'rollout_id', 'kind', 'unit', 'phase', 'detail', 'edits', 'was_active', 'commit',
             'restored', 'failure', 'rollback', 'started_at', 'updated_at'})
 
     def test_get_on_post_only_rollout_subroutes_returns_405(self):
@@ -3952,7 +3952,7 @@ class TestEnablementRoutes(unittest.TestCase):
             payload = json.loads(body)
 
             # Verify frozen key set
-            frozen_keys = {'unit', 'enabled', 'was', 'changed', 'strategy_note'}
+            frozen_keys = {'host', 'unit', 'enabled', 'was', 'changed', 'strategy_note'}
             self.assertEqual(set(payload.keys()), frozen_keys,
                            f"Response keys must be exactly {frozen_keys}, got {set(payload.keys())}")
 

@@ -441,6 +441,20 @@ TOOLS = {
         'shaper': None,
         'send_requester': False,
     },
+    'fleet_roster': {
+        'description': 'Fleet roster across this host and its declared fleet peers: every unit tagged with its source host, plus per-peer mode, fetch time, and staleness. Reads only — peer units cannot be actuated from here.',
+        'schema': {
+            'type': 'object',
+            'properties': {},
+            'additionalProperties': False
+        },
+        'method': 'GET',
+        'path': '/api/fleet',
+        'action': False,
+        'body_args': (),
+        'shaper': None,
+        'send_requester': False,
+    },
 }
 
 
@@ -625,7 +639,7 @@ def handle_message(msg, conn_state) -> dict or None:
                     'capabilities': {'tools': {}},
                     'serverInfo': {
                         'name': 'roundhouse-mcp',
-                        'version': '7.0'
+                        'version': '8.0'
                     }
                 }
             }

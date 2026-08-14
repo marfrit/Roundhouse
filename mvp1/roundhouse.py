@@ -2156,6 +2156,12 @@ class RoundhouseRequestHandler(http.server.BaseHTTPRequestHandler):
             self.serve_routing_config()
         elif route == '/api/routing-config.json':
             self.serve_routing_config_json()
+        elif route == '/api/fleet':
+            self.serve_fleet()
+        elif route == '/api/routing-config/fleet':
+            self.serve_routing_config_fleet()
+        elif route == '/api/routing-config/fleet.json':
+            self.serve_routing_config_fleet_json()
         elif route == '/api/warm':
             self.serve_warm_state()
         elif route == '/api/peers':
@@ -2200,6 +2206,9 @@ class RoundhouseRequestHandler(http.server.BaseHTTPRequestHandler):
             route == '/api/events' or
             route == '/api/routing-config' or
             route == '/api/routing-config.json' or
+            route == '/api/fleet' or
+            route == '/api/routing-config/fleet' or
+            route == '/api/routing-config/fleet.json' or
             route == '/api/warm' or
             route == '/api/peers' or
             route.startswith('/api/rollouts/') or   # GET-only unless /rollback|/dismiss
@@ -2351,6 +2360,7 @@ class RoundhouseRequestHandler(http.server.BaseHTTPRequestHandler):
         self.send_header('Content-Type', 'application/json; charset=utf-8')
         self.end_headers()
         response = {
+            'host': os.uname()[1],
             'unit': unit_name,
             'edits': [{'field': e.field, 'flag': e.flag, 'old': e.old_text, 'new': e.new_text}
                      for e in edits],
@@ -2448,7 +2458,7 @@ class RoundhouseRequestHandler(http.server.BaseHTTPRequestHandler):
             self.send_response(202)
             self.send_header('Content-Type', 'application/json; charset=utf-8')
             self.end_headers()
-            response = {'rollout_id': rollout['rollout_id']}
+            response = {'host': os.uname()[1], 'rollout_id': rollout['rollout_id']}
             self.wfile.write(json.dumps(response).encode('utf-8'))
         except ActuationError as e:
             if 'rollout_in_progress' in str(e):
@@ -2562,6 +2572,7 @@ class RoundhouseRequestHandler(http.server.BaseHTTPRequestHandler):
         self.send_header('Content-Type', 'application/json; charset=utf-8')
         self.end_headers()
         response = {
+            'host': os.uname()[1],
             'unit': unit_name,
             'enabled': enabled_after,
             'was': was,
@@ -2597,7 +2608,7 @@ class RoundhouseRequestHandler(http.server.BaseHTTPRequestHandler):
             self.send_response(202)
             self.send_header('Content-Type', 'application/json; charset=utf-8')
             self.end_headers()
-            self.wfile.write(json.dumps({'rollout_id': rollout_id}).encode('utf-8'))
+            self.wfile.write(json.dumps({'host': os.uname()[1], 'rollout_id': rollout_id}).encode('utf-8'))
         except ActuationError as e:
             # Lost the race against a concurrent rollback/dismiss: concurrency, so 409.
             if 'not_rollbackable' in str(e):
@@ -2641,7 +2652,7 @@ class RoundhouseRequestHandler(http.server.BaseHTTPRequestHandler):
         self.send_response(200)
         self.send_header('Content-Type', 'application/json; charset=utf-8')
         self.end_headers()
-        self.wfile.write(json.dumps({'ok': True}).encode('utf-8'))
+        self.wfile.write(json.dumps({'host': os.uname()[1], 'ok': True}).encode('utf-8'))
 
     def handle_switch_preview(self):
         """Handle POST /api/switch/preview (preview mode)."""
@@ -2697,6 +2708,7 @@ class RoundhouseRequestHandler(http.server.BaseHTTPRequestHandler):
             self.send_header('Content-Type', 'application/json; charset=utf-8')
             self.end_headers()
             response = {
+                'host': os.uname()[1],
                 'target': pf['target'],
                 'stop_candidates': pf['stop_candidates'],
                 'checks': pf['checks'],
@@ -2826,7 +2838,7 @@ class RoundhouseRequestHandler(http.server.BaseHTTPRequestHandler):
             self.send_response(202)
             self.send_header('Content-Type', 'application/json; charset=utf-8')
             self.end_headers()
-            response = {'rollout_id': switch['rollout_id']}
+            response = {'host': os.uname()[1], 'rollout_id': switch['rollout_id']}
             self.wfile.write(json.dumps(response).encode('utf-8'))
         except ActuationError as e:
             error_str = str(e)
@@ -3018,7 +3030,9 @@ class RoundhouseRequestHandler(http.server.BaseHTTPRequestHandler):
         if not rollout:
             self.send_json_error(404, 'not_found', f'no rollout {rollout_id}')
             return
-        self.send_json(rollout_public_record(rollout))
+        record = rollout_public_record(rollout)
+        record['host'] = os.uname()[1]
+        self.send_json(record)
 
     def serve_mem(self):
         """Serve /api/mem: measured peak rows (§6 schema) plus the current per-unit
@@ -3128,6 +3142,155 @@ class RoundhouseRequestHandler(http.server.BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(json.dumps(response).encode('utf-8'))
 
+    def serve_fleet(self):
+        """Serve GET /api/fleet (§6.1): aggregate roster — local units + fleet peers.
+
+        Local units first (keep-list applied), never stale. Per-fleet-peer: units with
+        stale marker, plus peer metadata. Fleet peers only (TCP peers are reachability-only).
+        """
+        snapshot = self.server.take_snapshot()
+        peer_watch = getattr(self.server, 'peer_watch', None)
+        now_utc = datetime.now(timezone.utc)
+
+        # Gather peer fed data under lock (short hold; internal consistency guaranteed)
+        if peer_watch:
+            with self.server.watcher_lock:
+                fed_rows = peer_watch.fed_rows_unlocked()
+        else:
+            fed_rows = {}
+
+        # Build fleet response: local units + federated units
+        units = []
+
+        # Local units first (from snapshot)
+        for row in snapshot.get('units', []):
+            row_with_source = {**row, 'source': snapshot['host'], 'stale': False}
+            units.append(row_with_source)
+
+        # Federated units (per peer, sorted by peer name)
+        for peer_name in sorted(fed_rows.keys()):
+            fed = fed_rows[peer_name]
+            for unit in fed.get('units', []):
+                unit_with_source = {**unit, 'source': peer_name, 'stale': (fed['state'] != 'fresh')}
+                units.append(unit_with_source)
+
+        # Build peers list (fleet peers only, sorted by name)
+        peers = []
+        if peer_watch:
+            for peer_name in sorted(fed_rows.keys()):
+                fed = fed_rows[peer_name]
+                peer_state = peer_watch.peers.get(peer_name, {})
+                peers.append({
+                    'name': peer_name,
+                    'kind': 'roundhouse',
+                    'url': peer_watch.fleet.get(peer_name, ''),
+                    'state': peer_state.get('state', 'unknown'),
+                    'mode': fed.get('mode'),
+                    'fed_state': fed['state'],
+                    'stale': (fed['state'] != 'fresh'),
+                    'reason': fed.get('reason'),
+                    'fetched_at': fed.get('fetched_at'),
+                    'attempted_at': fed.get('attempted_at'),
+                    'unit_count': len(fed.get('units', [])),
+                    'invalid_entries': fed.get('invalid_entries', 0)
+                })
+
+        response = {
+            'host': snapshot['host'],
+            'mode': snapshot.get('mode', 'read-only'),
+            'generated_at': now_utc.timestamp(),
+            'fetch': {
+                'timeout_seconds': FETCH_TIMEOUT_SEC,
+                'max_bytes': FETCH_MAX_BYTES,
+                'cadence_seconds': getattr(self.server, 'peer_interval', PEER_INTERVAL_SEC),
+            },
+            'units': units,
+            'peers': peers
+        }
+
+        self.send_json(response)
+
+    def serve_routing_config_fleet(self):
+        """Serve GET /api/routing-config/fleet (YAML fleet-merged routing config)."""
+        snapshot = self.server.take_snapshot()
+        advertise_host = getattr(self.server, 'advertise_host', None) or snapshot.get('host', '?')
+        now_utc = datetime.now(timezone.utc)
+
+        # Build local entries
+        entries = build_routing_entries(snapshot, advertise_host)
+        meta = routing_meta(snapshot, advertise_host, self.server.port, now_utc)
+
+        # Get federated data under lock (short hold)
+        peer_watch = getattr(self.server, 'peer_watch', None)
+        if peer_watch:
+            with self.server.watcher_lock:
+                fed_rows = peer_watch.fed_rows_unlocked()
+                # Capture reachability state for excluded entries
+                peer_states = {name: peer_watch.peers.get(name, {}).get('state', 'unknown')
+                              for name in fed_rows.keys()}
+        else:
+            fed_rows = {}
+            peer_states = {}
+
+        # Build fleet merge
+        merge = build_fleet_merge(entries, advertise_host, fed_rows)
+
+        # Fill in reachability state for excluded entries
+        for excl in merge.get('excluded', []):
+            excl['state'] = peer_states.get(excl['name'], 'unknown')
+
+        # Emit YAML
+        yaml_text = emit_fleet_yaml(meta, merge)
+
+        self.send_response(200)
+        self.send_header('Content-Type', 'text/yaml; charset=utf-8')
+        self.end_headers()
+        self.wfile.write(yaml_text.encode('utf-8'))
+
+    def serve_routing_config_fleet_json(self):
+        """Serve GET /api/routing-config/fleet.json (JSON fleet-merged routing config)."""
+        snapshot = self.server.take_snapshot()
+        advertise_host = getattr(self.server, 'advertise_host', None) or snapshot.get('host', '?')
+        now_utc = datetime.now(timezone.utc)
+
+        # Build local entries
+        entries = build_routing_entries(snapshot, advertise_host)
+        meta = routing_meta(snapshot, advertise_host, self.server.port, now_utc)
+
+        # Get federated data under lock (short hold)
+        peer_watch = getattr(self.server, 'peer_watch', None)
+        if peer_watch:
+            with self.server.watcher_lock:
+                fed_rows = peer_watch.fed_rows_unlocked()
+                # Capture reachability state for excluded entries
+                peer_states = {name: peer_watch.peers.get(name, {}).get('state', 'unknown')
+                              for name in fed_rows.keys()}
+        else:
+            fed_rows = {}
+            peer_states = {}
+
+        # Build fleet merge
+        merge = build_fleet_merge(entries, advertise_host, fed_rows)
+
+        # Fill in reachability state for excluded entries
+        for excl in merge.get('excluded', []):
+            excl['state'] = peer_states.get(excl['name'], 'unknown')
+
+        # Build JSON response
+        response = {
+            'generated_by': f"roundhouse@{advertise_host} (fleet)",
+            'generated_at': now_utc.isoformat() + 'Z',
+            'contributors': merge.get('contributors', []),
+            'excluded': merge.get('excluded', []),
+            'conflicts': merge.get('conflicts', []),
+            'model_list': merge.get('model_list', [])
+        }
+
+        self.send_response(200)
+        self.send_header('Content-Type', 'application/json; charset=utf-8')
+        self.end_headers()
+        self.wfile.write(json.dumps(response).encode('utf-8'))
+
     def serve_warm_state(self):
         """Serve GET /api/warm (warm queue state)."""
         engine = self.server.rollout_engine
@@ -3225,6 +3388,7 @@ class RoundhouseRequestHandler(http.server.BaseHTTPRequestHandler):
                 self.send_header('Content-Type', 'application/json; charset=utf-8')
                 self.end_headers()
                 self.wfile.write(json.dumps({
+                    'host': snap['host'],
                     'status': 'already_warm',
                     'unit': target,
                     'rung': rung
@@ -3253,6 +3417,7 @@ class RoundhouseRequestHandler(http.server.BaseHTTPRequestHandler):
                 pending_unit = engine.pending_warm.get('unit')
                 if pending_unit == target:
                     queue_response = (200, {
+                        'host': snap['host'],
                         'status': 'already_queued',
                         'unit': target,
                         'pending': dict(engine.pending_warm)
@@ -3272,7 +3437,7 @@ class RoundhouseRequestHandler(http.server.BaseHTTPRequestHandler):
                     'requester': requester,
                     'requested_at': time.time()
                 }
-                queue_response = (202, {'queued': True, 'unit': target})
+                queue_response = (202, {'host': snap['host'], 'queued': True, 'unit': target})
         if queue_response is not None:
             status, body = queue_response
             self.send_response(status)
@@ -3341,6 +3506,7 @@ class RoundhouseRequestHandler(http.server.BaseHTTPRequestHandler):
             self.send_header('Content-Type', 'application/json; charset=utf-8')
             self.end_headers()
             response = {
+                'host': snap['host'],
                 'rollout_id': result.get('rollout_id'),
                 'stops': plan['stops']
             }
@@ -3358,7 +3524,7 @@ class RoundhouseRequestHandler(http.server.BaseHTTPRequestHandler):
                     if engine.pending_warm is not None:
                         pending = dict(engine.pending_warm)
                         if pending.get('unit') == target:
-                            reentry = (200, {'status': 'already_queued',
+                            reentry = (200, {'host': snap['host'], 'status': 'already_queued',
                                              'unit': target, 'pending': pending})
                         else:
                             reentry = (409, {'error': 'warm_queue_full',
@@ -3372,7 +3538,7 @@ class RoundhouseRequestHandler(http.server.BaseHTTPRequestHandler):
                             'requester': requester,
                             'requested_at': time.time()
                         }
-                        reentry = (202, {'queued': True, 'unit': target})
+                        reentry = (202, {'host': snap['host'], 'queued': True, 'unit': target})
                 status, body = reentry
                 self.send_response(status)
                 self.send_header('Content-Type', 'application/json; charset=utf-8')
@@ -3416,6 +3582,7 @@ class RoundhouseRequestHandler(http.server.BaseHTTPRequestHandler):
         self.send_header('Content-Type', 'application/json; charset=utf-8')
         self.end_headers()
         self.wfile.write(json.dumps({
+            'host': os.uname()[1],
             'cancelled': True,
             'unit': cancelled_unit
         }).encode('utf-8'))
