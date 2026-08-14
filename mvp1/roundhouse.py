@@ -18,6 +18,7 @@ import re
 import json
 import argparse
 import sqlite3
+import ipaddress
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional, List, Dict, Any
@@ -3394,18 +3395,28 @@ class ThreadingHTTPServer(http.server.ThreadingHTTPServer):
     """HTTP server with references to watcher, event_bus, and port."""
 
     def __init__(self, host_port, handler_class, watcher, event_bus, port,
-                 watcher_lock=None, rollout_engine=None, advertise_host=None):
+                 watcher_lock=None, rollout_engine=None, advertise_host=None,
+                 peer_watch=None, address_family=None):
         self.watcher = watcher
         self.event_bus = event_bus
         self.port = port
         self.rollout_engine = rollout_engine
         self.advertise_host = advertise_host
+        self.peer_watch = peer_watch
         # snapshot() reads AND writes watcher state (rung cache commit is
         # elsewhere, but _state mutates under the sensing threads), so every
         # handler read must take the same lock the threads use. Sockets are
         # written OUTSIDE the lock: take_snapshot returns a plain dict.
         self.watcher_lock = watcher_lock or threading.Lock()
+        if address_family is not None:
+            self.address_family = address_family
         super().__init__(host_port, handler_class)
+
+    def server_bind(self):
+        """Override to set IPV6_V6ONLY=1 for IPv6 sockets (§3.2)."""
+        if self.address_family == socket.AF_INET6:
+            self.socket.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 1)
+        super().server_bind()
 
     def take_snapshot(self):
         with self.watcher_lock:
@@ -3416,6 +3427,445 @@ class ThreadingHTTPServer(http.server.ThreadingHTTPServer):
             else:
                 snapshot['rollout'] = None
             return snapshot
+
+
+# ===== SECTION F: PEER WATCH + LISTEN LIST (sensing only: the ONE outbound-connect site is _probe_peer; no data on the wire, no subprocess, no writes, no actuation) =====
+
+# Constants (§4.3, J6)
+PEER_TIMEOUT_SEC = 2.0
+PEER_INTERVAL_SEC = 60
+PEER_MAX = 8
+
+
+def parse_bind_list(values: Optional[List[str]]) -> tuple[List[tuple[str, int]], List[str]]:
+    """Parse --bind repeatable/comma-list arguments per §3.1.
+
+    Returns: ([(addr, family), ...], [errors, ...])
+    Default if values is None: [('0.0.0.0', socket.AF_INET)]
+    Errors collected; caller exits with all listed (§3.1).
+    """
+    import ipaddress
+    if values is None:
+        return [('0.0.0.0', socket.AF_INET)], []
+
+    errors = []
+    canonical_list = []
+
+    # Flatten repeats and comma lists
+    flat = []
+    for val in values:
+        tokens = [t.strip() for t in val.split(',')]
+        for token in tokens:
+            if not token:
+                errors.append(f"empty bind address in '{val}'")
+            else:
+                flat.append(token)
+
+    seen = set()
+    for token in flat:
+        # Strip brackets if present
+        host = token
+        if host.startswith('[') and host.endswith(']'):
+            host = host[1:-1]
+
+        # Try IPv4 first, then IPv6
+        family = None
+        try:
+            socket.inet_pton(socket.AF_INET, host)
+            family = socket.AF_INET
+        except socket.error:
+            try:
+                socket.inet_pton(socket.AF_INET6, host)
+                family = socket.AF_INET6
+            except socket.error:
+                errors.append(f"'{token}': not a literal IP address — bind to the address, not the name")
+                continue
+
+        # Canonicalize
+        if family == socket.AF_INET:
+            packed = socket.inet_pton(socket.AF_INET, host)
+            canonical = socket.inet_ntop(socket.AF_INET, packed)
+        else:
+            packed = socket.inet_pton(socket.AF_INET6, host)
+            canonical = socket.inet_ntop(socket.AF_INET6, packed)
+
+        # Check duplicates
+        if canonical in seen:
+            errors.append(f"duplicate bind address: {canonical}")
+            continue
+        seen.add(canonical)
+        canonical_list.append((canonical, family))
+
+    # Check for same-family wildcard overlaps
+    has_ipv4_wildcard = any(addr == '0.0.0.0' for addr, fam in canonical_list)
+    has_ipv6_wildcard = any(addr == '::' for addr, fam in canonical_list)
+    has_other_ipv4 = any(addr != '0.0.0.0' and fam == socket.AF_INET for addr, fam in canonical_list)
+    has_other_ipv6 = any(addr != '::' and fam == socket.AF_INET6 for addr, fam in canonical_list)
+
+    if has_ipv4_wildcard and has_other_ipv4:
+        other = next(addr for addr, fam in canonical_list if addr != '0.0.0.0' and fam == socket.AF_INET)
+        errors.append(f"'0.0.0.0' already covers '{other}' — bind one or the other")
+
+    if has_ipv6_wildcard and has_other_ipv6:
+        other = next(addr for addr, fam in canonical_list if addr != '::' and fam == socket.AF_INET6)
+        errors.append(f"'::' already covers '{other}' — bind one or the other")
+
+    return canonical_list, errors
+
+
+def parse_peer_decls(values: Optional[List[str]]) -> tuple[dict[str, tuple[str, int]], List[str]]:
+    """Parse --peer NAME=HOST:PORT declarations per §4.1.
+
+    Returns: ({name: (host, port)}, [errors, ...])
+    Errors collected; caller exits with all listed (§3.1, J3).
+    """
+    if values is None:
+        return {}, []
+
+    errors = []
+    peers = {}
+    seen_names = set()
+
+    for val in values:
+        # Split on first '='
+        if '=' not in val:
+            errors.append(f"malformed --peer '{val}': expected NAME=HOST:PORT")
+            continue
+
+        name, endpoint = val.split('=', 1)
+
+        # Validate name per §4.1
+        if not name:
+            errors.append(f"malformed --peer '{val}': NAME is empty")
+            continue
+        if not re.match(r'^[A-Za-z0-9][A-Za-z0-9._-]{0,31}$', name):
+            errors.append(f"malformed --peer '{val}': NAME '{name}' does not match ^[A-Za-z0-9][A-Za-z0-9._-]{{0,31}}$")
+            continue
+        if name in seen_names:
+            errors.append(f"duplicate peer name: '{name}'")
+            continue
+        seen_names.add(name)
+
+        # Parse endpoint: [host]:port or host:port
+        host = None
+        port = None
+
+        if endpoint.startswith('['):
+            # IPv6 literal: [host]:port
+            if ']:' not in endpoint:
+                errors.append(f"malformed --peer '{val}': bracket IPv6 hosts must be [addr]:port")
+                continue
+            bracket_end = endpoint.index(']')
+            host = endpoint[1:bracket_end]
+            port_str = endpoint[bracket_end+2:]
+
+            # Validate IPv6
+            try:
+                socket.inet_pton(socket.AF_INET6, host)
+            except socket.error:
+                errors.append(f"malformed --peer '{val}': invalid IPv6 address '{host}'")
+                continue
+        else:
+            # host:port (may be hostname or IPv4)
+            if ':' not in endpoint:
+                errors.append(f"malformed --peer '{val}': missing :PORT")
+                continue
+            parts = endpoint.rsplit(':', 1)
+            host = parts[0]
+            port_str = parts[1]
+
+            # Check for unbracketed IPv6 (has another ':')
+            if ':' in host:
+                errors.append(f"malformed --peer '{val}': bracket IPv6 hosts: [addr]:port")
+                continue
+
+        # Validate host (non-empty, no whitespace, no '/')
+        if not host or any(c in host for c in ' \t\n\r/'):
+            errors.append(f"malformed --peer '{val}': invalid host")
+            continue
+
+        # Parse port
+        try:
+            port = int(port_str)
+            if not (1 <= port <= 65535):
+                errors.append(f"malformed --peer '{val}': port {port} out of range 1-65535")
+                continue
+        except ValueError:
+            errors.append(f"malformed --peer '{val}': port '{port_str}' is not an integer")
+            continue
+
+        peers[name] = (host, port)
+
+    # Check cap (§4.1 J3)
+    if len(peers) > PEER_MAX:
+        errors.append(f"too many peers ({len(peers)} > {PEER_MAX}): a probe round must finish well inside the 60 s cadence")
+
+    return peers, errors
+
+
+def local_host_forms(nodename: str, advertise_host: str, bind_addrs: List[str]) -> set[str]:
+    """Build the set of LOCAL_FORMS per §6.3.
+
+    Lowercase all forms; includes: localhost, nodename variants, advertise_host,
+    non-wildcard bind addresses, loopback literals (::1, 127.0.0.0/8), and
+    best-effort getaddrinfo(nodename) results.
+    """
+    forms = {
+        'localhost',
+        'localhost.localdomain',
+        nodename.lower(),
+        nodename.split('.')[0].lower(),  # short name
+        advertise_host.lower()
+    }
+
+    # Add non-wildcard bind addresses
+    for addr in bind_addrs:
+        if addr not in ('0.0.0.0', '::'):
+            forms.add(addr.lower())
+
+    # Add loopback literals (IPv4 and IPv6)
+    try:
+        # Test ::1
+        socket.inet_pton(socket.AF_INET6, '::1')
+        forms.add('::1')
+    except:
+        pass
+
+    # All of 127.0.0.0/8 are loopback (add common patterns)
+    forms.add('127.0.0.1')
+    forms.add('127.0.0.2')
+
+    # Add wildcards (nonsense as peer hosts; caught here per §6.3)
+    forms.add('0.0.0.0')
+    forms.add('::')
+
+    # Best-effort getaddrinfo; wrap in try/except
+    try:
+        for family, _, _, _, sockaddr in socket.getaddrinfo(nodename, None):
+            addr = sockaddr[0]
+            forms.add(addr.lower())
+    except Exception:
+        pass  # DNS down is covered by documented residual (J8)
+
+    return forms
+
+
+def validate_peers(peers: dict[str, tuple[str, int]], units: dict,
+                   self_port: int, bind_addrs: List[str],
+                   advertise_host: str, nodename: str) -> List[str]:
+    """Validate peer declarations per §6.3 (D2 rule).
+
+    Rule: peer host ∈ LOCAL_FORMS AND peer port ∈ MANAGED_PORTS → error.
+    Returns: [errors, ...]
+    """
+    if not peers:
+        return []
+
+    errors = []
+
+    # Build MANAGED_PORTS (extract from UnitFile objects) and port->unit mapping
+    managed_ports = set()
+    port_to_unit = {}  # {port: unit_name} for better error messages
+    for u_name, u_obj in units.items():
+        # UnitFile has exec_start which has engine_argv
+        if u_obj.exec_start and u_obj.exec_start.engine_argv:
+            profile = extract_param_profile(u_obj.exec_start.engine_argv)
+            if profile.get('port'):
+                port = profile['port']
+                managed_ports.add(port)
+                port_to_unit[port] = u_name
+    managed_ports.add(self_port)
+
+    # Build LOCAL_FORMS
+    local_forms = local_host_forms(nodename, advertise_host, bind_addrs)
+
+    # Check each peer
+    for name, (host, port) in peers.items():
+        # Canonicalize host for comparison
+        host_lower = host.lower()
+
+        # Try to parse as IP literal to check is_loopback
+        is_loopback = False
+        try:
+            ip_obj = ipaddress.ip_address(host)
+            is_loopback = ip_obj.is_loopback
+            host_lower = ip_obj.compressed
+        except ValueError:
+            pass  # It's a hostname, not a literal
+
+        # Check collision rule: host ∈ LOCAL_FORMS AND port ∈ MANAGED_PORTS
+        if host_lower in local_forms and port in managed_ports:
+            # Find the managing unit for better error message
+            if port == self_port:
+                unit_service = 'roundhouse.service'
+            else:
+                unit_name = port_to_unit.get(port)
+                unit_service = f'{unit_name}.service' if unit_name else '(unknown).service'
+
+            errors.append(
+                f"peer '{name}' targets {host}:{port} — port {port} is managed unit "
+                f"{unit_service}'s port (or roundhouse's own) on this host; peers are other hosts"
+            )
+
+    return errors
+
+
+class PeerWatch:
+    """Peer reachability watch: state machine per §4.3 with lock discipline per §4.4.
+
+    - declared: {name: (host, port)}, never mutated after init
+    - peers: {name: state_dict}, mutations guarded by lock
+    - lock: watcher.lock (shared, non-reentrant)
+    - now: injected clock for testing
+    """
+
+    def __init__(self, declared: dict[str, tuple[str, int]], lock, event_bus,
+                 now=None):
+        self.declared = dict(declared)  # Snapshot declared peers at startup
+        self.lock = lock
+        self.event_bus = event_bus
+        self.now = now or time.time
+
+        # Initialize state: all peers start unknown
+        self.peers = {name: {
+            'state': 'unknown',
+            'since': self.now(),
+            'last_probe': None,
+            'consecutive_failures': 0,
+            'last_error': None
+        } for name in declared}
+
+    def apply_result_unlocked(self, name: str, ok: bool, error: Optional[str],
+                              ts: float) -> Optional[dict]:
+        """Apply probe result per §4.3 state table. CALLER HOLDS self.lock.
+
+        Returns SSE payload on transition, else None.
+        """
+        if name not in self.peers:
+            return None
+
+        peer = self.peers[name]
+        old_state = peer['state']
+
+        if ok:
+            # Probe succeeded
+            peer['last_error'] = None
+            peer['last_probe'] = ts
+
+            if old_state == 'unknown':
+                # unknown + success → up, emit event
+                peer['state'] = 'up'
+                peer['since'] = ts
+                peer['consecutive_failures'] = 0
+                return self._event_payload(name, old_state)
+            elif old_state == 'up':
+                # up + success → up, no event
+                peer['consecutive_failures'] = 0
+                return None
+            elif old_state == 'down':
+                # down + success → up, emit event
+                peer['state'] = 'up'
+                peer['since'] = ts
+                peer['consecutive_failures'] = 0
+                return self._event_payload(name, old_state)
+        else:
+            # Probe failed
+            peer['last_error'] = error
+            peer['last_probe'] = ts
+            peer['consecutive_failures'] += 1
+
+            if old_state == 'unknown':
+                if peer['consecutive_failures'] < 2:
+                    # unknown + 1st failure → unknown, no event
+                    return None
+                else:
+                    # unknown + 2nd failure → down, emit event
+                    peer['state'] = 'down'
+                    peer['since'] = ts
+                    return self._event_payload(name, old_state)
+            elif old_state == 'up':
+                if peer['consecutive_failures'] < 2:
+                    # up + 1st failure → up, no event
+                    return None
+                else:
+                    # up + 2nd failure → down, emit event
+                    peer['state'] = 'down'
+                    peer['since'] = ts
+                    return self._event_payload(name, old_state)
+            elif old_state == 'down':
+                # down + any failure → down, no event
+                return None
+
+        return None
+
+    def _event_payload(self, name: str, prev_state: str) -> dict:
+        """Build SSE peer event payload per §5.3."""
+        peer = self.peers[name]
+        host, port = self.declared[name]
+        return {
+            'name': name,
+            'host': host,
+            'port': port,
+            'state': peer['state'],
+            'since': peer['since'],
+            'last_probe': peer['last_probe'],
+            'consecutive_failures': peer['consecutive_failures'],
+            'last_error': peer['last_error'],
+            'prev_state': prev_state
+        }
+
+    def rows_unlocked(self) -> List[dict]:
+        """Snapshot of peer rows per §5 shape, sorted by name. CALLER HOLDS self.lock.
+
+        Used in take_snapshot; lock is non-reentrant, acquiring here would deadlock.
+        """
+        rows = []
+        for name in sorted(self.peers.keys()):
+            peer = self.peers[name]
+            host, port = self.declared[name]
+            rows.append({
+                'name': name,
+                'host': host,
+                'port': port,
+                'state': peer['state'],
+                'since': peer['since'],
+                'last_probe': peer['last_probe'],
+                'consecutive_failures': peer['consecutive_failures'],
+                'last_error': peer['last_error']
+            })
+        return rows
+
+
+def _probe_peer(peer_watch: PeerWatch, name: str,
+                connect=socket.create_connection) -> tuple[bool, Optional[str]]:
+    """THE one outbound-socket site (guarded by AST, §6.1). §4.2 frozen.
+
+    Endpoint comes only from the startup-validated declaration table —
+    unrepresentable otherwise (J8).
+    """
+    host, port = peer_watch.declared[name]  # KeyError = programming error, loudly
+    try:
+        sock = connect((host, port), timeout=PEER_TIMEOUT_SEC)
+        sock.close()
+        return (True, None)
+    except Exception as e:
+        return (False, f'{type(e).__name__}: {e}'[:200])
+
+
+def peer_watch_round(peer_watch: PeerWatch) -> None:
+    """Run one round of peer probing. §4.4 pattern: probe outside lock, apply inside.
+
+    Probe order = declaration order; transitions published immediately.
+    """
+    for name in peer_watch.declared:
+        # Probe OUTSIDE any lock (Risk #1, J5)
+        ok, error = _probe_peer(peer_watch, name)
+
+        # Apply result with lock held for dict mutation only
+        with peer_watch.lock:
+            payload = peer_watch.apply_result_unlocked(name, ok, error, peer_watch.now())
+            if payload:
+                peer_watch.event_bus.publish('peer', payload)
 
 
 # ===== SECTION E: ACTUATION (armed only by --actuate; run_actuate + run_git are the only mutation gateways) =====
@@ -6565,6 +7015,12 @@ def main():
     parser.add_argument('--db', help='SQLite database path')
     parser.add_argument('--no-db', action='store_true', help='Skip database')
     parser.add_argument('--actuate', action='store_true', help='Enable rollouts (requires git)')
+    parser.add_argument('--bind', action='append', default=None,
+                        help='Bind address(es); repeatable and/or comma-separated; default 0.0.0.0')
+    parser.add_argument('--peer', action='append', default=None,
+                        help='Peer declaration NAME=HOST:PORT; repeatable, max 8')
+    parser.add_argument('--peer-interval', type=int, default=PEER_INTERVAL_SEC,
+                        help=f'Peer probe cadence in seconds (default: {PEER_INTERVAL_SEC})')
 
     args = parser.parse_args()
 
@@ -6958,22 +7414,68 @@ def cmd_serve(args):
     journal_thread = threading.Thread(target=journal_with_backfill, daemon=True)
     journal_thread.start()
 
-    # Start HTTP server
-    try:
-        advertise_host = args.advertise_host or os.uname()[1]
-        server = ThreadingHTTPServer(
-            ('0.0.0.0', port),
-            RoundhouseRequestHandler,
-            watcher,
-            event_bus,
-            port,
-            watcher_lock=watcher_lock,
-            rollout_engine=rollout_engine,
-            advertise_host=advertise_host
-        )
-        print(f"Roundhouse listening on http://0.0.0.0:{port}")
+    # Parse and validate --bind and --peer arguments (§3.1, §4.1)
+    bind_list, bind_errors = parse_bind_list(args.bind)
+    peer_decls, peer_errors = parse_peer_decls(args.peer)
 
-        # Handle shutdown signals
+    # Collect all errors
+    all_errors = bind_errors + peer_errors
+    if all_errors:
+        for error in all_errors:
+            print(error, file=sys.stderr)
+        return 1
+
+    # Validate peer declarations (D2 rule, §6.3)
+    advertise_host = args.advertise_host or os.uname()[1]
+    nodename = os.uname()[1]
+    bind_addrs = [addr for addr, _ in bind_list]
+    peer_validation_errors = validate_peers(peer_decls, units, port, bind_addrs,
+                                            advertise_host, nodename)
+    if peer_validation_errors:
+        for error in peer_validation_errors:
+            print(error, file=sys.stderr)
+        return 1
+
+    # Create PeerWatch (before servers, before threads — J6 construction order)
+    peer_watch = PeerWatch(peer_decls, watcher_lock, event_bus) if peer_decls else None
+
+    # Start HTTP servers (all-or-nothing multi-bind loop per §3.3, J1)
+    try:
+        servers = []
+        failures = []
+
+        for addr, family in bind_list:
+            try:
+                server = ThreadingHTTPServer(
+                    (addr, port),
+                    RoundhouseRequestHandler,
+                    watcher,
+                    event_bus,
+                    port,
+                    watcher_lock=watcher_lock,
+                    rollout_engine=rollout_engine,
+                    advertise_host=advertise_host,
+                    peer_watch=peer_watch,
+                    address_family=family
+                )
+                servers.append(server)
+                # Display address with brackets for IPv6
+                display_addr = f'[{addr}]' if family == socket.AF_INET6 else addr
+                print(f"Roundhouse listening on http://{display_addr}:{port}")
+            except OSError as e:
+                # Track failure but continue to try other addresses
+                display_addr = f'[{addr}]' if family == socket.AF_INET6 else addr
+                failures.append(f"cannot bind {display_addr}:{port}: [Errno {e.errno}] {e.strerror}")
+
+        # All-or-nothing check: if any address failed, close all successful ones and exit
+        if failures:
+            for srv in servers:
+                srv.server_close()  # Close all successfully bound sockets
+            for line in failures:
+                print(line, file=sys.stderr)
+            return 1
+
+        # Setup signal handler (simplified per J1 — no helper thread needed)
         def signal_handler(sig, frame):
             print("\nShutting down...")
             shutdown_event.set()
@@ -6982,18 +7484,48 @@ def cmd_serve(args):
                     journal_state['proc'].terminate()
                 except Exception:
                     pass
-            # server.shutdown() blocks until serve_forever() returns -- and serve_forever()
-            # runs in THIS thread, so calling it from the handler deadlocks the process:
-            # it stops accepting but never exits, and systemd has to SIGKILL it at the stop
-            # timeout. Ask for shutdown from a helper thread and let serve_forever() unwind.
-            threading.Thread(target=server.shutdown, daemon=True).start()
 
         signal.signal(signal.SIGTERM, signal_handler)
         signal.signal(signal.SIGINT, signal_handler)
 
-        # Serve forever
-        server.serve_forever()
-        server.server_close()
+        # Start listener threads (daemon, one per server — J1)
+        listener_threads = []
+        for i, srv in enumerate(servers):
+            host, port_num = srv.server_address
+            thread_name = f'http-{host}'
+            t = threading.Thread(target=srv.serve_forever, daemon=True, name=thread_name)
+            t.start()
+            listener_threads.append(t)
+
+        # Start peer watch thread (J6 — after all binds succeed, before we wait for shutdown)
+        peer_thread = None
+        if peer_watch:
+            def peer_watch_loop():
+                # First round immediately at startup
+                peer_watch_round(peer_watch)
+                # Then cadence
+                while not shutdown_event.is_set():
+                    if shutdown_event.wait(args.peer_interval):
+                        break  # shutdown_event was set
+                    peer_watch_round(peer_watch)
+
+            peer_thread = threading.Thread(target=peer_watch_loop, daemon=True, name='peer-watch')
+            peer_thread.start()
+
+        # Main thread waits for shutdown signal (J1)
+        while not shutdown_event.is_set():
+            shutdown_event.wait(1.0)
+
+        # Shutdown: call shutdown() then server_close() on all servers in order (J1)
+        for srv in servers:
+            srv.shutdown()
+        for srv in servers:
+            srv.server_close()
+
+        # Join listener threads with timeout
+        for t in listener_threads:
+            t.join(timeout=5.0)
+
     except Exception as e:
         print(f"Error starting server: {e}", file=sys.stderr)
         shutdown_event.set()

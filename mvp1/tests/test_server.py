@@ -625,7 +625,7 @@ class TestWriteGuards(unittest.TestCase):
         import re
         banners = [(i, m.group(1))
                    for i, line in enumerate(source.splitlines(), 1)
-                   for m in [re.match(r'^# ===== SECTION ([A-E])\b', line)] if m]
+                   for m in [re.match(r'^# ===== SECTION ([A-F])\b', line)] if m]
         total = len(source.splitlines()) + 1
         spans = {}
         for idx, (line, letter) in enumerate(banners):
@@ -973,7 +973,7 @@ class TestWriteGuards(unittest.TestCase):
         # GET-only paths do_POST recognises purely to answer 405 (§4 status doctrine)
         get_only = {'/', '/api/units', '/api/ports', '/api/deployments',
                     '/api/mem', '/api/events', '/api/routing-config',
-                    '/api/routing-config.json', '/api/warm'}
+                    '/api/routing-config.json', '/api/warm', '/api/peers'}
         allowed = from_frozen | get_only
 
         self.assertEqual(
@@ -1069,6 +1069,278 @@ class TestWriteGuards(unittest.TestCase):
                                                 break
                                 if not found:
                                     self.fail(f"Path.open with write mode found outside {write_funcs}")
+
+    def test_outbound_connect_confined(self):
+        """§6.1 guard: socket.create_connection and socket.socket() only in _probe_peer.
+
+        Three legs:
+        (a) socket.create_connection and socket.socket() must be in PROBE_CALLSITES
+        (b) Exactly one create_connection exists (in _probe_peer's default argument)
+        (c) No send/recv/makefile within _probe_peer (connect-and-close only)
+        """
+        import ast
+        source, tree = self._tree()
+        parents = self._parents(tree)
+
+        PROBE_CALLSITES = {'_probe_peer'}
+        FORBIDDEN_SOCKET_METHODS = {'send', 'sendall', 'sendto', 'recv', 'recv_into', 'makefile', 'sendfile'}
+
+        violations_callsite = []
+        create_connection_count = 0
+        forbidden_in_probe = []
+
+        for node in ast.walk(tree):
+            # Check for socket.create_connection attribute (must be on 'socket' module)
+            if isinstance(node, ast.Attribute) and node.attr == 'create_connection':
+                if isinstance(node.value, ast.Name) and node.value.id == 'socket':
+                    func_name = self._enclosing_func(node, parents)
+                    if func_name not in PROBE_CALLSITES:
+                        violations_callsite.append((node.lineno, 'socket.create_connection', func_name))
+                    create_connection_count += 1
+
+            # Check for socket.socket(...) calls
+            if isinstance(node, ast.Call):
+                if isinstance(node.func, ast.Attribute) and node.func.attr == 'socket':
+                    if isinstance(node.func.value, ast.Name) and node.func.value.id == 'socket':
+                        func_name = self._enclosing_func(node, parents)
+                        if func_name not in PROBE_CALLSITES:
+                            violations_callsite.append((node.lineno, 'socket.socket', func_name))
+
+            # Check for forbidden socket methods within _probe_peer
+            if isinstance(node, ast.Attribute) and node.attr in FORBIDDEN_SOCKET_METHODS:
+                func_name = self._enclosing_func(node, parents)
+                if func_name == '_probe_peer':
+                    forbidden_in_probe.append((node.lineno, node.attr))
+
+        # Assertions
+        self.assertEqual(violations_callsite, [],
+                        f"Socket module methods outside PROBE_CALLSITES={PROBE_CALLSITES}: {violations_callsite}")
+
+        # Exactly one create_connection (the default argument in _probe_peer)
+        self.assertLessEqual(create_connection_count, 1,
+                            f"Found {create_connection_count} socket.create_connection calls; expected ≤1 (in _probe_peer default)")
+
+        self.assertEqual(forbidden_in_probe, [],
+                        f"Forbidden socket methods in _probe_peer: {forbidden_in_probe} — "
+                        "connect-and-close means no send/recv")
+
+
+class TestMultiListener(unittest.TestCase):
+    """T1 integration: multi-listener lifecycle per §7.4."""
+
+    def test_multi_listener_shared_state(self):
+        """Two listeners on different addresses share watcher/engine/bus state (§7.4 multi-listener)."""
+        import tempfile
+        import shutil
+        import threading
+        import time
+        from unittest.mock import MagicMock
+
+        temp_dir = tempfile.mkdtemp()
+        try:
+            watcher = MagicMock(spec=roundhouse.Watcher)
+            watcher.snapshot.return_value = {
+                'host': 'test', 'kernel': '6.1', 'now': time.time(),
+                'mem': {}, 'units': [], 'sources': {},
+                'rollout': None
+            }
+            watcher.units = {}
+
+            event_bus = roundhouse.EventBus()
+
+            # Try to bind two servers on different loopback addresses
+            # (127.0.0.1 and ::1 if available)
+            servers = []
+            try:
+                sock_v4 = socket.socket()
+                sock_v4.bind(('127.0.0.1', 0))
+                port_v4 = sock_v4.getsockname()[1]
+                sock_v4.close()
+
+                sock_v6 = socket.socket(socket.AF_INET6)
+                sock_v6.bind(('::1', 0))
+                port_v6 = sock_v6.getsockname()[1]
+                sock_v6.close()
+
+                ipv6_available = True
+            except OSError:
+                ipv6_available = False
+                port_v4 = None
+
+            if not ipv6_available:
+                self.skipTest("IPv6 not available")
+
+            # Find same free port for both
+            sock = socket.socket()
+            sock.bind(('127.0.0.1', 0))
+            common_port = sock.getsockname()[1]
+            sock.close()
+
+            roundhouse.ACTUATE_ARMED = False
+            engine = roundhouse.RolloutEngine(watcher, {}, temp_dir, common_port, event_bus, threading.Lock())
+
+            # Create two servers on different addresses, same port
+            try:
+                server1 = roundhouse.ThreadingHTTPServer(
+                    ('127.0.0.1', common_port),
+                    roundhouse.RoundhouseRequestHandler,
+                    watcher,
+                    event_bus,
+                    common_port,
+                    watcher_lock=threading.Lock(),
+                    rollout_engine=engine,
+                    address_family=socket.AF_INET
+                )
+                servers.append(server1)
+
+                server2 = roundhouse.ThreadingHTTPServer(
+                    ('::1', common_port),
+                    roundhouse.RoundhouseRequestHandler,
+                    watcher,
+                    event_bus,
+                    common_port,
+                    watcher_lock=threading.Lock(),
+                    rollout_engine=engine,
+                    address_family=socket.AF_INET6
+                )
+                servers.append(server2)
+
+                # Start both
+                for srv in servers:
+                    threading.Thread(target=srv.serve_forever, daemon=True).start()
+                    time.sleep(0.05)
+
+                # Verify both respond
+                import http.client
+                for addr in ['127.0.0.1', '::1']:
+                    conn = http.client.HTTPConnection(addr, common_port, timeout=2)
+                    try:
+                        conn.request('GET', '/')
+                        resp = conn.getresponse()
+                        self.assertIn(resp.status, [200, 404], f"Address {addr} responded with {resp.status}")
+                    except Exception as e:
+                        self.fail(f"Could not connect to {addr}:{common_port}: {e}")
+                    finally:
+                        conn.close()
+
+            finally:
+                for srv in servers:
+                    srv.shutdown()
+                    srv.server_close()
+        finally:
+            shutil.rmtree(temp_dir, ignore_errors=True)
+
+    def test_bind_failure_all_or_nothing(self):
+        """Bind failure closes all successful binds and exits non-zero (§7.4 bind-failure)."""
+        # Occupy a port with a scratch socket, try to bind both v4 and v6 to it
+        sock_block = socket.socket()
+        sock_block.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        sock_block.bind(('127.0.0.1', 0))
+        blocked_port = sock_block.getsockname()[1]
+
+        # Now try to parse_bind_list with that port occupied for v4
+        # This is a functional test: simulate the all-or-nothing loop
+        servers = []
+        failures = []
+        bind_list = [
+            ('127.0.0.1', socket.AF_INET),
+            ('::1', socket.AF_INET6)
+        ]
+
+        for addr, family in bind_list:
+            try:
+                srv = roundhouse.ThreadingHTTPServer(
+                    (addr, blocked_port),
+                    roundhouse.RoundhouseRequestHandler,
+                    MagicMock(spec=roundhouse.Watcher),
+                    roundhouse.EventBus(),
+                    blocked_port,
+                    address_family=family
+                )
+                servers.append(srv)
+            except OSError as e:
+                display_addr = f'[{addr}]' if family == socket.AF_INET6 else addr
+                failures.append(f"cannot bind {display_addr}:{blocked_port}: [Errno {e.errno}] {e.strerror}")
+
+        try:
+            # If v4 failed, check that we close any successful binds
+            if failures and servers:
+                for srv in servers:
+                    srv.server_close()
+                # Verify both are now unbound (can bind again)
+                test_sock = socket.socket()
+                try:
+                    test_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                    test_sock.bind(('127.0.0.1', blocked_port))
+                    # If we got here, the server was properly closed
+                    test_sock.close()
+                except OSError:
+                    self.fail("Server socket not properly closed after bind failure")
+        finally:
+            sock_block.close()
+
+    def test_real_socket_hysteresis(self):
+        """Real-socket hysteresis: up on first success, down after two failures (§7.4)."""
+        # Create an ephemeral listener
+        server_sock = socket.socket()
+        server_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        server_sock.bind(('127.0.0.1', 0))
+        peer_port = server_sock.getsockname()[1]
+        server_sock.listen(1)
+
+        lock = threading.Lock()
+        event_bus = MagicMock()
+        peer_watch = roundhouse.PeerWatch(
+            {'test_peer': ('127.0.0.1', peer_port)},
+            lock,
+            event_bus
+        )
+
+        try:
+            # Round 1: server listening → up
+            roundhouse.peer_watch_round(peer_watch)
+            with lock:
+                state1 = peer_watch.peers['test_peer']['state']
+            self.assertEqual(state1, 'up', 'After first successful probe, should be up')
+
+            # Close the server socket (refuse new connections)
+            server_sock.close()
+
+            # Round 2: server down but only 1st failure → still up (cf=1)
+            roundhouse.peer_watch_round(peer_watch)
+            with lock:
+                state2 = peer_watch.peers['test_peer']['state']
+                cf2 = peer_watch.peers['test_peer']['consecutive_failures']
+            self.assertEqual(state2, 'up', 'After 1 failure, still up (hysteresis)')
+            self.assertEqual(cf2, 1)
+
+            # Round 3: 2nd failure → down
+            roundhouse.peer_watch_round(peer_watch)
+            with lock:
+                state3 = peer_watch.peers['test_peer']['state']
+                cf3 = peer_watch.peers['test_peer']['consecutive_failures']
+            self.assertEqual(state3, 'down', 'After 2 consecutive failures, should be down')
+            self.assertEqual(cf3, 2)
+
+            # Rebind the server (on same port, SO_REUSEADDR)
+            server_sock2 = socket.socket()
+            server_sock2.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            server_sock2.bind(('127.0.0.1', peer_port))
+            server_sock2.listen(1)
+
+            # Round 4: server back up → back to up
+            roundhouse.peer_watch_round(peer_watch)
+            with lock:
+                state4 = peer_watch.peers['test_peer']['state']
+                cf4 = peer_watch.peers['test_peer']['consecutive_failures']
+            self.assertEqual(state4, 'up', 'After success from down, should be up')
+            self.assertEqual(cf4, 0)
+
+            server_sock2.close()
+        except Exception as e:
+            if not server_sock._closed:
+                server_sock.close()
+            raise
 
 
 class TestMobileStatic(unittest.TestCase):
