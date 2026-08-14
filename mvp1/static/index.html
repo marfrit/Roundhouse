@@ -776,6 +776,57 @@
                 display: none;
             }
         }
+
+        .peer-strip {
+            margin-bottom: 1.5em;
+            padding: 0.75em;
+            background: var(--border);
+            border: 1px solid var(--border);
+            border-radius: 3px;
+            display: flex;
+            gap: 1em;
+            align-items: center;
+            flex-wrap: wrap;
+        }
+
+        .peer-strip-title {
+            font-weight: bold;
+            min-width: 80px;
+        }
+
+        .peer-item {
+            display: flex;
+            align-items: center;
+            gap: 0.5em;
+            padding: 0.25em 0.5em;
+            background: rgba(0, 0, 0, 0.2);
+            border-radius: 2px;
+            min-height: 24px;
+        }
+
+        .peer-item.up {
+            background: rgba(63, 185, 80, 0.15);
+        }
+
+        .peer-item.down {
+            background: rgba(248, 81, 73, 0.15);
+        }
+
+        .peer-item.unknown {
+            background: rgba(110, 118, 129, 0.15);
+        }
+
+        .peer-glyph {
+            display: inline-block;
+            font-size: 1em;
+            min-width: 1em;
+            text-align: center;
+        }
+
+        .peer-name {
+            font-family: 'Courier New', monospace;
+            font-size: 0.9em;
+        }
     </style>
 </head>
 <body>
@@ -811,6 +862,11 @@
                 <button id="dismiss-button" class="link-button" onclick="dismiss()">dismiss</button>
             </span>
         </div>
+    </div>
+
+    <div class="peer-strip" id="peer-strip" style="display: none;">
+        <div class="peer-strip-title">peers:</div>
+        <div id="peer-items"></div>
     </div>
 
     <div class="section" id="active-section">
@@ -994,12 +1050,25 @@
             }
         });
 
+        eventSource.addEventListener('peer', (e) => {
+            const data = JSON.parse(e.data);
+            if (!state.peers) state.peers = [];
+            const peer = state.peers.find(p => p.name === data.name);
+            if (peer) {
+                Object.assign(peer, data);
+            } else {
+                state.peers.push(data);
+            }
+            renderPeers();
+        });
+
         eventSource.onerror = () => {
             showDegradedBanner('sensing degraded (connection lost)');
         };
 
         function render() {
             renderHeader();
+            renderPeers();
             renderUnits();
             renderPortBoard();
         }
@@ -1030,6 +1099,49 @@
             const total_gb = (total / 1e9).toFixed(1);
             const avail_gb = ((state.mem.available_bytes || 0) / 1e9).toFixed(1);
             document.getElementById('mem-text').textContent = `${avail_gb} / ${total_gb} GiB`;
+        }
+
+        function renderPeers() {
+            const peers = state.peers || [];
+            const strip = document.getElementById('peer-strip');
+            const peerItems = document.getElementById('peer-items');
+
+            if (peers.length === 0) {
+                strip.style.display = 'none';
+                return;
+            }
+
+            strip.style.display = 'flex';
+            peerItems.replaceChildren();
+
+            for (const peer of peers) {
+                const item = document.createElement('div');
+                item.className = 'peer-item ' + (peer.state || 'unknown');
+
+                const glyph = document.createElement('span');
+                glyph.className = 'peer-glyph';
+                if (peer.state === 'up') {
+                    glyph.textContent = '●';
+                } else if (peer.state === 'down') {
+                    glyph.textContent = '●';
+                } else {
+                    glyph.textContent = '◌';
+                }
+                item.appendChild(glyph);
+
+                const name = document.createElement('span');
+                name.className = 'peer-name';
+                name.textContent = peer.name + ' ' + peer.state;
+                item.appendChild(name);
+
+                const label = document.createElement('span');
+                label.textContent = ' (reachable)';
+                label.style.fontSize = '0.8em';
+                label.style.color = 'var(--neutral)';
+                item.appendChild(label);
+
+                peerItems.appendChild(item);
+            }
         }
 
         function renderUnits() {

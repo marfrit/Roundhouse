@@ -973,7 +973,7 @@ class TestWriteGuards(unittest.TestCase):
         # GET-only paths do_POST recognises purely to answer 405 (§4 status doctrine)
         get_only = {'/', '/api/units', '/api/ports', '/api/deployments',
                     '/api/mem', '/api/events', '/api/routing-config',
-                    '/api/routing-config.json', '/api/warm'}
+                    '/api/routing-config.json', '/api/warm', '/api/peers'}
         allowed = from_frozen | get_only
 
         self.assertEqual(

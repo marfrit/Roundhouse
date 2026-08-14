@@ -427,6 +427,20 @@ TOOLS = {
         'shaper': None,
         'send_requester': False,
     },
+    'peer_status': {
+        'description': 'Fleet peer reachability watch: declared peers, their TCP connect state (up/down/unknown), state duration, and last probe time.',
+        'schema': {
+            'type': 'object',
+            'properties': {},
+            'additionalProperties': False
+        },
+        'method': 'GET',
+        'path': '/api/peers',
+        'action': False,
+        'body_args': (),
+        'shaper': None,
+        'send_requester': False,
+    },
 }
 
 
@@ -611,7 +625,7 @@ def handle_message(msg, conn_state) -> dict or None:
                     'capabilities': {'tools': {}},
                     'serverInfo': {
                         'name': 'roundhouse-mcp',
-                        'version': '6.0'
+                        'version': '7.0'
                     }
                 }
             }
