@@ -1254,52 +1254,61 @@ class TestMultiListener(unittest.TestCase):
             shutil.rmtree(temp_dir, ignore_errors=True)
 
     def test_bind_failure_all_or_nothing(self):
-        """Bind failure closes all successful binds and exits non-zero (§7.4 bind-failure)."""
-        # Occupy a port with a scratch socket, try to bind both v4 and v6 to it
+        """Bind failure closes every successful bind, and the failure is REAL.
+
+        MVP7 review M1: the first version of this test never called listen() on
+        the blocking socket, and with SO_REUSEADDR on both sides Linux let the
+        server bind and listen anyway — `failures` stayed empty, every assertion
+        below was skipped, and two live listeners leaked into the rest of the
+        suite. A test that cannot fail proves nothing; this one asserts that the
+        collision actually happened before it checks the cleanup.
+        """
         sock_block = socket.socket()
-        sock_block.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        # NO SO_REUSEADDR here, and listen() so the port is genuinely taken:
+        # that combination is what makes the second bind raise EADDRINUSE.
         sock_block.bind(('127.0.0.1', 0))
+        sock_block.listen(1)
         blocked_port = sock_block.getsockname()[1]
 
-        # Now try to parse_bind_list with that port occupied for v4
-        # This is a functional test: simulate the all-or-nothing loop
         servers = []
         failures = []
-        bind_list = [
-            ('127.0.0.1', socket.AF_INET),
-            ('::1', socket.AF_INET6)
-        ]
-
-        for addr, family in bind_list:
-            try:
-                srv = roundhouse.ThreadingHTTPServer(
-                    (addr, blocked_port),
-                    roundhouse.RoundhouseRequestHandler,
-                    MagicMock(spec=roundhouse.Watcher),
-                    roundhouse.EventBus(),
-                    blocked_port,
-                    address_family=family
-                )
-                servers.append(srv)
-            except OSError as e:
-                display_addr = f'[{addr}]' if family == socket.AF_INET6 else addr
-                failures.append(f"cannot bind {display_addr}:{blocked_port}: [Errno {e.errno}] {e.strerror}")
-
         try:
-            # If v4 failed, check that we close any successful binds
-            if failures and servers:
-                for srv in servers:
-                    srv.server_close()
-                # Verify both are now unbound (can bind again)
-                test_sock = socket.socket()
+            for addr, family in (('::1', socket.AF_INET6), ('127.0.0.1', socket.AF_INET)):
                 try:
-                    test_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-                    test_sock.bind(('127.0.0.1', blocked_port))
-                    # If we got here, the server was properly closed
-                    test_sock.close()
-                except OSError:
-                    self.fail("Server socket not properly closed after bind failure")
+                    srv = roundhouse.ThreadingHTTPServer(
+                        (addr, blocked_port),
+                        roundhouse.RoundhouseRequestHandler,
+                        MagicMock(spec=roundhouse.Watcher),
+                        roundhouse.EventBus(),
+                        blocked_port,
+                        address_family=family
+                    )
+                    servers.append(srv)
+                except OSError as e:
+                    display_addr = f'[{addr}]' if family == socket.AF_INET6 else addr
+                    failures.append(
+                        f"cannot bind {display_addr}:{blocked_port}: [Errno {e.errno}] {e.strerror}")
+
+            # THE assertion the old version lacked: the conflict must be real.
+            self.assertTrue(failures, "127.0.0.1 bind should have failed on an occupied port")
+            self.assertIn('127.0.0.1', failures[0])
+            self.assertIn('Errno', failures[0])
+
+            # All-or-nothing: everything that did bind gets closed.
+            for srv in servers:
+                srv.server_close()
+            servers = []
+
+            probe = socket.socket(socket.AF_INET6, socket.SOCK_STREAM)
+            try:
+                probe.bind(('::1', blocked_port))
+            except OSError:
+                self.fail("a successful listener was not closed after the failed bind")
+            finally:
+                probe.close()
         finally:
+            for srv in servers:
+                srv.server_close()
             sock_block.close()
 
     def test_real_socket_hysteresis(self):

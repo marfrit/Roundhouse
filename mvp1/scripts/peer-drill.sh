@@ -6,8 +6,12 @@
 # round boundary, so "down after two failures" is proven rather than observed once.
 #
 #   ./peer-drill.sh              container legs (read-only instance; no actuation)
-#   ./peer-drill.sh --slot       also the multi-listener shared-operation-slot leg,
-#                                which ARMS an instance and switches a fake unit
+#   RH_UNIT_DIR=<disposable> ./peer-drill.sh --slot
+#                                also the shared-operation-slot leg. This one ARMS
+#                                actuation and STOPS whichever unit the preview
+#                                suggests, so it REFUSES to run unless RH_UNIT_DIR
+#                                is set explicitly — never against the default dir,
+#                                which on a live host holds production models.
 #   ./peer-drill.sh --live       print the live-boltzmann operator checklist and exit
 #
 # Env: RH_PORT (default 8190 — deliberately NOT 8090, so a running roundhouse.service
@@ -21,6 +25,9 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 MVP1="$(dirname "$HERE")"
 RH="$MVP1/roundhouse.py"
 RH_PORT="${RH_PORT:-8190}"
+# Remember whether the operator chose the unit dir BEFORE defaulting it — the
+# --slot guard below is meaningless once the default has been substituted.
+RH_UNIT_DIR_EXPLICIT="${RH_UNIT_DIR+yes}"
 RH_UNIT_DIR="${RH_UNIT_DIR:-$HOME/.config/systemd/user}"
 INTERVAL=5
 PFAKE=9401          # unmanaged port: a legitimate local fake peer
@@ -71,7 +78,21 @@ LIVE
 fi
 
 RUN_SLOT=0
-[ "${1:-}" = "--slot" ] && RUN_SLOT=1
+if [ "${1:-}" = "--slot" ]; then
+    # MVP7 review M3: this leg ARMS an instance and STOPS whatever unit the
+    # preview suggests. Against the default unit dir on a live host that means
+    # production models — the header used to promise "a fake unit", which is
+    # true only inside the throwaway container. Refuse unless the operator has
+    # deliberately pointed the drill somewhere disposable.
+    if [ -z "$RH_UNIT_DIR_EXPLICIT" ]; then
+        echo "refusing --slot: it arms actuation and stops the unit the preview suggests." >&2
+        echo "  Set RH_UNIT_DIR explicitly to a disposable unit dir (the container's, or a" >&2
+        echo "  copy) so this can never stop a production model:" >&2
+        echo "    RH_UNIT_DIR=/home/roundhouse/.config/systemd/user $0 --slot" >&2
+        exit 2
+    fi
+    RUN_SLOT=1
+fi
 
 # ---------------------------------------------------------------- helpers
 PIDS_TO_KILL=()

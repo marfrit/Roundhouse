@@ -3740,14 +3740,32 @@ def validate_peers(peers: dict[str, tuple[str, int]], units: dict,
         # Canonicalize host for comparison
         host_lower = host.lower()
 
-        # Try to parse as IP literal to check is_loopback
+        # Try to parse as IP literal to check is_loopback.
         is_loopback = False
         try:
             ip_obj = ipaddress.ip_address(host)
             is_loopback = ip_obj.is_loopback
+            # An IPv4-mapped IPv6 literal (::ffff:127.0.0.1) is loopback when the
+            # mapped half is; ipaddress only reports that itself on newer Pythons.
+            mapped = getattr(ip_obj, 'ipv4_mapped', None)
+            if mapped is not None and mapped.is_loopback:
+                is_loopback = True
             host_lower = ip_obj.compressed
         except ValueError:
-            pass  # It's a hostname, not a literal
+            # Not an ipaddress-acceptable literal — but the resolver is far more
+            # permissive than ipaddress is. `2130706433`, `0x7f000001`,
+            # `0177.0.0.1` and `127.000.000.001` all reach 127.0.0.1 through
+            # getaddrinfo while failing ip_address(), so a peer spelled that way
+            # would slip the loopback rule and probe a managed port on this host
+            # (MVP7 review M2). inet_aton accepts exactly that legacy family.
+            try:
+                packed = socket.inet_aton(host)
+            except OSError:
+                pass  # genuinely a hostname
+            else:
+                ip_obj = ipaddress.ip_address(packed)
+                is_loopback = ip_obj.is_loopback
+                host_lower = ip_obj.compressed
 
         # Check collision rule: host ∈ LOCAL_FORMS AND port ∈ MANAGED_PORTS.
         # A loopback literal IS this host by definition — the whole of 127.0.0.0/8
