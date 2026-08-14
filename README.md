@@ -133,6 +133,8 @@ Against the field: an engine-agnostic driver contract, desired-state reconciliat
 5. **Proxy generation + on-demand:** emit LiteLLM config from LogicalModels, and implement request-triggered autoscale-to-warm.
 6. **MCP interface:** an MCP server exposing the fleet to agents as first-class operators — read tools for the roster, deployments, port board, and measured feasibility; action tools for the turntable switch, parameter rollouts, and load-strategy toggles. Every action tool goes through the exact same gate as the UI (`--actuate` + bearer token, preflights, the operation slot, RETIRED lockout, the enable-collision interlock) — an agent's tool call is an operator action, not an autonomous loop, and a preflight refusal comes back machine-readable so the agent can reason about *why* (claimants, fit arithmetic, gates) instead of retrying blind.
 
+7. **Listen list + peer watch:** `--bind` takes a list of addresses (so Roundhouse can sit on loopback behind caddy with no second unencrypted door), and `--peer NAME=HOST:PORT` declares other fleet hosts to watch with a once-a-minute TCP connect. Sensing only, in both halves: the watch says *reachable*, never *healthy*, and cannot start, stop, or wake anything. See [docs/PEERS.md](docs/PEERS.md).
+
 ## License / contributing
 
 Do whatever you want with this design. Built as the control plane for a personal heterogeneous inference fleet, and shared as prior art. Issues and better ideas welcome.

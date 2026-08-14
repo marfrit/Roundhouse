@@ -428,7 +428,7 @@ TOOLS = {
         'send_requester': False,
     },
     'peer_status': {
-        'description': 'Fleet peer reachability watch: declared peers, their TCP connect state (up/down/unknown), state duration, and last probe time.',
+        'description': 'Peer reachability watch: declared peers with up/down/unknown state, since, last probe, and last error — reachable means a TCP connect succeeded, not healthy.',
         'schema': {
             'type': 'object',
             'properties': {},

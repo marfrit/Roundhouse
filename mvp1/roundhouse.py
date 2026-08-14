@@ -1674,8 +1674,7 @@ class Watcher:
                 'unit_file_state': self.self_unit_file_state,
                 'enabled': self.self_unit_file_state == 'enabled'
             },
-            'units': units_list,
-            'peers': getattr(self, 'peer_watch', None) and self.peer_watch.peers or []
+            'units': units_list
         }
 
     def _get_rung(self, unit_name: str) -> Optional[str]:
@@ -2975,18 +2974,31 @@ class RoundhouseRequestHandler(http.server.BaseHTTPRequestHandler):
         self.send_json({'host': host, 'deployments': deployments})
 
     def serve_peers(self):
-        """Serve /api/peers (peer reachability status).
+        """Serve /api/peers (peer reachability status). Frozen envelope, §5.1.
 
-        Frozen shape per MVP7-SPEC §7: peers is a list of peer records with
-        name, host, port, state (up/down/unknown), since, last_probe,
-        consecutive_failures, last_error. The 'means' string is frozen as
-        "reachable" — a TCP connect proves something is listening; it proves
-        nothing about serving or health.
+        `peers` is a list of rows with name, host, port, state (up/down/unknown),
+        since, last_probe, consecutive_failures, last_error — the same rows the
+        snapshot key carries, because it is the same function producing them.
+        `probe` states the method and the cadence actually in force; `means` is the
+        contract's Part 2.5 sentence verbatim: reachable, never healthy.
+
+        No peers declared → an empty list in the same envelope; the route always
+        exists. Rows are read under watcher_lock and serialized outside it.
         """
-        snapshot = self.server.take_snapshot()
+        peer_watch = getattr(self.server, 'peer_watch', None)
+        if peer_watch:
+            with self.server.watcher_lock:
+                rows = peer_watch.rows_unlocked()
+        else:
+            rows = []
         self.send_json({
-            'means': 'reachable',
-            'peers': snapshot.get('peers', [])
+            'peers': rows,
+            'probe': {
+                'method': 'tcp-connect',
+                'timeout_seconds': PEER_TIMEOUT_SEC,
+                'cadence_seconds': getattr(self.server, 'peer_interval', PEER_INTERVAL_SEC),
+            },
+            'means': PEER_MEANS,
         })
 
     def serve_rollout(self, rollout_id: str):
@@ -3415,13 +3427,19 @@ class ThreadingHTTPServer(http.server.ThreadingHTTPServer):
 
     def __init__(self, host_port, handler_class, watcher, event_bus, port,
                  watcher_lock=None, rollout_engine=None, advertise_host=None,
-                 peer_watch=None, address_family=None):
+                 peer_watch=None, address_family=None,
+                 peer_interval=None):
         self.watcher = watcher
         self.event_bus = event_bus
         self.port = port
         self.rollout_engine = rollout_engine
         self.advertise_host = advertise_host
         self.peer_watch = peer_watch
+        # /api/peers reports the cadence it is actually running at (§5.1), so the
+        # drill's 5 s and production's 60 s are both true on the wire. Resolved
+        # here, not in the signature: Section F's constants are defined below this
+        # class and a default expression would be evaluated at import time.
+        self.peer_interval = PEER_INTERVAL_SEC if peer_interval is None else peer_interval
         # snapshot() reads AND writes watcher state (rung cache commit is
         # elsewhere, but _state mutates under the sensing threads), so every
         # handler read must take the same lock the threads use. Sockets are
@@ -3445,6 +3463,10 @@ class ThreadingHTTPServer(http.server.ThreadingHTTPServer):
                 snapshot['rollout'] = rollout_public_record(self.rollout_engine.current)
             else:
                 snapshot['rollout'] = None
+            # §5.2: peers merge here, under the same lock, from the same function that
+            # serves /api/peers — rows_unlocked must NOT re-acquire (watcher_lock is
+            # non-reentrant; recon 3). No PeerWatch declared → the key is [], never absent.
+            snapshot['peers'] = self.peer_watch.rows_unlocked() if self.peer_watch else []
             return snapshot
 
 
@@ -3455,6 +3477,27 @@ PEER_TIMEOUT_SEC = 2.0
 PEER_INTERVAL_SEC = 60
 PEER_MAX = 8
 
+# The contract's Part 2.5 statement, made machine-visible on /api/peers (§5.1). Frozen.
+PEER_MEANS = ('reachable, not healthy: a TCP connect proves something is listening '
+              'on that port and nothing more')
+
+
+def bind_display(addr: str, family: int) -> str:
+    """Render a bind address for humans: IPv6 literals are bracketed (§3.3)."""
+    return f'[{addr}]' if family == socket.AF_INET6 else addr
+
+
+def validate_peer_interval(interval: int) -> List[str]:
+    """J6: `--peer-interval SECONDS` (default 60, min 1).
+
+    Below 1 the cadence loop stops being a cadence: `wait(0)` returns immediately
+    and the watch thread spins, probing without pause. Configuration error, batched
+    with the other startup refusals.
+    """
+    if interval < 1:
+        return [f'--peer-interval must be at least 1 second (got {interval})']
+    return []
+
 
 def parse_bind_list(values: Optional[List[str]]) -> tuple[List[tuple[str, int]], List[str]]:
     """Parse --bind repeatable/comma-list arguments per §3.1.
@@ -3463,7 +3506,6 @@ def parse_bind_list(values: Optional[List[str]]) -> tuple[List[tuple[str, int]],
     Default if values is None: [('0.0.0.0', socket.AF_INET)]
     Errors collected; caller exits with all listed (§3.1).
     """
-    import ipaddress
     if values is None:
         return [('0.0.0.0', socket.AF_INET)], []
 
@@ -3642,17 +3684,12 @@ def local_host_forms(nodename: str, advertise_host: str, bind_addrs: List[str]) 
         if addr not in ('0.0.0.0', '::'):
             forms.add(addr.lower())
 
-    # Add loopback literals (IPv4 and IPv6)
-    try:
-        # Test ::1
-        socket.inet_pton(socket.AF_INET6, '::1')
-        forms.add('::1')
-    except:
-        pass
-
-    # All of 127.0.0.0/8 are loopback (add common patterns)
+    # Loopback literals are NOT enumerated here: 127.0.0.0/8 has 16 million members
+    # and an enumeration would silently miss 127.1.2.3. validate_peers applies the
+    # §6.3 loopback rule structurally instead (ipaddress .is_loopback). The two most
+    # common spellings stay in the set so the forms are readable in a debugger.
     forms.add('127.0.0.1')
-    forms.add('127.0.0.2')
+    forms.add('::1')
 
     # Add wildcards (nonsense as peer hosts; caught here per §6.3)
     forms.add('0.0.0.0')
@@ -3712,14 +3749,23 @@ def validate_peers(peers: dict[str, tuple[str, int]], units: dict,
         except ValueError:
             pass  # It's a hostname, not a literal
 
-        # Check collision rule: host ∈ LOCAL_FORMS AND port ∈ MANAGED_PORTS
-        if host_lower in local_forms and port in managed_ports:
+        # Check collision rule: host ∈ LOCAL_FORMS AND port ∈ MANAGED_PORTS.
+        # A loopback literal IS this host by definition — the whole of 127.0.0.0/8
+        # and ::1, not just the few forms an enumeration can spell out (§6.3).
+        if (host_lower in local_forms or is_loopback) and port in managed_ports:
             # Find the managing unit for better error message
             if port == self_port:
                 unit_service = 'roundhouse.service'
             else:
+                # `units` is keyed by the full unit name already — appending another
+                # '.service' printed 'qwen3.6-coding.service.service' at the operator.
                 unit_name = port_to_unit.get(port)
-                unit_service = f'{unit_name}.service' if unit_name else '(unknown).service'
+                if not unit_name:
+                    unit_service = '(unknown).service'
+                elif unit_name.endswith('.service'):
+                    unit_service = unit_name
+                else:
+                    unit_service = f'{unit_name}.service'
 
             errors.append(
                 f"peer '{name}' targets {host}:{port} — port {port} is managed unit "
@@ -7437,8 +7483,8 @@ def cmd_serve(args):
     bind_list, bind_errors = parse_bind_list(args.bind)
     peer_decls, peer_errors = parse_peer_decls(args.peer)
 
-    # Collect all errors
-    all_errors = bind_errors + peer_errors
+    # Collect all errors (J3: every parse/validation offense is reported before the exit)
+    all_errors = bind_errors + peer_errors + validate_peer_interval(args.peer_interval)
     if all_errors:
         for error in all_errors:
             print(error, file=sys.stderr)
@@ -7475,24 +7521,31 @@ def cmd_serve(args):
                     rollout_engine=rollout_engine,
                     advertise_host=advertise_host,
                     peer_watch=peer_watch,
-                    address_family=family
+                    address_family=family,
+                    peer_interval=args.peer_interval
                 )
-                servers.append(server)
-                # Display address with brackets for IPv6
-                display_addr = f'[{addr}]' if family == socket.AF_INET6 else addr
-                print(f"Roundhouse listening on http://{display_addr}:{port}")
+                servers.append((server, bind_display(addr, family)))
             except OSError as e:
                 # Track failure but continue to try other addresses
-                display_addr = f'[{addr}]' if family == socket.AF_INET6 else addr
-                failures.append(f"cannot bind {display_addr}:{port}: [Errno {e.errno}] {e.strerror}")
+                failures.append(f"cannot bind {bind_display(addr, family)}:{port}: "
+                                f"[Errno {e.errno}] {e.strerror}")
 
         # All-or-nothing check: if any address failed, close all successful ones and exit
         if failures:
-            for srv in servers:
+            for srv, _display_addr in servers:
                 srv.server_close()  # Close all successfully bound sockets
             for line in failures:
                 print(line, file=sys.stderr)
             return 1
+
+        # Announce only once EVERY bind has succeeded: a "listening" line for a door
+        # that startup is about to close is the lie this milestone exists to remove.
+        # flush: stdout is block-buffered on a pipe, so under systemd these lines
+        # would otherwise surface only when the process exits — the announcement is
+        # for the operator reading `systemctl status` now, not for the postmortem.
+        for _srv, display_addr in servers:
+            print(f"Roundhouse listening on http://{display_addr}:{port}", flush=True)
+        servers = [srv for srv, _display_addr in servers]
 
         # Setup signal handler (simplified per J1 — no helper thread needed)
         def signal_handler(sig, frame):
@@ -7509,9 +7562,10 @@ def cmd_serve(args):
 
         # Start listener threads (daemon, one per server — J1)
         listener_threads = []
-        for i, srv in enumerate(servers):
-            host, port_num = srv.server_address
-            thread_name = f'http-{host}'
+        for srv in servers:
+            # An AF_INET6 sockaddr is (host, port, flowinfo, scope_id) — index, never
+            # unpack, or every IPv6 listener dies right after announcing itself.
+            thread_name = f'http-{srv.server_address[0]}'
             t = threading.Thread(target=srv.serve_forever, daemon=True, name=thread_name)
             t.start()
             listener_threads.append(t)

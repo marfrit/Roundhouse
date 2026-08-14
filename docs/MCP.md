@@ -162,7 +162,7 @@ Or set the env var in Claude Code's `.mcp.json`:
 **Description:** Warm queue state: the pending parked request and the last disposition, or nulls.
 
 #### 8. `peer_status`
-**Description:** Fleet peer reachability watch: declared peers, their TCP connect state (up/down/unknown), state duration, and last probe time.
+**Description:** Peer reachability watch: declared peers with up/down/unknown state, since, last probe, and last error — reachable means a TCP connect succeeded, not healthy.
 
 **Example Call:**
 ```json
@@ -181,7 +181,6 @@ Or set the env var in Claude Code's `.mcp.json`:
 ```json
 {
   "http_status": 200,
-  "means": "reachable",
   "peers": [
     {
       "name": "ampere",
@@ -201,18 +200,27 @@ Or set the env var in Claude Code's `.mcp.json`:
       "since": 1692345480.0,
       "last_probe": 1692345720.0,
       "consecutive_failures": 2,
-      "last_error": "Connection refused"
+      "last_error": "ConnectionRefusedError: [Errno 111] Connection refused"
     }
-  ]
+  ],
+  "probe": {
+    "method": "tcp-connect",
+    "timeout_seconds": 2.0,
+    "cadence_seconds": 60
+  },
+  "means": "reachable, not healthy: a TCP connect proves something is listening on that port and nothing more"
 }
 ```
 
 **Remarks:**
-- `means`: Always "reachable" — a TCP connect proves listening; nothing more about serving or health.
+- `means`: Frozen verbatim, and it is the point of the tool — a TCP connect proves listening; it proves nothing about serving, health, or the fleet behind the port.
+- `probe`: What the watch actually does — a TCP connect with a 2 s timeout, re-resolving the name every round. `cadence_seconds` reflects the cadence the server is running at, not a constant.
 - `state`: One of `up` (first successful connect), `down` (two consecutive failures), or `unknown` (never probed yet).
 - `since`: Epoch timestamp of the last state transition.
 - `consecutive_failures`: Counter toward hysteresis gate; resets to 0 on success.
 - `last_error`: Human-readable reason for last failure, or null if never failed.
+
+**Boundary:** the catalog is frozen at 17 as of MVP7. `peer_status` is a read, and peers are never MCP action targets — Roundhouse does not start, stop, wake, or otherwise touch another host (MVP7 contract, Out of scope). The watch is sensing only: peer state feeds no placement, no warm decision, and no operation slot.
 
 ---
 
@@ -436,7 +444,7 @@ To query Roundhouse against a live (read-only) instance without actuate privileg
 }
 ```
 
-**Read tools work with or without a token:** `fleet_status`, `unit_detail`, `port_board`, `deployments`, `routing_config`, `operation_status`, `warm_state`. Every GET route is unauthenticated by design (MVP2 E8), so a token-less registration is a fully functional read-only client — the `env` block above can be dropped entirely.
+**Read tools work with or without a token:** `fleet_status`, `unit_detail`, `port_board`, `deployments`, `routing_config`, `operation_status`, `warm_state`, `peer_status`. Every GET route is unauthenticated by design (MVP2 E8), so a token-less registration is a fully functional read-only client — the `env` block above can be dropped entirely.
 
 **Action tools refuse — but read which refusal you get.** The token check happens in the MCP server, *before* any HTTP request, so the two cases are distinguishable and both arrive with `isError: false`:
 

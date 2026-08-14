@@ -496,7 +496,7 @@ class TestWatcher(unittest.TestCase):
         snap = watcher.snapshot()
 
         # Check top-level keys
-        required_keys = {'host', 'kernel', 'now', 'mem', 'sources', 'self_port', 'self_unit', 'units', 'peers'}
+        required_keys = {'host', 'kernel', 'now', 'mem', 'sources', 'self_port', 'self_unit', 'units'}
         self.assertEqual(set(snap.keys()), required_keys)
 
         # Check mem dict

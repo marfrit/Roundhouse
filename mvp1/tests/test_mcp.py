@@ -1851,5 +1851,146 @@ def _mvp5_unit(unit_name: str, alias: str or None, port: int, on_demand: bool = 
     return parsed
 
 
+class TestPeerStatusTool(unittest.TestCase):
+    """§5.5 / §7.5: tool #17 is a passthrough read of /api/peers.
+
+    The catalog row is asserted structurally by TestFrozenCatalog; this class
+    proves the tool actually reaches the route and hands the envelope back
+    field-for-field, which is the only way `/api/peers`, the snapshot key and
+    `peer_status` can be said to agree.
+    """
+
+    PEERS = {'ampere': ('ampere.fritz.box', 8099), 'dirac': ('dirac.fritz.box', 22)}
+
+    @classmethod
+    def setUpClass(cls):
+        cls.watcher = MagicMock(spec=roundhouse.Watcher)
+        cls.watcher.lock = threading.Lock()
+        cls.watcher.units = {}
+        cls.watcher.mem_store = None
+        cls.watcher.snapshot.side_effect = lambda: {
+            'host': 'testhost', 'kernel': '6.1.0-test', 'now': 1000.0,
+            'mem': {'total_bytes': 1, 'available_bytes': 1},
+            'sources': {'journal': 'ok', 'systemctl': 'ok'},
+            'self_port': cls.port, 'units': [],
+        }
+        cls.event_bus = roundhouse.EventBus()
+
+        sock = socket.socket()
+        sock.bind(('127.0.0.1', 0))
+        cls.port = sock.getsockname()[1]
+        sock.close()
+
+        cls.peer_watch = roundhouse.PeerWatch(cls.PEERS, cls.watcher.lock, cls.event_bus)
+        cls.server = roundhouse.ThreadingHTTPServer(
+            ('127.0.0.1', cls.port), roundhouse.RoundhouseRequestHandler,
+            cls.watcher, cls.event_bus, cls.port,
+            watcher_lock=cls.watcher.lock, peer_watch=cls.peer_watch, peer_interval=60)
+        cls.thread = threading.Thread(target=cls.server.serve_forever, daemon=True)
+        cls.thread.start()
+        time.sleep(0.1)
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.server.shutdown()
+        cls.server.server_close()
+
+    def _http_peers(self):
+        conn = http.client.HTTPConnection('127.0.0.1', self.port, timeout=5)
+        try:
+            conn.request('GET', '/api/peers')
+            resp = conn.getresponse()
+            return resp.status, json.loads(resp.read())
+        finally:
+            conn.close()
+
+    def _call(self):
+        response = roundhouse_mcp.handle_message(
+            {'jsonrpc': '2.0', 'id': 1, 'method': 'tools/call',
+             'params': {'name': 'peer_status', 'arguments': {}}},
+            {'url': f'http://127.0.0.1:{self.port}', 'client_name': 'test-client'})
+        text = response['result']['content'][0]['text']
+        return json.loads(text), response['result'].get('isError', False)
+
+    def test_passthrough_is_field_for_field(self):
+        with self.peer_watch.lock:
+            self.peer_watch.apply_result_unlocked('ampere', True, None, 1755100000.0)
+        status, body = self._http_peers()
+        result, is_error = self._call()
+
+        self.assertEqual(status, 200)
+        self.assertFalse(is_error)
+        self.assertEqual(result['http_status'], 200)
+        stripped = {k: v for k, v in result.items() if k != 'http_status'}
+        self.assertEqual(stripped, body)
+        self.assertEqual(stripped['probe']['method'], 'tcp-connect')
+        self.assertIn('not healthy', stripped['means'])
+        self.assertEqual([r['name'] for r in stripped['peers']], ['ampere', 'dirac'])
+
+    def test_needs_no_token(self):
+        """A read, so a token-less agent registration is fully functional."""
+        with patch.dict(os.environ, {}, clear=True), \
+             patch.object(roundhouse_mcp.os.path, 'expanduser',
+                          lambda p: '/nonexistent/roundhouse/token'):
+            result, is_error = self._call()
+        self.assertFalse(is_error)
+        self.assertEqual(result['http_status'], 200)
+
+    def test_description_says_reachable_not_healthy(self):
+        """The catalog text is an agent's only prose about what this tool means."""
+        desc = roundhouse_mcp.TOOLS['peer_status']['description']
+        self.assertIn('reachable', desc)
+        self.assertIn('not healthy', desc)
+
+    def test_peers_are_never_action_targets(self):
+        """Contract Out-of-scope: no peer tool may be an action."""
+        for name, row in roundhouse_mcp.TOOLS.items():
+            if 'peer' in name:
+                self.assertFalse(row['action'], name)
+                self.assertEqual(row['method'], 'GET', name)
+
+
+class TestPeerDocs(unittest.TestCase):
+    """§5.5: docs/MCP.md documents the 17th tool and its boundary."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.doc = (Path(__file__).resolve().parents[2] / 'docs' / 'MCP.md').read_text()
+
+    def _assert_doc_contains(self, needle, why):
+        self.assertTrue(needle in self.doc, f'{why}: docs/MCP.md lacks {needle!r}')
+
+    def test_peer_status_is_documented(self):
+        self._assert_doc_contains('peer_status', 'tool #17 must be in the catalog section')
+        self._assert_doc_contains('#### 8. `peer_status`',
+                                  'the read-tools section must carry the numbered entry')
+
+    def test_documented_result_matches_the_frozen_envelope(self):
+        """A doc example that shows an envelope the server does not serve is worse
+        than no example: an agent codes against it."""
+        self._assert_doc_contains('"probe"', 'the example result must show the probe block')
+        self._assert_doc_contains(roundhouse.PEER_MEANS, 'the `means` string is frozen verbatim')
+
+    def test_documented_description_matches_the_registry(self):
+        self._assert_doc_contains(roundhouse_mcp.TOOLS['peer_status']['description'],
+                                  'the documented description drifted from the registry')
+
+    def test_read_tool_list_includes_peer_status(self):
+        """§5.5: the token paragraph's read-tool list gains peer_status."""
+        para = self.doc[self.doc.index('Read tools work with or without a token'):]
+        para = para[:para.index('\n\n')]
+        self.assertTrue('peer_status' in para,
+                        'peer_status missing from the token-less read-tool list')
+
+    def test_catalog_size_is_stated_as_17(self):
+        self._assert_doc_contains('17-Tool', 'the catalog heading must say 17')
+        self.assertTrue('16-Tool' not in self.doc, 'a stale 16-tool heading survives')
+
+    def test_boundary_statement_present(self):
+        low = self.doc.lower()
+        self.assertTrue('peers are never mcp action targets' in low,
+                        'docs/MCP.md must state the peers-are-not-targets boundary')
+
+
 if __name__ == '__main__':
     unittest.main()

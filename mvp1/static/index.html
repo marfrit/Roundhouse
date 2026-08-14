@@ -794,33 +794,23 @@
             min-width: 80px;
         }
 
+        /* Neutral by contract (§5.4): a peer that is down is information, not an
+           alarm — these are other people's hosts and Roundhouse cannot act on them.
+           up = the ordinary text colour, down/unknown = muted. No red, no amber,
+           no green, and no raw colour literals sneaking past the --red guard. */
         .peer-item {
             display: flex;
             align-items: center;
             gap: 0.5em;
             padding: 0.25em 0.5em;
-            background: rgba(0, 0, 0, 0.2);
             border-radius: 2px;
             min-height: 24px;
+            color: var(--fg);
         }
 
-        .peer-item.up {
-            background: rgba(63, 185, 80, 0.15);
-        }
-
-        .peer-item.down {
-            background: rgba(248, 81, 73, 0.15);
-        }
-
+        .peer-item.down,
         .peer-item.unknown {
-            background: rgba(110, 118, 129, 0.15);
-        }
-
-        .peer-glyph {
-            display: inline-block;
-            font-size: 1em;
-            min-width: 1em;
-            text-align: center;
+            color: var(--neutral);
         }
 
         .peer-name {
@@ -865,7 +855,7 @@
     </div>
 
     <div class="peer-strip" id="peer-strip" style="display: none;">
-        <div class="peer-strip-title">peers:</div>
+        <div class="peer-strip-title">peers (reachable)</div>
         <div id="peer-items"></div>
     </div>
 
@@ -1114,31 +1104,16 @@
             strip.style.display = 'flex';
             peerItems.replaceChildren();
 
+            // The strip is labelled once, in the title — the label states what the
+            // whole strip means (§5.4). Cells are `name · state`, textContent only.
             for (const peer of peers) {
                 const item = document.createElement('div');
                 item.className = 'peer-item ' + (peer.state || 'unknown');
 
-                const glyph = document.createElement('span');
-                glyph.className = 'peer-glyph';
-                if (peer.state === 'up') {
-                    glyph.textContent = '●';
-                } else if (peer.state === 'down') {
-                    glyph.textContent = '●';
-                } else {
-                    glyph.textContent = '◌';
-                }
-                item.appendChild(glyph);
-
                 const name = document.createElement('span');
                 name.className = 'peer-name';
-                name.textContent = peer.name + ' ' + peer.state;
+                name.textContent = peer.name + ' · ' + (peer.state || 'unknown');
                 item.appendChild(name);
-
-                const label = document.createElement('span');
-                label.textContent = ' (reachable)';
-                label.style.fontSize = '0.8em';
-                label.style.color = 'var(--neutral)';
-                item.appendChild(label);
 
                 peerItems.appendChild(item);
             }

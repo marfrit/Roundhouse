@@ -1083,19 +1083,30 @@ class TestWriteGuards(unittest.TestCase):
         parents = self._parents(tree)
 
         PROBE_CALLSITES = {'_probe_peer'}
+        CONNECT_ATTRS = {'create_connection', 'connect', 'connect_ex'}
         FORBIDDEN_SOCKET_METHODS = {'send', 'sendall', 'sendto', 'recv', 'recv_into', 'makefile', 'sendfile'}
+        # sqlite3.connect opens a FILE, not a socket; it is the one benign `connect`
+        # attribute in the tree and is named here rather than left to a value-shape
+        # coincidence. socket.gethostname is outside the guarded set entirely (recon 7).
+        BENIGN_CONNECT_OWNERS = {'sqlite3'}
 
         violations_callsite = []
         create_connection_count = 0
         forbidden_in_probe = []
 
         for node in ast.walk(tree):
-            # Check for socket.create_connection attribute (must be on 'socket' module)
-            if isinstance(node, ast.Attribute) and node.attr == 'create_connection':
-                if isinstance(node.value, ast.Name) and node.value.id == 'socket':
-                    func_name = self._enclosing_func(node, parents)
-                    if func_name not in PROBE_CALLSITES:
-                        violations_callsite.append((node.lineno, 'socket.create_connection', func_name))
+            # (a) every connect-shaped attribute, whoever owns it, must sit in a probe
+            # callsite — an obj.connect((h, p)) on a socket handed in from elsewhere
+            # is exactly the erosion this guard exists to catch.
+            if isinstance(node, ast.Attribute) and node.attr in CONNECT_ATTRS:
+                owner = node.value.id if isinstance(node.value, ast.Name) else None
+                if owner in BENIGN_CONNECT_OWNERS:
+                    continue
+                func_name = self._enclosing_func(node, parents)
+                if func_name not in PROBE_CALLSITES:
+                    violations_callsite.append(
+                        (node.lineno, f'{owner or "<expr>"}.{node.attr}', func_name))
+                if node.attr == 'create_connection':
                     create_connection_count += 1
 
             # Check for socket.socket(...) calls
@@ -1116,9 +1127,12 @@ class TestWriteGuards(unittest.TestCase):
         self.assertEqual(violations_callsite, [],
                         f"Socket module methods outside PROBE_CALLSITES={PROBE_CALLSITES}: {violations_callsite}")
 
-        # Exactly one create_connection (the default argument in _probe_peer)
-        self.assertLessEqual(create_connection_count, 1,
-                            f"Found {create_connection_count} socket.create_connection calls; expected ≤1 (in _probe_peer default)")
+        # (b) EXACTLY one create_connection: the default argument in _probe_peer. Not
+        # "at most" — zero would mean the probe stopped being a probe, and a guard
+        # that is happy with a missing mechanism is not guarding anything.
+        self.assertEqual(create_connection_count, 1,
+                        f"Found {create_connection_count} socket.create_connection nodes; "
+                        "expected exactly 1 (the _probe_peer default argument)")
 
         self.assertEqual(forbidden_in_probe, [],
                         f"Forbidden socket methods in _probe_peer: {forbidden_in_probe} — "
@@ -1177,7 +1191,11 @@ class TestMultiListener(unittest.TestCase):
             sock.close()
 
             roundhouse.ACTUATE_ARMED = False
-            engine = roundhouse.RolloutEngine(watcher, {}, temp_dir, common_port, event_bus, threading.Lock())
+            # J1: every listener is constructed with the SAME watcher, bus, engine and
+            # lock. Handing each server its own lock would still pass a both-doors-answer
+            # test while destroying the property the test claims to prove.
+            shared_lock = threading.Lock()
+            engine = roundhouse.RolloutEngine(watcher, {}, temp_dir, common_port, event_bus, shared_lock)
 
             # Create two servers on different addresses, same port
             try:
@@ -1187,7 +1205,7 @@ class TestMultiListener(unittest.TestCase):
                     watcher,
                     event_bus,
                     common_port,
-                    watcher_lock=threading.Lock(),
+                    watcher_lock=shared_lock,
                     rollout_engine=engine,
                     address_family=socket.AF_INET
                 )
@@ -1199,11 +1217,16 @@ class TestMultiListener(unittest.TestCase):
                     watcher,
                     event_bus,
                     common_port,
-                    watcher_lock=threading.Lock(),
+                    watcher_lock=shared_lock,
                     rollout_engine=engine,
                     address_family=socket.AF_INET6
                 )
                 servers.append(server2)
+
+                self.assertIs(server1.rollout_engine, server2.rollout_engine)
+                self.assertIs(server1.watcher_lock, server2.watcher_lock)
+                self.assertIs(server1.watcher, server2.watcher)
+                self.assertIs(server1.event_bus, server2.event_bus)
 
                 # Start both
                 for srv in servers:
@@ -1555,6 +1578,597 @@ class TestMobileStatic(unittest.TestCase):
                       "Load strategy 'on-boot (enabled)' text not found")
         self.assertIn('manual (disabled)', self.HTML_CONTENT,
                       "Load strategy 'manual (disabled)' text not found")
+
+
+# ===== MVP7 §7.4 legs 4-5, 7 — the surfaces of the peer watch (T2's owed suite) =====
+
+MEANS = ('reachable, not healthy: a TCP connect proves something is listening '
+         'on that port and nothing more')
+
+
+class _PeersRouteHarness(unittest.TestCase):
+    """A live server whose PeerWatch is driven by hand (no sockets, injected clock)."""
+
+    PEERS = {'ampere': ('ampere.fritz.box', 8099), 'dirac': ('dirac.fritz.box', 22)}
+    PEER_INTERVAL = 60
+
+    @classmethod
+    def setUpClass(cls):
+        cls.watcher = StubWatcher()
+        cls.event_bus = roundhouse.EventBus()
+        cls.watcher_lock = threading.Lock()
+        cls.clock = [1_755_100_000.0]
+
+        cls.peer_watch = (roundhouse.PeerWatch(cls.PEERS, cls.watcher_lock, cls.event_bus,
+                                               now=lambda: cls.clock[0])
+                          if cls.PEERS else None)
+
+        sock = socket.socket()
+        sock.bind(('127.0.0.1', 0))
+        cls.port = sock.getsockname()[1]
+        sock.close()
+
+        cls.server = roundhouse.ThreadingHTTPServer(
+            ('127.0.0.1', cls.port), roundhouse.RoundhouseRequestHandler,
+            cls.watcher, cls.event_bus, cls.port,
+            watcher_lock=cls.watcher_lock, peer_watch=cls.peer_watch,
+            peer_interval=cls.PEER_INTERVAL)
+        cls.thread = threading.Thread(target=cls.server.serve_forever, daemon=True)
+        cls.thread.start()
+        time.sleep(0.1)
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.server.shutdown()
+        cls.server.server_close()
+
+    def request(self, method, path, headers=None):
+        conn = http.client.HTTPConnection('127.0.0.1', self.port, timeout=5)
+        try:
+            conn.request(method, path, headers=headers or {})
+            resp = conn.getresponse()
+            return resp.status, resp.read()
+        finally:
+            conn.close()
+
+    def drive(self, name, ok, error=None):
+        """One probe result applied the way peer_watch_round applies it."""
+        with self.watcher_lock:
+            payload = self.peer_watch.apply_result_unlocked(name, ok, error, self.clock[0])
+            if payload:
+                self.event_bus.publish('peer', payload)
+        return payload
+
+
+class TestPeersRoute(_PeersRouteHarness):
+    """§5.1 / §7.4: GET /api/peers — shape, unauthenticated, POST 405."""
+
+    def test_envelope_is_frozen(self):
+        """Exactly three keys; the probe block and the `means` string are verbatim."""
+        status, body = self.request('GET', '/api/peers')
+        self.assertEqual(status, 200)
+        data = json.loads(body)
+        self.assertEqual(set(data.keys()), {'peers', 'probe', 'means'})
+        self.assertEqual(data['probe'], {'method': 'tcp-connect',
+                                         'timeout_seconds': 2.0,
+                                         'cadence_seconds': self.PEER_INTERVAL})
+        self.assertEqual(data['means'], MEANS)
+
+    def test_means_never_claims_health(self):
+        """Contract Part 2.5: the wire says reachable and denies healthy."""
+        _s, body = self.request('GET', '/api/peers')
+        means = json.loads(body)['means']
+        self.assertIn('reachable', means)
+        self.assertIn('not healthy', means)
+
+    def test_rows_are_the_frozen_shape_sorted_by_name(self):
+        status, body = self.request('GET', '/api/peers')
+        rows = json.loads(body)['peers']
+        self.assertEqual([r['name'] for r in rows], ['ampere', 'dirac'])
+        for row in rows:
+            self.assertEqual(set(row.keys()),
+                             {'name', 'host', 'port', 'state', 'since',
+                              'last_probe', 'consecutive_failures', 'last_error'})
+        self.assertEqual(rows[0]['host'], 'ampere.fritz.box')
+        self.assertEqual(rows[0]['port'], 8099)
+
+    def test_declared_peers_actually_reach_the_wire(self):
+        """The regression that made the whole feature invisible: /api/peers served an
+        empty list while peers were declared and probed."""
+        self.drive('ampere', True)
+        try:
+            _s, body = self.request('GET', '/api/peers')
+            rows = json.loads(body)['peers']
+            self.assertEqual(len(rows), 2, 'declared peers missing from /api/peers')
+            ampere = next(r for r in rows if r['name'] == 'ampere')
+            self.assertEqual(ampere['state'], 'up')
+        finally:
+            self.peer_watch.peers['ampere'].update(
+                {'state': 'unknown', 'consecutive_failures': 0,
+                 'last_probe': None, 'last_error': None})
+
+    def test_unauthenticated_like_every_read(self):
+        """No Authorization header, and a bogus bearer, both answer 200."""
+        for headers in ({}, {'Authorization': 'Bearer not-a-real-token'}):
+            status, _body = self.request('GET', '/api/peers', headers=headers)
+            self.assertEqual(status, 200)
+
+    def test_post_is_405(self):
+        status, _body = self.request('POST', '/api/peers')
+        self.assertEqual(status, 405)
+
+    def test_snapshot_key_agrees_field_for_field(self):
+        """§5.2: the snapshot `peers` key and the route serve the same rows."""
+        self.drive('dirac', False, 'TimeoutError: timed out')
+        _s, body = self.request('GET', '/api/peers')
+        route_rows = json.loads(body)['peers']
+        snap_rows = self.server.take_snapshot()['peers']
+        self.assertEqual(snap_rows, route_rows)
+
+    def test_reading_peers_writes_nothing(self):
+        """Three-leg proof: the read route touches no write gateway and no subprocess."""
+        from unittest.mock import patch
+        recorder = []
+
+        def boom(*a, **k):
+            raise AssertionError('write gateway called from /api/peers')
+
+        def record(*a, **k):
+            recorder.append(a)
+            raise AssertionError('subprocess spawned from /api/peers')
+
+        with patch('roundhouse._atomic_write', side_effect=boom), \
+             patch('roundhouse.run_git', side_effect=boom), \
+             patch('roundhouse.run_actuate', side_effect=boom), \
+             patch('roundhouse.subprocess.Popen', side_effect=record), \
+             patch('roundhouse.subprocess.run', side_effect=record):
+            status, _body = self.request('GET', '/api/peers')
+        self.assertEqual(status, 200)
+        self.assertEqual(recorder, [])
+
+
+class TestPeersRouteWithoutPeers(_PeersRouteHarness):
+    """Graceful degradation: the route always exists, even with nothing declared."""
+
+    PEERS = {}
+    PEER_INTERVAL = 5
+
+    def test_empty_envelope_is_the_same_envelope(self):
+        status, body = self.request('GET', '/api/peers')
+        self.assertEqual(status, 200)
+        data = json.loads(body)
+        self.assertEqual(data['peers'], [])
+        self.assertEqual(set(data.keys()), {'peers', 'probe', 'means'})
+        self.assertEqual(data['means'], MEANS)
+
+    def test_cadence_reflects_the_configured_interval(self):
+        _s, body = self.request('GET', '/api/peers')
+        self.assertEqual(json.loads(body)['probe']['cadence_seconds'], 5)
+
+    def test_snapshot_key_present_and_empty(self):
+        snap = self.server.take_snapshot()
+        self.assertIn('peers', snap)
+        self.assertEqual(snap['peers'], [])
+
+
+class TestPeersFlapCannotActuate(_PeersRouteHarness):
+    """Contract Part 2.7 / §7.4 leg 5: a full up→down→up flap actuates nothing."""
+
+    def test_flap_touches_no_gateway_and_no_operation_slot(self):
+        from unittest.mock import patch
+        engine = MagicMock()
+        engine.current = None
+        self.server.rollout_engine = engine
+        recorder = []
+
+        def boom(*a, **k):
+            raise AssertionError('write gateway called from the peer watch')
+
+        def record(*a, **k):
+            recorder.append(a)
+            raise AssertionError('subprocess spawned from the peer watch')
+
+        peer_watch = roundhouse.PeerWatch({'p': ('h', 1)}, self.watcher_lock, self.event_bus)
+        results = [(True, None), (False, 'e1'), (False, 'e2'), (True, None), (True, None)]
+        seq = iter(results)
+
+        try:
+            with patch('roundhouse._atomic_write', side_effect=boom), \
+                 patch('roundhouse.run_git', side_effect=boom), \
+                 patch('roundhouse.run_actuate', side_effect=boom), \
+                 patch('roundhouse.subprocess.Popen', side_effect=record), \
+                 patch('roundhouse.subprocess.run', side_effect=record), \
+                 patch.object(roundhouse, '_probe_peer', lambda pw, n: next(seq)):
+                for _ in results:
+                    roundhouse.peer_watch_round(peer_watch)
+            self.assertEqual(recorder, [])
+            self.assertEqual(peer_watch.peers['p']['state'], 'up')
+            self.assertIsNone(engine.current)
+            self.assertEqual(engine.mock_calls, [])
+        finally:
+            self.server.rollout_engine = None
+
+
+class TestPeerSSE(_PeersRouteHarness):
+    """§5.3: the `peer` event is a transition delta on a snapshot the client has."""
+
+    PEERS = {'solo': ('solo.example', 4242)}
+
+    def _open_stream(self):
+        """A raw socket, not http.client: proving SILENCE needs a read that can time
+        out and be retried, which a buffered response object refuses to do."""
+        sock = socket.create_connection(('127.0.0.1', self.port), timeout=5)
+        sock.sendall(b'GET /api/events HTTP/1.1\r\nHost: 127.0.0.1\r\n'
+                     b'Accept: text/event-stream\r\n\r\n')
+        header = b''
+        while b'\r\n\r\n' not in header:
+            header += sock.recv(1)
+        self.assertIn(b'200 OK', header.split(b'\r\n')[0])
+        self.assertIn(b'text/event-stream', header)
+        return sock, None
+
+    def _read_events(self, sock, resp, count, timeout=4.0):
+        """Read up to `count` SSE frames (id/event/data), skipping heartbeats.
+
+        Returns early on `timeout` — a quiet stream is the assertion in the
+        transition-only test, so silence must be observable, not a hang.
+        """
+        import select
+        events, buf, deadline = [], b'', time.time() + timeout
+        while len(events) < count and time.time() < deadline:
+            readable, _, _ = select.select([sock], [], [], 0.2)
+            if not readable:
+                continue
+            chunk = sock.recv(4096)
+            if not chunk:
+                break
+            buf += chunk
+            if buf.endswith(b'\n\n'):
+                frame = buf.decode('utf-8')
+                buf = b''
+                name = data = None
+                for line in frame.strip().split('\n'):
+                    if line.startswith('event: '):
+                        name = line[7:]
+                    elif line.startswith('data: '):
+                        data = json.loads(line[6:])
+                if name:
+                    events.append((name, data))
+        return events
+
+    def test_initial_snapshot_carries_peers_so_no_replay_is_needed(self):
+        sock, resp = self._open_stream()
+        try:
+            events = self._read_events(sock, resp, 1)
+            self.assertEqual(events[0][0], 'snapshot')
+            self.assertIn('peers', events[0][1])
+            self.assertEqual([r['name'] for r in events[0][1]['peers']], ['solo'])
+        finally:
+            sock.close()
+
+    def test_transition_emits_exactly_one_event_and_stability_emits_none(self):
+        sock, resp = self._open_stream()
+        try:
+            self._read_events(sock, resp, 1)                 # the initial snapshot
+
+            self.drive('solo', True)                         # unknown→up: one event
+            events = self._read_events(sock, resp, 1)
+            self.assertEqual(len(events), 1)
+            name, payload = events[0]
+            self.assertEqual(name, 'peer')
+            self.assertEqual(payload['prev_state'], 'unknown')
+            self.assertEqual(payload['state'], 'up')
+            self.assertEqual(payload['name'], 'solo')
+            self.assertEqual(set(payload.keys()),
+                             {'name', 'host', 'port', 'state', 'since', 'last_probe',
+                              'consecutive_failures', 'last_error', 'prev_state'})
+
+            for _ in range(4):                               # four stable rounds
+                self.drive('solo', True)
+            self.drive('solo', False, 'TimeoutError: timed out')   # cf=1, still up
+
+            quiet = self._read_events(sock, resp, 1, timeout=1.5)
+            self.assertEqual([e for e in quiet if e[0] == 'peer'], [],
+                             'a stable peer generated SSE traffic')
+        finally:
+            sock.close()
+
+
+class TestPeerStripStatic(unittest.TestCase):
+    """§5.4 / §7.4 leg 7: the UI strip is neutral, labelled reachable, non-interactive."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.html = (Path(__file__).parent.parent / 'static' / 'index.html').read_text()
+        cls.css = cls.html[cls.html.index('<style>'):cls.html.index('</style>')]
+        cls.peer_css = '\n'.join(
+            m.group(0) for m in __import__('re').finditer(r'([^{}]+)\{([^{}]*)\}', cls.css)
+            if 'peer' in m.group(1))
+        start = cls.html.index('function renderPeers')
+        cls.renderer = cls.html[start:cls.html.index('\n        function ', start + 10)]
+        cls.markup = cls.html[cls.html.index('<div class="peer-strip"'):]
+        cls.markup = cls.markup[:cls.markup.index('</div>', cls.markup.index('peer-items'))]
+
+    def test_strip_element_present(self):
+        self.assertIn('id="peer-strip"', self.html)
+
+    def test_strip_says_reachable(self):
+        self.assertIn('reachable', self.markup + self.renderer)
+
+    def test_strip_never_says_healthy(self):
+        """index.html says `healthy` elsewhere legitimately; the peer surface must not."""
+        for scope, text in (('markup', self.markup), ('renderer', self.renderer),
+                            ('css', self.peer_css)):
+            with self.subTest(scope=scope):
+                self.assertNotIn('healthy', text.lower())
+
+    def test_strip_uses_no_alarm_colors(self):
+        """No red, no amber, no green — these are other people's hosts (§5.4).
+
+        Hard-coded rgba() literals count: they are the same pixels as var(--red)
+        with the token guard walked around.
+        """
+        import re as _re
+        self.assertNotIn('var(--red)', self.peer_css)
+        self.assertNotIn('var(--amber)', self.peer_css)
+        self.assertNotIn('var(--green)', self.peer_css)
+        literals = _re.findall(r'#[0-9a-fA-F]{3,8}|rgba?\([^)]*\)', self.peer_css)
+        self.assertEqual(literals, [],
+                         f'peer strip must use theme tokens only, found {literals}')
+
+    def test_strip_is_non_interactive(self):
+        """No buttons, no click handlers — so the frozen 44 px touch-target set stands."""
+        for forbidden in ('<button', 'onclick', 'addEventListener(\'click\''):
+            self.assertNotIn(forbidden, self.markup)
+        self.assertNotIn('<button', self.renderer)
+        self.assertNotIn('onclick', self.renderer)
+
+    def test_renderer_reads_the_snapshot_key(self):
+        """The strip must be populated by the snapshot, not only by transition deltas —
+        a peer that never flaps while the page is open is still a peer."""
+        self.assertIn('state.peers', self.renderer)
+        self.assertIn('renderPeers', self.html[self.html.index("addEventListener('snapshot'"):
+                                               self.html.index('function renderHeader')])
+
+
+class TestBindFailureIsLoud(unittest.TestCase):
+    """§3.3 / contract acceptance: all-or-nothing startup, and it does not lie first."""
+
+    def _run_serve(self, extra_args, port, timeout=30):
+        """Run a real `--serve` to completion. A run that does NOT exit is itself the
+        failure: every case here must be a startup refusal."""
+        import subprocess
+        repo = Path(__file__).resolve().parents[2]
+        cmd = [sys.executable, str(repo / 'mvp1' / 'roundhouse.py'), '--serve',
+               '--unit-dir', str(repo / 'docs' / 'fixtures'), '--no-db',
+               '--port', str(port)] + extra_args
+        try:
+            return subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        except subprocess.TimeoutExpired as e:
+            self.fail(f'startup did not refuse; it kept serving: {" ".join(cmd)}\n'
+                      f'stdout={e.stdout!r}')
+
+    def test_no_listening_line_is_printed_when_a_later_bind_fails(self):
+        """The message must not claim a door is open that startup then closes.
+
+        Behavior was already correct (exit 1, nothing left listening); the stdout
+        line lied about it, which is exactly the failure mode an operator finds a
+        week later from a phone that cannot reach the box.
+        """
+        blocker = socket.socket()
+        blocker.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        blocker.bind(('127.0.0.1', 0))
+        blocked_port = blocker.getsockname()[1]
+        blocker.listen(1)
+
+        try:
+            try:
+                probe = socket.socket(socket.AF_INET6)
+                probe.bind(('::1', 0))
+                probe.close()
+            except OSError:
+                self.skipTest('IPv6 not available')
+
+            # ::1 binds first and succeeds; 127.0.0.1 is occupied and fails.
+            result = self._run_serve(['--bind', '::1,127.0.0.1'], blocked_port)
+
+            self.assertEqual(result.returncode, 1, result.stderr)
+            self.assertIn(f'cannot bind 127.0.0.1:{blocked_port}', result.stderr)
+            self.assertIn('Errno 98', result.stderr)
+            self.assertNotIn('listening', result.stdout.lower(),
+                             'printed a listening line for a door it then closed')
+
+            # Nothing left listening on the address that DID bind.
+            leftover = socket.socket(socket.AF_INET6)
+            leftover.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 1)
+            try:
+                leftover.bind(('::1', blocked_port))
+            except OSError as e:
+                self.fail(f'::1:{blocked_port} still held after the refusal: {e}')
+            finally:
+                leftover.close()
+        finally:
+            blocker.close()
+
+    def test_every_failing_address_is_named(self):
+        """Not just the first: an operator must see the whole truth in one go."""
+        blocker4 = socket.socket()
+        blocker4.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        blocker4.bind(('127.0.0.1', 0))
+        port = blocker4.getsockname()[1]
+        blocker4.listen(1)
+        blocker6 = socket.socket(socket.AF_INET6)
+        blocker6.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 1)
+        try:
+            blocker6.bind(('::1', port))
+            blocker6.listen(1)
+        except OSError:
+            blocker4.close()
+            blocker6.close()
+            self.skipTest('IPv6 not available')
+
+        try:
+            result = self._run_serve(['--bind', '127.0.0.1,::1'], port)
+            self.assertEqual(result.returncode, 1)
+            self.assertIn(f'cannot bind 127.0.0.1:{port}', result.stderr)
+            self.assertIn(f'cannot bind [::1]:{port}', result.stderr)
+            self.assertNotIn('listening', result.stdout.lower())
+        finally:
+            blocker4.close()
+            blocker6.close()
+
+    def test_peer_interval_floor_refuses_at_startup(self):
+        """J6: min 1 — a zero cadence would spin the watch thread."""
+        sock = socket.socket()
+        sock.bind(('127.0.0.1', 0))
+        free_port = sock.getsockname()[1]
+        sock.close()
+
+        result = self._run_serve(['--bind', '127.0.0.1', '--peer', 'x=192.0.2.1:22',
+                                  '--peer-interval', '0'], free_port)
+        self.assertEqual(result.returncode, 1)
+        self.assertIn('peer-interval', result.stderr)
+        self.assertNotIn('listening', result.stdout.lower())
+
+    def test_d2_collision_refuses_at_startup_naming_both_sides(self):
+        """§6.3: a peer that names this host on a managed unit's port is a refusal."""
+        sock = socket.socket()
+        sock.bind(('127.0.0.1', 0))
+        free_port = sock.getsockname()[1]
+        sock.close()
+
+        result = self._run_serve(['--bind', '127.0.0.1',
+                                  '--peer', 'self=127.0.0.1:8085'], free_port)
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("peer 'self' targets 127.0.0.1:8085", result.stderr)
+        self.assertIn('qwen3.6-coding', result.stderr)
+        self.assertNotIn('listening', result.stdout.lower())
+
+    def test_listening_lines_reach_the_journal_while_running(self):
+        """Announce, then serve — not announce-when-you-eventually-exit.
+
+        stdout is block-buffered on a pipe, so under systemd the startup lines sat
+        in the process buffer and `systemctl status` showed nothing at all. The
+        first thing an operator checks after editing --bind is which doors opened.
+        """
+        import select
+        import subprocess
+        sock = socket.socket()
+        sock.bind(('127.0.0.1', 0))
+        free_port = sock.getsockname()[1]
+        sock.close()
+
+        repo = Path(__file__).resolve().parents[2]
+        proc = subprocess.Popen(
+            [sys.executable, str(repo / 'mvp1' / 'roundhouse.py'), '--serve',
+             '--unit-dir', str(repo / 'docs' / 'fixtures'), '--no-db',
+             '--port', str(free_port), '--bind', '127.0.0.1'],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        try:
+            line, deadline = '', time.time() + 15
+            while time.time() < deadline and not line:
+                if proc.poll() is not None:
+                    self.fail('process exited before announcing')
+                readable, _, _ = select.select([proc.stdout], [], [], 0.5)
+                if readable:
+                    line = proc.stdout.readline()
+            self.assertIn(f'Roundhouse listening on http://127.0.0.1:{free_port}', line,
+                          'the announcement never left the stdout buffer')
+        finally:
+            proc.terminate()
+            try:
+                proc.communicate(timeout=10)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.communicate()
+
+    def test_an_ipv6_listener_actually_serves(self):
+        """The contract's IPv6 row, end to end through a real process.
+
+        Binding ::1 succeeded and then the lifecycle loop unpacked
+        `srv.server_address` as a 2-tuple — an AF_INET6 sockaddr is a 4-tuple
+        (host, port, flowinfo, scope_id), so every IPv6 start died with
+        `too many values to unpack` after printing that it was listening.
+        Constructing the socket is not the same as serving on it.
+        """
+        import subprocess
+        try:
+            probe = socket.socket(socket.AF_INET6)
+            probe.bind(('::1', 0))
+            free_port = probe.getsockname()[1]
+            probe.close()
+        except OSError:
+            self.skipTest('IPv6 not available')
+
+        repo = Path(__file__).resolve().parents[2]
+        proc = subprocess.Popen(
+            [sys.executable, str(repo / 'mvp1' / 'roundhouse.py'), '--serve',
+             '--unit-dir', str(repo / 'docs' / 'fixtures'), '--no-db',
+             '--port', str(free_port), '--bind', '::1'],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        try:
+            deadline, served = time.time() + 20, False
+            while time.time() < deadline and proc.poll() is None:
+                try:
+                    conn = http.client.HTTPConnection('::1', free_port, timeout=1)
+                    conn.request('GET', '/api/units')
+                    self.assertEqual(conn.getresponse().status, 200)
+                    conn.close()
+                    served = True
+                    break
+                except (OSError, http.client.HTTPException):
+                    time.sleep(0.2)
+            self.assertIsNone(proc.poll(), 'the process died instead of serving on ::1')
+            self.assertTrue(served, 'nothing answered on [::1] after a successful bind')
+        finally:
+            proc.terminate()
+            try:
+                proc.communicate(timeout=10)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.communicate()
+
+    def test_same_port_on_another_host_is_allowed(self):
+        """recon 10: the rule is host-AND-port, so ampere:8085 must still start."""
+        import subprocess
+        sock = socket.socket()
+        sock.bind(('127.0.0.1', 0))
+        free_port = sock.getsockname()[1]
+        sock.close()
+
+        repo = Path(__file__).resolve().parents[2]
+        proc = subprocess.Popen(
+            [sys.executable, str(repo / 'mvp1' / 'roundhouse.py'), '--serve',
+             '--unit-dir', str(repo / 'docs' / 'fixtures'), '--no-db',
+             '--port', str(free_port), '--bind', '127.0.0.1',
+             '--peer', 'ampere=ampere.fritz.box:8085', '--peer-interval', '3600'],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        try:
+            deadline = time.time() + 15
+            listening = False
+            while time.time() < deadline:
+                if proc.poll() is not None:
+                    break
+                try:
+                    conn = http.client.HTTPConnection('127.0.0.1', free_port, timeout=1)
+                    conn.request('GET', '/api/peers')
+                    resp = conn.getresponse()
+                    rows = json.loads(resp.read())['peers']
+                    conn.close()
+                    listening = True
+                    self.assertEqual([r['name'] for r in rows], ['ampere'])
+                    break
+                except (OSError, http.client.HTTPException):
+                    time.sleep(0.2)
+            self.assertIsNone(proc.poll(), 'startup refused a legitimate same-port peer')
+            self.assertTrue(listening)
+        finally:
+            proc.terminate()
+            try:
+                proc.communicate(timeout=10)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.communicate()
 
 
 if __name__ == '__main__':
