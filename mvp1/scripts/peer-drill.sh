@@ -496,7 +496,13 @@ kill "$BLOCKER_PID" 2>/dev/null; wait "$BLOCKER_PID" 2>/dev/null
 # ---------------------------------------------------------------- 13. slot leg
 if [ "$RUN_SLOT" = "1" ]; then
     step "13. Shared operation slot across listeners (ARMED — actuates a fake unit)"
-    python3 "$RH" --serve --unit-dir "$RH_UNIT_DIR" --no-db --actuate \
+    # A COPY of the measurement db, not --no-db and not the live file: switch
+    # preflight fits against measured peaks, so a memory-less instance refuses
+    # every target with preflight_failed and the leg would silently skip.
+    SLOT_DB="$LOG_DIR/slot.sqlite"
+    LIVE_DB="${XDG_STATE_HOME:-$HOME/.local/state}/roundhouse/roundhouse.sqlite"
+    [ -f "$LIVE_DB" ] && cp "$LIVE_DB" "$SLOT_DB"
+    python3 "$RH" --serve --unit-dir "$RH_UNIT_DIR" --db "$SLOT_DB" --actuate \
         --port "$RH_PORT" --bind "$BIND_ARG" \
         > "$LOG_DIR/armed.out" 2> "$LOG_DIR/armed.err" &
     ARMED_PID=$!
@@ -528,11 +534,12 @@ if target is None:
     print('SKIP no OFF unit to switch to'); sys.exit(0)
 
 status, prev = call(A, '/api/switch/preview', {'target': target, 'stops': []}, 'POST')
-if status != 200 or not prev.get('ok'):
+if status != 200 or 'confirm' not in prev:
     print('SKIP preview refused: %s %s' % (status, json.dumps(prev)[:200])); sys.exit(0)
+print('preview ok: target=%s suggested_stops=%s' % (target, prev.get('suggested_stops')))
 
 status, started = call(A, '/api/switch',
-                       {'target': target, 'stops': prev.get('stops', []),
+                       {'target': target, 'stops': prev.get('suggested_stops', []),
                         'confirm': prev['confirm']}, 'POST')
 print('door A switch -> %s %s' % (status, json.dumps(started)[:160]))
 if status != 202:
