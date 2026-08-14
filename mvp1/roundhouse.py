@@ -3932,12 +3932,25 @@ def parse_fleet_peer_decls(values: Optional[List[str]]) -> tuple[dict[str, tuple
     return fleet, errors
 
 
-def validate_peer_sets(tcp: dict, fleet: dict) -> List[str]:
+def validate_peer_sets(tcp: dict, fleet: dict, local_names=()) -> List[str]:
     """Validate cross-flag peer configuration per §3.2, K1.
+
+    `local_names` are this host's own identities (nodename, advertise host). A
+    fleet peer may not take one of them: /api/fleet tags every row with the
+    declared peer name, so a peer called `boltzmann` on the host `boltzmann`
+    makes local and remote rows indistinguishable — and MVP9 forwarding is
+    specified to key on exactly that identity, where the ambiguity stops being
+    cosmetic and starts misrouting (MVP8 review, item b).
 
     Returns: [errors, ...]
     """
     errors = []
+
+    local_set = {n for n in local_names if n}
+    for name in sorted(set(fleet) & local_set):
+        errors.append(
+            f"--fleet-peer '{name}' collides with this host's own name — "
+            f"peer rows would be indistinguishable from local ones; pick another name")
 
     # Check for shared namespace
     tcp_names = set(tcp.keys())
@@ -4100,15 +4113,25 @@ def validate_peer_entry(entry) -> bool:
     if not isinstance(model_name, str) or not model_name:
         return False
 
-    # Check all values: scalars or depth-≤2 dicts with scalar values
+    # Check all KEYS and values. Keys matter as much as values: they are
+    # peer-authored, they are written into the YAML document unquoted, and the
+    # emitter asserts ENTRY_KEY_RE on them. Without this check a key carrying a
+    # newline passed ingestion and then crashed /api/routing-config/fleet with
+    # an uncaught AssertionError — or, with asserts stripped (python -O),
+    # injected a second YAML document (MVP8 review F1). §5.1 errata: keys are
+    # validated here, which is what makes the emitter's assertion unreachable.
     for key, value in entry.items():
+        if not isinstance(key, str) or not ENTRY_KEY_RE.fullmatch(key):
+            return False
         if value is None:
             return False
         if isinstance(value, (str, int, float, bool)):
             continue
         if isinstance(value, dict):
-            # All values in nested dict must be scalars
-            for nested_val in value.values():
+            # All keys and values in the nested dict must be safe too.
+            for nested_key, nested_val in value.items():
+                if not isinstance(nested_key, str) or not ENTRY_KEY_RE.fullmatch(nested_key):
+                    return False
                 if not isinstance(nested_val, (str, int, float, bool)) or nested_val is None:
                     return False
         else:
@@ -7429,7 +7452,11 @@ def _comment_text(value) -> str:
     write into our document. They become '?'; the result is bounded at 120 chars.
     """
     text = value if isinstance(value, str) else str(value)
-    cleaned = ''.join(c if (0x20 <= ord(c) < 0x7f) or ord(c) > 0x9f else '?'
+    # U+2028/U+2029 are line separators to some consumers (JS, a few editors)
+    # though not to YAML or JSON — stripped as defense in depth, since this is
+    # the boundary where another machine's string enters our document.
+    cleaned = ''.join('?' if c in ('\u2028', '\u2029')
+                      else (c if (0x20 <= ord(c) < 0x7f) or ord(c) > 0x9f else '?')
                       for c in text)
     return cleaned if len(cleaned) <= 120 else cleaned[:117] + '...'
 
@@ -8371,7 +8398,8 @@ def cmd_serve(args):
                                             advertise_host, nodename)
 
     # K1: shared namespace and cap validation
-    peer_set_errors = validate_peer_sets(peer_decls, fleet_decls)
+    peer_set_errors = validate_peer_sets(peer_decls, fleet_decls,
+                                         local_names=(nodename, advertise_host))
 
     # D2: Fleet peer validation (endpoints derived from URLs)
     fleet_endpoints = {name: (host, port) for name, (host, port, url) in fleet_decls.items()}

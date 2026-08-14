@@ -899,3 +899,81 @@ class TestFedFailureEventChatter(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class TestPeerEntryKeyValidation(unittest.TestCase):
+    """MVP8 review F1: entry KEYS are peer-authored too.
+
+    validate_peer_entry checked values and never keys, while the emitter
+    asserts every key matches ENTRY_KEY_RE — each faithful to its own spec
+    section, with the hole between them. A peer returning a key containing a
+    newline passed ingestion, then crashed /api/routing-config/fleet with an
+    uncaught AssertionError (connection reset, no response) — and with asserts
+    stripped (python -O) it became a YAML document injection instead.
+    """
+
+    def test_newline_in_top_level_key_is_rejected_at_ingestion(self):
+        evil = {'model_name': 'x', 'evil\nmodel_list:\n  - model_name: pwned': 'v'}
+        self.assertFalse(roundhouse.validate_peer_entry(evil))
+
+    def test_newline_in_nested_key_is_rejected_at_ingestion(self):
+        evil = {'model_name': 'x',
+                'litellm_params': {'ok': 'v', 'bad\nmodel_list:': 'v'}}
+        self.assertFalse(roundhouse.validate_peer_entry(evil))
+
+    def test_non_identifier_keys_are_rejected(self):
+        for bad_key in ('has space', 'dash-key', 'dot.key', '', 'quote"key', '#comment'):
+            with self.subTest(key=bad_key):
+                self.assertFalse(
+                    roundhouse.validate_peer_entry({'model_name': 'x', bad_key: 'v'}))
+
+    def test_ordinary_entries_still_validate(self):
+        good = {'model_name': 'host-alias',
+                'litellm_params': {'model': 'openai/alias', 'api_base': 'http://h:1/v1'},
+                'model_info': {'unit': 'u.service', 'rung': 'READY'},
+                'rpm': 240}
+        self.assertTrue(roundhouse.validate_peer_entry(good))
+
+    def test_every_surviving_key_satisfies_the_emitter_assertion(self):
+        """The emitter's assert must be genuinely unreachable, as its comment claims."""
+        entry = {'model_name': 'x', 'weight': 3, 'nested': {'a': 1}}
+        self.assertTrue(roundhouse.validate_peer_entry(entry))
+        for key, value in entry.items():
+            self.assertTrue(roundhouse.ENTRY_KEY_RE.fullmatch(key))
+            if isinstance(value, dict):
+                for nk in value:
+                    self.assertTrue(roundhouse.ENTRY_KEY_RE.fullmatch(nk))
+
+
+class TestFleetPeerNameCollision(unittest.TestCase):
+    """MVP8 review item b: a fleet peer may not carry this host's own name.
+
+    /api/fleet tags rows with the declared peer name, so `--fleet-peer
+    boltzmann=...` on the host `boltzmann` makes local and peer rows
+    indistinguishable — and MVP9 forwarding is specified to key on that
+    identity, where it would misroute rather than merely confuse.
+    """
+
+    def test_peer_named_like_the_nodename_is_refused(self):
+        errs = roundhouse.validate_peer_sets(
+            {}, {'boltzmann': ('boltzmann.fritz.box', 8099, 'https://boltzmann.fritz.box')},
+            local_names=('boltzmann', 'boltzmann.fritz.box'))
+        self.assertTrue(errs)
+        self.assertIn('collides with this host', errs[0])
+
+    def test_peer_named_like_the_advertise_host_is_refused(self):
+        errs = roundhouse.validate_peer_sets(
+            {}, {'boltzmann.fritz.box': ('h', 8099, 'https://h')},
+            local_names=('boltzmann', 'boltzmann.fritz.box'))
+        self.assertTrue(errs)
+
+    def test_a_distinct_name_is_accepted(self):
+        errs = roundhouse.validate_peer_sets(
+            {}, {'ampere': ('ampere.fritz.box', 8099, 'https://ampere.fritz.box')},
+            local_names=('boltzmann', 'boltzmann.fritz.box'))
+        self.assertEqual(errs, [])
+
+    def test_the_guard_does_not_disturb_the_existing_checks(self):
+        errs = roundhouse.validate_peer_sets(
+            {'dup': ('h', 22)}, {'dup': ('h', 8099, 'https://h')}, local_names=('boltzmann',))
+        self.assertTrue(any('both --peer and --fleet-peer' in e for e in errs))
