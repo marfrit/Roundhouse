@@ -3183,10 +3183,17 @@ class RoundhouseRequestHandler(http.server.BaseHTTPRequestHandler):
         if peer_watch:
             for peer_name in sorted(fed_rows.keys()):
                 fed = fed_rows[peer_name]
+                # Get the current endpoint_in_use URL (or first candidate URL for backward compat)
+                peer_info = peer_watch.peers.get(peer_name, {})
+                endpoint_url = peer_info.get('endpoint_in_use')
+                if not endpoint_url and peer_name in peer_watch.fleet:
+                    # Fallback to first candidate if endpoint_in_use not set
+                    urls = peer_watch.fleet.get(peer_name, [])
+                    endpoint_url = urls[0] if urls else ''
                 peers.append({
                     'name': peer_name,
                     'kind': 'roundhouse',
-                    'url': peer_watch.fleet.get(peer_name, ''),
+                    'url': endpoint_url or '',
                     # Reachability rides in the fed row, captured under the same lock
                     # hold — never a second, unlocked read of peer_watch.peers.
                     'state': fed.get('peer_state', 'unknown'),
@@ -4275,11 +4282,65 @@ def parse_peer_decls(values: Optional[List[str]]) -> tuple[dict[str, tuple[str, 
     return peers, errors
 
 
-def parse_fleet_peer_decls(values: Optional[List[str]]) -> tuple[dict[str, tuple[str, int, str]], List[str]]:
-    """Parse --fleet-peer NAME=URL declarations per §3.1, K1.
+def _parse_fleet_url(url_str: str) -> tuple[Optional[tuple[str, int, str]], Optional[str]]:
+    """Parse a single fleet peer URL per K1: scheme, host, optional port.
 
-    Returns: ({name: (host, port, normalized_url)}, [errors, ...])
-    Errors collected; caller exits with all listed (§3.1, J3).
+    Returns: ((host, port, normalized_url), error_msg_or_None)
+    No path, query, fragment, credentials allowed.
+    """
+    try:
+        parsed = urllib.parse.urlsplit(url_str)
+    except ValueError as e:
+        return (None, str(e))
+
+    # Validate scheme
+    if parsed.scheme not in ('http', 'https'):
+        return (None, f'URL scheme must be http or https')
+
+    # Validate hostname (non-empty)
+    if not parsed.hostname:
+        return (None, f'URL must have a hostname')
+
+    # Validate no path, query, fragment, credentials
+    if parsed.path and parsed.path != '/':
+        return (None, f'URL must not carry a path, query, fragment, or credentials — declare the instance root (scheme://host[:port])')
+    if parsed.query:
+        return (None, f'URL must not carry a path, query, fragment, or credentials — declare the instance root (scheme://host[:port])')
+    if parsed.fragment:
+        return (None, f'URL must not carry a path, query, fragment, or credentials — declare the instance root (scheme://host[:port])')
+    if parsed.username or parsed.password:
+        return (None, f'URL must not carry a path, query, fragment, or credentials — declare the instance root (scheme://host[:port])')
+
+    # Get port with defaults
+    if parsed.port:
+        port = parsed.port
+    else:
+        port = 443 if parsed.scheme == 'https' else 80
+
+    # Normalize host display (bracket IPv6)
+    host = parsed.hostname
+    try:
+        # Try to parse as IP to check if it's IPv6
+        ip_obj = ipaddress.ip_address(host)
+        if isinstance(ip_obj, ipaddress.IPv6Address):
+            host_display = f'[{host}]'
+        else:
+            host_display = host
+    except ValueError:
+        # Not an IP literal (hostname)
+        host_display = host
+
+    # Build normalized URL
+    normalized_url = f'{parsed.scheme}://{host_display}:{port}'
+    return ((host, port, normalized_url), None)
+
+
+def parse_fleet_peer_decls(values: Optional[List[str]]) -> tuple[dict[str, list[tuple[str, int, str]]], List[str]]:
+    """Parse --fleet-peer NAME=URL[,URL...] declarations per §4.1, L5.
+
+    Returns: ({name: [(host, port, normalized_url), ...]}, [errors, ...])
+    Candidates are ordered, capped at FLEET_CANDIDATE_MAX per peer; errors are collected.
+    Caller exits with all listed (§3.1, J3).
     """
     if values is None:
         return {}, []
@@ -4291,10 +4352,10 @@ def parse_fleet_peer_decls(values: Optional[List[str]]) -> tuple[dict[str, tuple
     for val in values:
         # Split on first '='
         if '=' not in val:
-            errors.append(f"malformed --fleet-peer '{val}': expected NAME=URL")
+            errors.append(f"malformed --fleet-peer '{val}': expected NAME=URL[,URL...]")
             continue
 
-        name, url_str = val.split('=', 1)
+        name, urls_str = val.split('=', 1)
 
         # Validate name per §4.1 (same as --peer)
         if not name:
@@ -4308,62 +4369,40 @@ def parse_fleet_peer_decls(values: Optional[List[str]]) -> tuple[dict[str, tuple
             continue
         seen_names.add(name)
 
-        # Parse URL per K1: scheme, host, optional port; no path, query, fragment, credentials
-        try:
-            parsed = urllib.parse.urlsplit(url_str)
-        except ValueError as e:
-            errors.append(f"malformed --fleet-peer '{val}': {e}")
+        # Split candidates on comma (§L5)
+        candidates = []
+        seen_urls = set()
+        for i, url_token in enumerate(urls_str.split(',')):
+            url_token = url_token.strip()
+            if not url_token:
+                errors.append(f"malformed --fleet-peer '{name}': candidate {i+1} is empty")
+                continue
+
+            # Parse URL per K1
+            candidate, err = _parse_fleet_url(url_token)
+            if err:
+                errors.append(f"malformed --fleet-peer '{name}': candidate {i+1}: {err}")
+                continue
+
+            host, port, normalized_url = candidate
+
+            # Check for duplicates within this peer (§4.1)
+            if normalized_url in seen_urls:
+                errors.append(f"duplicate candidate for fleet peer '{name}': {normalized_url}")
+                continue
+            seen_urls.add(normalized_url)
+
+            candidates.append((host, port, normalized_url))
+
+        # Check cap per peer (§4.1, L5, L6)
+        if len(candidates) > FLEET_CANDIDATE_MAX:
+            errors.append(f"too many candidates for fleet peer '{name}' ({len(candidates)} > {FLEET_CANDIDATE_MAX}): the probe walk must fit the 60 s round (worst case 56 s at 3, §L6)")
             continue
 
-        # Validate scheme
-        if parsed.scheme not in ('http', 'https'):
-            errors.append(f"malformed --fleet-peer '{val}': URL scheme must be http or https")
-            continue
+        if candidates:
+            fleet[name] = candidates
 
-        # Validate hostname (non-empty)
-        if not parsed.hostname:
-            errors.append(f"malformed --fleet-peer '{val}': URL must have a hostname")
-            continue
-
-        # Validate no path, query, fragment, credentials
-        if parsed.path and parsed.path != '/':
-            errors.append(f"malformed --fleet-peer '{val}': URL must not carry a path, query, fragment, or credentials — declare the instance root (scheme://host[:port])")
-            continue
-        if parsed.query:
-            errors.append(f"malformed --fleet-peer '{val}': URL must not carry a path, query, fragment, or credentials — declare the instance root (scheme://host[:port])")
-            continue
-        if parsed.fragment:
-            errors.append(f"malformed --fleet-peer '{val}': URL must not carry a path, query, fragment, or credentials — declare the instance root (scheme://host[:port])")
-            continue
-        if parsed.username or parsed.password:
-            errors.append(f"malformed --fleet-peer '{val}': URL must not carry a path, query, fragment, or credentials — declare the instance root (scheme://host[:port])")
-            continue
-
-        # Get port with defaults
-        if parsed.port:
-            port = parsed.port
-        else:
-            port = 443 if parsed.scheme == 'https' else 80
-
-        # Normalize host display (bracket IPv6)
-        host = parsed.hostname
-        try:
-            # Try to parse as IP to check if it's IPv6
-            ip_obj = ipaddress.ip_address(host)
-            if isinstance(ip_obj, ipaddress.IPv6Address):
-                host_display = f'[{host}]'
-            else:
-                host_display = host
-        except ValueError:
-            # Not an IP literal (hostname)
-            host_display = host
-
-        # Build normalized URL
-        normalized_url = f'{parsed.scheme}://{host_display}:{port}'
-
-        fleet[name] = (host, port, normalized_url)
-
-    # Check cap (K1)
+    # Check peer cap (L5)
     if len(fleet) > FLEET_PEER_MAX:
         errors.append(f"too many fleet peers ({len(fleet)} > {FLEET_PEER_MAX}): two fetches per peer per round must finish well inside the 60 s cadence")
 
@@ -4615,30 +4654,69 @@ class FedRows:
 class PeerWatch:
     """Peer reachability watch: state machine per §4.3 with lock discipline per §4.4.
 
-    - declared: {name: (host, port)}, never mutated after init
-    - fleet: {name: url}, subset of declared that are fleet peers (never mutated after init)
+    - declared: {name: [(host, port), ...]}, never mutated after init (§L5 candidates)
+    - fleet: {name: [url, ...]}, subset of declared that are fleet peers (§L5)
     - peers: {name: state_dict}, mutations guarded by lock
     - fed: {name: fed_state_dict}, federated data per fleet peer, mutations guarded by lock
     - lock: watcher.lock (shared, non-reentrant)
     - now: injected clock for testing
+
+    Ctor normalization (§7.3 compat seam): old single-endpoint shapes normalize to lists.
+    Existing fixtures pass tuple-shaped declared or string-shaped fleet; new code always uses lists.
     """
 
-    def __init__(self, declared: dict[str, tuple[str, int]], lock, event_bus,
-                 fleet=None, now=None):
-        self.declared = dict(declared)  # Snapshot declared peers at startup
-        self.fleet = dict(fleet) if fleet else {}  # Fleet peers (subset of declared)
+    def __init__(self, declared: dict, lock, event_bus, fleet=None, now=None):
+        # Normalize declared: detect old single-endpoint shape and normalize to lists (§7.3)
+        self.declared = {}
+        for name, value in declared.items():
+            if isinstance(value, list):
+                # Already new format: list of (host, port) tuples
+                self.declared[name] = value
+            elif isinstance(value, tuple) and len(value) == 2 and isinstance(value[0], str):
+                # Old format: single (host, port) tuple; normalize to list
+                self.declared[name] = [value]
+            else:
+                # Unexpected; treat as is
+                self.declared[name] = [value]
+
+        # Normalize fleet: detect old single-URL shape and normalize to lists (§7.3)
+        self.fleet = {}
+        if fleet:
+            for name, value in fleet.items():
+                if isinstance(value, list):
+                    # Already new format: list of URLs
+                    self.fleet[name] = value
+                elif isinstance(value, str):
+                    # Old format: single URL string; normalize to list
+                    self.fleet[name] = [value]
+                else:
+                    # Tuple shape like (host, port, url); extract URL or normalize
+                    if isinstance(value, tuple) and len(value) == 3:
+                        self.fleet[name] = [value[2]]  # Extract the URL (third element)
+                    else:
+                        self.fleet[name] = [value]
+
         self.lock = lock
         self.event_bus = event_bus
         self.now = now or time.time
 
         # Initialize reachability state: all peers start unknown
-        self.peers = {name: {
-            'state': 'unknown',
-            'since': self.now(),
-            'last_probe': None,
-            'consecutive_failures': 0,
-            'last_error': None
-        } for name in declared}
+        self.peers = {}
+        for name in declared:
+            self.peers[name] = {
+                'state': 'unknown',
+                'since': self.now(),
+                'last_probe': None,
+                'consecutive_failures': 0,
+                'last_error': None,
+                'endpoint_index': 0,  # Start at first candidate (§4.3, L5)
+                'endpoint_in_use': None,  # Will be set on first successful probe
+                'endpoint_changed_at': None,
+            }
+            # For TCP peers (not in fleet), endpoint_in_use is the single endpoint
+            if name not in self.fleet and self.declared[name]:
+                host, port = self.declared[name][0]
+                self.peers[name]['endpoint_in_use'] = f'{host}:{port}'
 
         # Initialize federated state: fleet peers only
         self.fed = {name: {
@@ -4650,19 +4728,38 @@ class PeerWatch:
             'fetched_at': None,
             'attempted_at': None,
             'reason': None
-        } for name in (fleet or {})}
+        } for name in self.fleet}
 
     def apply_result_unlocked(self, name: str, ok: bool, error: Optional[str],
-                              ts: float) -> Optional[dict]:
-        """Apply probe result per §4.3 state table. CALLER HOLDS self.lock.
+                              ts: float, winner_index: Optional[int] = None) -> Optional[dict]:
+        """Apply probe result per §4.3 state table, with endpoint tracking per §4.3, L5.
 
-        Returns SSE payload on transition, else None.
+        winner_index: for fleet peers with candidates, the index of the winning candidate
+                      (None for failed walks or TCP peers).
+
+        CALLER HOLDS self.lock.
+
+        Returns SSE payload on transition or endpoint change, else None. Per §4.3:
+        endpoint changes emit an event even without state transition.
         """
         if name not in self.peers:
             return None
 
         peer = self.peers[name]
         old_state = peer['state']
+        endpoint_changed = False
+
+        # Handle endpoint change for fleet peers (§4.3, L5)
+        if ok and winner_index is not None and name in self.fleet:
+            old_endpoint_index = peer.get('endpoint_index', 0)
+            if winner_index != old_endpoint_index:
+                peer['endpoint_index'] = winner_index
+                urls = self.fleet[name]
+                if 0 <= winner_index < len(urls):
+                    url = urls[winner_index]
+                    peer['endpoint_in_use'] = url
+                    peer['endpoint_changed_at'] = ts
+                    endpoint_changed = True
 
         if ok:
             # Probe succeeded
@@ -4676,8 +4773,10 @@ class PeerWatch:
                 peer['consecutive_failures'] = 0
                 return self._event_payload(name, old_state)
             elif old_state == 'up':
-                # up + success → up, no event
+                # up + success → up, no event UNLESS endpoint changed (§4.3)
                 peer['consecutive_failures'] = 0
+                if endpoint_changed:
+                    return self._event_payload(name, old_state)
                 return None
             elif old_state == 'down':
                 # down + success → up, emit event
@@ -4730,14 +4829,21 @@ class PeerWatch:
         return None
 
     def _event_payload(self, name: str, prev_state: str, fed_prev=None) -> dict:
-        """Build SSE peer event payload per §5.3.
+        """Build SSE peer event payload per §5.3, §4.3 endpoint fields.
 
         fed_prev: the fed state BEFORE this event (§4.2). Reachability transitions
         that do not touch fed state pass None and report the current value, so the
         payload shape is uniform per kind.
         """
         peer = self.peers[name]
-        host, port = self.declared[name]
+        # Use endpoint_index to get the current endpoint host/port (§4.3)
+        endpoint_index = peer.get('endpoint_index', 0)
+        candidates = self.declared[name]
+        if 0 <= endpoint_index < len(candidates):
+            host, port = candidates[endpoint_index]
+        else:
+            host, port = candidates[0] if candidates else ('unknown', 0)
+
         payload = {
             'name': name,
             'host': host,
@@ -4747,6 +4853,8 @@ class PeerWatch:
             'last_probe': peer['last_probe'],
             'consecutive_failures': peer['consecutive_failures'],
             'last_error': peer['last_error'],
+            'endpoint_in_use': peer.get('endpoint_in_use'),
+            'endpoint_changed_at': peer.get('endpoint_changed_at'),
             'prev_state': prev_state,
             'kind': 'roundhouse' if name in self.fleet else 'tcp'
         }
@@ -4769,12 +4877,20 @@ class PeerWatch:
         """Snapshot of peer rows per §5 shape, sorted by name. CALLER HOLDS self.lock.
 
         Used in take_snapshot; lock is non-reentrant, acquiring here would deadlock.
-        Adds 'kind' ('tcp'|'roundhouse') and for fleet peers adds 'fed' with fed state summary.
+        Adds 'kind' ('tcp'|'roundhouse'), endpoint fields per §4.3, and for fleet peers
+        adds 'fed' with fed state summary and 'endpoints' (all candidate URLs).
         """
         rows = []
         for name in sorted(self.peers.keys()):
             peer = self.peers[name]
-            host, port = self.declared[name]
+            # Use endpoint_index to get the current endpoint host/port (§4.3)
+            endpoint_index = peer.get('endpoint_index', 0)
+            candidates = self.declared[name]
+            if 0 <= endpoint_index < len(candidates):
+                host, port = candidates[endpoint_index]
+            else:
+                host, port = candidates[0] if candidates else ('unknown', 0)
+
             row = {
                 'name': name,
                 'host': host,
@@ -4784,10 +4900,12 @@ class PeerWatch:
                 'last_probe': peer['last_probe'],
                 'consecutive_failures': peer['consecutive_failures'],
                 'last_error': peer['last_error'],
+                'endpoint_in_use': peer.get('endpoint_in_use'),
+                'endpoint_changed_at': peer.get('endpoint_changed_at'),
                 'kind': 'roundhouse' if name in self.fleet else 'tcp'
             }
 
-            # Add fed data for fleet peers
+            # Add fed data and endpoints list for fleet peers
             if name in self.fleet:
                 fed = self.fed[name]
                 row['fed'] = {
@@ -4797,6 +4915,8 @@ class PeerWatch:
                     'fetched_at': fed['fetched_at'],
                     'unit_count': len(fed['units'])
                 }
+                # Extract URLs from fleet (list of URLs)
+                row['endpoints'] = self.fleet[name]
 
             rows.append(row)
         return rows
@@ -4903,7 +5023,13 @@ class PeerWatch:
         """Build SSE peer event payload for fed transitions."""
         peer = self.peers[name]
         fed = self.fed[name]
-        host, port = self.declared[name]
+        # Use endpoint_index to get the current endpoint host/port
+        endpoint_index = peer.get('endpoint_index', 0)
+        candidates = self.declared[name]
+        if 0 <= endpoint_index < len(candidates):
+            host, port = candidates[endpoint_index]
+        else:
+            host, port = candidates[0] if candidates else ('unknown', 0)
 
         return {
             'name': name,
@@ -4913,6 +5039,8 @@ class PeerWatch:
             'since': peer['since'],
             'last_probe': peer['last_probe'],
             'last_error': peer['last_error'],
+            'endpoint_in_use': peer.get('endpoint_in_use'),
+            'endpoint_changed_at': peer.get('endpoint_changed_at'),
             'prev_state': prev_state,
             'kind': 'roundhouse',
             'fed': {
@@ -4944,14 +5072,18 @@ class PeerWatch:
         return FedRows(rows)
 
 
-def _probe_peer(peer_watch: PeerWatch, name: str,
+def _probe_peer(peer_watch: PeerWatch, name: str, index: int = 0,
                 connect=socket.create_connection) -> tuple[bool, Optional[str]]:
-    """THE one outbound-socket site (guarded by AST, §6.1). §4.2 frozen.
+    """THE one outbound-socket site (guarded by AST, §6.1). §4.2 + §4.2 walk logic frozen.
 
-    Endpoint comes only from the startup-validated declaration table —
-    unrepresentable otherwise (J8).
+    Endpoint comes only from the startup-validated declaration table at index;
+    unrepresentable otherwise (J8, L5). Default index=0 preserves compat with
+    existing direct calls (§7.3 compat seam).
     """
-    host, port = peer_watch.declared[name]  # KeyError = programming error, loudly
+    candidates = peer_watch.declared[name]
+    if not (0 <= index < len(candidates)):
+        return (False, f'invalid candidate index {index}')
+    host, port = candidates[index]  # KeyError = programming error, loudly
     try:
         sock = connect((host, port), timeout=PEER_TIMEOUT_SEC)
         sock.close()
@@ -4966,13 +5098,17 @@ class _FleetNoRedirect(urllib.request.HTTPRedirectHandler):
         return None
 
 
-def _fetch_peer(peer_watch: PeerWatch, name: str, path: str, opener=None) -> tuple[bool, Optional[dict], Optional[str]]:
+def _fetch_peer(peer_watch: PeerWatch, name: str, path: str, opener=None, index: int = 0) -> tuple[bool, Optional[dict], Optional[str]]:
     """THE one federated-HTTP call site (AST-guarded, §8). Base URL comes only from
-    the startup-frozen fleet table; path only from FLEET_PATHS — unrepresentable
-    otherwise (K9). Returns (ok, payload_dict_or_None, error_str_or_None); error
-    strings carry a frozen class prefix: tls:/http:/timeout:/connect:/body:."""
+    the startup-frozen fleet table at index; path only from FLEET_PATHS — unrepresentable
+    otherwise (K9, L5). Default index=0 preserves compat (§7.3 compat seam).
+    Returns (ok, payload_dict_or_None, error_str_or_None); error strings carry a frozen
+    class prefix: tls:/http:/timeout:/connect:/body:."""
     assert path in FLEET_PATHS
-    url = peer_watch.fleet[name] + path          # KeyError = programming error, loudly
+    urls = peer_watch.fleet[name]
+    if not (0 <= index < len(urls)):
+        return (False, None, f'invalid candidate index {index}')
+    url = urls[index] + path          # KeyError = programming error, loudly
     if opener is None:                            # test seam, same shape as _probe_peer's
         ctx = ssl.create_default_context()        # system trust store; NEVER weakened (K2/§8)
         opener = urllib.request.build_opener(
@@ -5010,25 +5146,44 @@ def peer_watch_round(peer_watch: PeerWatch) -> None:
     """Run one round of peer probing and fetching. §4.4/K3 pattern: probe outside lock,
     apply inside; fetch outside lock if peer is up and is a fleet peer.
 
-    Probe order = declaration order; transitions published immediately.
+    Probe order = declaration order per peer; for fleet peers with candidates, walk
+    candidates in order and stop at first success (§4.2, L5). Transitions published immediately.
     """
     for name in peer_watch.declared:
-        # Probe OUTSIDE any lock (Risk #1, J5)
-        ok, error = _probe_peer(peer_watch, name)
+        # Candidate walk: for each peer, iterate through candidates (§4.2, L5)
+        # Re-walk from the top every round; hysteresis is peer-level not per-candidate
+        candidates = peer_watch.declared[name]
+        winner_index = None
+        errors = []
+
+        for i in range(len(candidates)):
+            # Probe OUTSIDE any lock (Risk #1, J5)
+            ok, err = _probe_peer(peer_watch, name, index=i)
+            if ok:
+                winner_index = i
+                break  # Stop at first success (§4.2, L5)
+            errors.append(f'candidate {i+1}: {err}')
+
+        # Determine overall result: ok if any candidate answered
+        ok = winner_index is not None
+        error = None if ok else '; '.join(errors)[:200]  # Truncate combined errors
 
         # Apply result with lock held for dict mutation only
         with peer_watch.lock:
-            payload = peer_watch.apply_result_unlocked(name, ok, error, peer_watch.now())
+            payload = peer_watch.apply_result_unlocked(
+                name, ok, error, peer_watch.now(), winner_index=winner_index)
             state_now = peer_watch.peers[name]['state']
             if payload:
                 peer_watch.event_bus.publish('peer', payload)
 
         # Fetch fleet peer data if it's a fleet peer and is up (per K3, outside lock)
-        if name in peer_watch.fleet and state_now == 'up':
-            # Fetch /api/units
-            ok_u, units_doc, err = _fetch_peer(peer_watch, name, '/api/units')
+        # Only fetch if walk succeeded (ok=True) — if walk failed but peer is still up,
+        # skip fetch and feed data stays stale (the fetch-skip rule per §4.2, L5)
+        if name in peer_watch.fleet and state_now == 'up' and winner_index is not None:
+            # Fetch /api/units using the winning candidate
+            ok_u, units_doc, err = _fetch_peer(peer_watch, name, '/api/units', index=winner_index)
             # Fetch /api/routing-config.json only if /api/units succeeded
-            ok_r, routing_doc, err_r = (_fetch_peer(peer_watch, name, '/api/routing-config.json')
+            ok_r, routing_doc, err_r = (_fetch_peer(peer_watch, name, '/api/routing-config.json', index=winner_index)
                                         if ok_u else (False, None, err))
 
             # Apply fetch result under lock
@@ -8845,9 +9000,15 @@ def cmd_serve(args):
     peer_set_errors = validate_peer_sets(peer_decls, fleet_decls,
                                          local_names=(nodename, advertise_host))
 
-    # D2: Fleet peer validation (endpoints derived from URLs)
-    fleet_endpoints = {name: (host, port) for name, (host, port, url) in fleet_decls.items()}
-    fleet_peer_validation_errors = validate_peers(fleet_endpoints, units, port, bind_addrs,
+    # D2: Fleet peer validation per candidate (§4.1, L7 — candidates are full D2 citizens)
+    # Validate each candidate with name like 'peer[1]', 'peer[2]', etc. for error clarity
+    fleet_candidate_endpoints = {}
+    for name, candidates in fleet_decls.items():
+        for i, (host, port, url) in enumerate(candidates, 1):
+            candidate_name = f'{name}[{i}]'
+            fleet_candidate_endpoints[candidate_name] = (host, port)
+
+    fleet_peer_validation_errors = validate_peers(fleet_candidate_endpoints, units, port, bind_addrs,
                                                    advertise_host, nodename)
 
     all_validation_errors = peer_validation_errors + peer_set_errors + fleet_peer_validation_errors
@@ -8856,9 +9017,15 @@ def cmd_serve(args):
             print(error, file=sys.stderr)
         return 1
 
-    # Merge declared peers for PeerWatch (all TCP + fleet endpoints)
-    all_declared = {**peer_decls, **fleet_endpoints}
-    fleet_urls = {name: url for name, (host, port, url) in fleet_decls.items()}
+    # Merge declared peers for PeerWatch (all TCP + fleet candidates; §4.1, L5)
+    # For fleet peers, create a list of (host, port) tuples for each peer name
+    all_declared = dict(peer_decls)  # Start with TCP peers
+    for name, candidates in fleet_decls.items():
+        # Extract (host, port) tuples from candidates
+        all_declared[name] = [(host, port) for host, port, url in candidates]
+
+    # Extract URLs from candidates for fleet_urls dict (§4.1)
+    fleet_urls = {name: [url for host, port, url in candidates] for name, candidates in fleet_decls.items()}
 
     # Create PeerWatch (before servers, before threads — J6 construction order, K1)
     peer_watch = PeerWatch(all_declared, watcher_lock, event_bus, fleet=fleet_urls) if all_declared else None

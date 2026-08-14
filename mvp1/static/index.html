@@ -777,7 +777,7 @@
             }
         }
 
-        .peer-strip {
+        .listener-strip, .peer-strip {
             margin-bottom: 1.5em;
             padding: 0.75em;
             background: var(--border);
@@ -816,6 +816,24 @@
         .peer-name {
             font-family: 'Courier New', monospace;
             font-size: 0.9em;
+        }
+
+        /* Listener cells: address and state (§5.4, L4). Neutral by contract: bound = normal text,
+           absent/error = muted. No red, no amber — these are interface changes, not alarms. */
+        .listener-cell {
+            display: flex;
+            align-items: center;
+            gap: 0.5em;
+            padding: 0.25em 0.5em;
+            border-radius: 2px;
+            min-height: 24px;
+            color: var(--fg);
+            font-size: 0.9em;
+        }
+
+        .listener-cell.absent,
+        .listener-cell.error {
+            color: var(--neutral);
         }
 
         /* MVP8 §6.4: the fleet section is a read-only listing of what other hosts
@@ -880,6 +898,11 @@
                 <button id="dismiss-button" class="link-button" onclick="dismiss()">dismiss</button>
             </span>
         </div>
+    </div>
+
+    <div class="listener-strip" id="listener-strip" style="display: none;">
+        <div class="peer-strip-title">listening</div>
+        <div id="listener-items"></div>
     </div>
 
     <div class="peer-strip" id="peer-strip" style="display: none;">
@@ -1086,12 +1109,25 @@
             renderFleetSection();
         });
 
+        eventSource.addEventListener('listener', (e) => {
+            const data = JSON.parse(e.data);
+            if (!state.listeners) state.listeners = [];
+            const listener = state.listeners.find(l => l.addr === data.addr);
+            if (listener) {
+                Object.assign(listener, data);
+            } else {
+                state.listeners.push(data);
+            }
+            renderListeners();
+        });
+
         eventSource.onerror = () => {
             showDegradedBanner('sensing degraded (connection lost)');
         };
 
         function render() {
             renderHeader();
+            renderListeners();
             renderPeers();
             renderFleetSection();
             renderUnits();
@@ -1150,18 +1186,59 @@
                 // MVP8 §6.4: a fleet peer's cell also carries what it told us — how
                 // many units it is running, and whether that answer is current. Same
                 // muted palette, same non-interactive cell; a `stale` marker is
-                // information, not an alarm.
+                // information, not an alarm. MVP9 §5.4: add endpoint hint when multiple candidates.
                 let label = peer.name + ' · ' + (peer.state || 'unknown');
-                if (peer.kind === 'roundhouse' && peer.fed) {
-                    label += ' · ' + (peer.fed.unit_count || 0) + ' units';
-                    if (peer.fed.stale) {
-                        label += ' · stale';
+                if (peer.kind === 'roundhouse') {
+                    // Show endpoint hint for fleet peers with candidates (§5.4, L5)
+                    if (peer.endpoints && peer.endpoints.length > 1 && peer.endpoint_in_use) {
+                        // Extract host from the endpoint_in_use URL
+                        try {
+                            const url = new URL(peer.endpoint_in_use);
+                            label += ' · via ' + url.hostname;
+                        } catch (e) {
+                            // Fallback if URL parsing fails
+                        }
+                    }
+                    if (peer.fed) {
+                        label += ' · ' + (peer.fed.unit_count || 0) + ' units';
+                        if (peer.fed.stale) {
+                            label += ' · stale';
+                        }
                     }
                 }
                 name.textContent = label;
                 item.appendChild(name);
 
                 peerItems.appendChild(item);
+            }
+        }
+
+        function renderListeners() {
+            const listeners = state.listeners || [];
+            const strip = document.getElementById('listener-strip');
+            const listenerItems = document.getElementById('listener-items');
+
+            if (listeners.length === 0) {
+                strip.style.display = 'none';
+                return;
+            }
+
+            strip.style.display = 'flex';
+            listenerItems.replaceChildren();
+
+            // Listener cells: `addr · state` (§5.4, L4). For name rows, append ` → a1, a2` from resolved.
+            for (const listener of listeners) {
+                const item = document.createElement('div');
+                item.className = 'listener-cell ' + (listener.state || 'error');
+
+                let label = listener.addr + ' · ' + (listener.state || 'error');
+                // Name rows show resolved addresses when bound
+                if (listener.kind === 'name' && listener.resolved && listener.resolved.length > 0) {
+                    label += ' → ' + listener.resolved.join(', ');
+                }
+
+                item.textContent = label;
+                listenerItems.appendChild(item);
             }
         }
 

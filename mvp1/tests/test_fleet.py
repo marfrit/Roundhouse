@@ -30,7 +30,7 @@ class TestFleetPeerParsing(unittest.TestCase):
         decls, errors = roundhouse.parse_fleet_peer_decls(['peer1=https://example.com:8099'])
         self.assertEqual(errors, [])
         self.assertIn('peer1', decls)
-        host, port, url = decls['peer1']
+        host, port, url = decls['peer1'][0]
         self.assertEqual(host, 'example.com')
         self.assertEqual(port, 8099)
         self.assertEqual(url, 'https://example.com:8099')
@@ -39,7 +39,7 @@ class TestFleetPeerParsing(unittest.TestCase):
         """Valid HTTP URL."""
         decls, errors = roundhouse.parse_fleet_peer_decls(['peer1=http://example.com:8080'])
         self.assertEqual(errors, [])
-        host, port, url = decls['peer1']
+        host, port, url = decls['peer1'][0]
         self.assertEqual(host, 'example.com')
         self.assertEqual(port, 8080)
 
@@ -47,7 +47,7 @@ class TestFleetPeerParsing(unittest.TestCase):
         """HTTPS defaults to port 443."""
         decls, errors = roundhouse.parse_fleet_peer_decls(['peer1=https://example.com'])
         self.assertEqual(errors, [])
-        host, port, url = decls['peer1']
+        host, port, url = decls['peer1'][0]
         self.assertEqual(port, 443)
         self.assertEqual(url, 'https://example.com:443')
 
@@ -55,7 +55,7 @@ class TestFleetPeerParsing(unittest.TestCase):
         """HTTP defaults to port 80."""
         decls, errors = roundhouse.parse_fleet_peer_decls(['peer1=http://example.com'])
         self.assertEqual(errors, [])
-        host, port, url = decls['peer1']
+        host, port, url = decls['peer1'][0]
         self.assertEqual(port, 80)
         self.assertEqual(url, 'http://example.com:80')
 
@@ -63,7 +63,7 @@ class TestFleetPeerParsing(unittest.TestCase):
         """IPv6 literals are bracketed and normalized."""
         decls, errors = roundhouse.parse_fleet_peer_decls(['peer1=https://[::1]:8099'])
         self.assertEqual(errors, [])
-        host, port, url = decls['peer1']
+        host, port, url = decls['peer1'][0]
         self.assertEqual(host, '::1')
         self.assertEqual(port, 8099)
         # Verify IPv6 is bracketed in normalized URL
@@ -73,7 +73,7 @@ class TestFleetPeerParsing(unittest.TestCase):
         """IPv4 literals work."""
         decls, errors = roundhouse.parse_fleet_peer_decls(['peer1=https://192.0.2.1:8099'])
         self.assertEqual(errors, [])
-        host, port, url = decls['peer1']
+        host, port, url = decls['peer1'][0]
         self.assertEqual(host, '192.0.2.1')
         self.assertEqual(port, 8099)
 
@@ -178,7 +178,7 @@ class TestFetchPeer(unittest.TestCase):
     def test_fetch_success_units(self):
         """Successful fetch of /api/units."""
         peer_watch = MagicMock()
-        peer_watch.fleet = {'peer1': 'https://example.com:8099'}
+        peer_watch.fleet = {'peer1': ['https://example.com:8099']}
 
         payload = {'units': [{'unit': 'test.service'}], 'mode': 'read-only'}
 
@@ -203,7 +203,7 @@ class TestFetchPeer(unittest.TestCase):
         """HTTP error (non-200) returns http: code."""
         import urllib.error
         peer_watch = MagicMock()
-        peer_watch.fleet = {'peer1': 'https://example.com:8099'}
+        peer_watch.fleet = {'peer1': ['https://example.com:8099']}
 
         def mock_opener_open(url, timeout=None):
             raise urllib.error.HTTPError(url, 404, 'Not Found', {}, None)
@@ -221,7 +221,7 @@ class TestFetchPeer(unittest.TestCase):
         """Redirects are not followed; returned as http: code."""
         import urllib.error
         peer_watch = MagicMock()
-        peer_watch.fleet = {'peer1': 'https://example.com:8099'}
+        peer_watch.fleet = {'peer1': ['https://example.com:8099']}
 
         def mock_opener_open(url, timeout=None):
             raise urllib.error.HTTPError(url, 301, 'Moved Permanently', {}, None)
@@ -237,7 +237,7 @@ class TestFetchPeer(unittest.TestCase):
         """Timeout returns timeout: prefix."""
         import urllib.error
         peer_watch = MagicMock()
-        peer_watch.fleet = {'peer1': 'https://example.com:8099'}
+        peer_watch.fleet = {'peer1': ['https://example.com:8099']}
 
         def mock_opener_open(url, timeout=None):
             raise TimeoutError('timed out')
@@ -252,7 +252,7 @@ class TestFetchPeer(unittest.TestCase):
     def test_fetch_ssl_error(self):
         """SSL error returns tls: prefix."""
         peer_watch = MagicMock()
-        peer_watch.fleet = {'peer1': 'https://example.com:8099'}
+        peer_watch.fleet = {'peer1': ['https://example.com:8099']}
 
         def mock_opener_open(url, timeout=None):
             raise ssl.SSLCertVerificationError('certificate verify failed')
@@ -268,7 +268,7 @@ class TestFetchPeer(unittest.TestCase):
         """Connection error returns connect: prefix."""
         import urllib.error
         peer_watch = MagicMock()
-        peer_watch.fleet = {'peer1': 'https://example.com:8099'}
+        peer_watch.fleet = {'peer1': ['https://example.com:8099']}
 
         def mock_opener_open(url, timeout=None):
             raise urllib.error.URLError(OSError('Connection refused'))
@@ -283,7 +283,7 @@ class TestFetchPeer(unittest.TestCase):
     def test_fetch_oversized_body(self):
         """Body larger than FETCH_MAX_BYTES is rejected."""
         peer_watch = MagicMock()
-        peer_watch.fleet = {'peer1': 'https://example.com:8099'}
+        peer_watch.fleet = {'peer1': ['https://example.com:8099']}
 
         def mock_opener_open(url, timeout=None):
             resp = MagicMock()
@@ -303,7 +303,7 @@ class TestFetchPeer(unittest.TestCase):
     def test_fetch_invalid_json(self):
         """Invalid JSON returns body: error."""
         peer_watch = MagicMock()
-        peer_watch.fleet = {'peer1': 'https://example.com:8099'}
+        peer_watch.fleet = {'peer1': ['https://example.com:8099']}
 
         def mock_opener_open(url, timeout=None):
             resp = MagicMock()
@@ -322,7 +322,7 @@ class TestFetchPeer(unittest.TestCase):
     def test_fetch_json_not_object(self):
         """JSON that is not an object is rejected."""
         peer_watch = MagicMock()
-        peer_watch.fleet = {'peer1': 'https://example.com:8099'}
+        peer_watch.fleet = {'peer1': ['https://example.com:8099']}
 
         def mock_opener_open(url, timeout=None):
             resp = MagicMock()
@@ -341,7 +341,7 @@ class TestFetchPeer(unittest.TestCase):
     def test_fetch_invalid_path(self):
         """Fetch with invalid path (not in FLEET_PATHS) asserts."""
         peer_watch = MagicMock()
-        peer_watch.fleet = {'peer1': 'https://example.com:8099'}
+        peer_watch.fleet = {'peer1': ['https://example.com:8099']}
 
         with self.assertRaises(AssertionError):
             roundhouse._fetch_peer(peer_watch, 'peer1', '/invalid/path')

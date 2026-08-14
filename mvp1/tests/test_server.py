@@ -1298,7 +1298,7 @@ class TestWriteGuards(unittest.TestCase):
         fn = next(n for n in ast.walk(tree)
                   if isinstance(n, ast.FunctionDef) and n.name == '_fetch_peer')
         arg_names = [a.arg for a in fn.args.args]
-        self.assertEqual(arg_names, ['peer_watch', 'name', 'path', 'opener'])
+        self.assertEqual(arg_names, ['peer_watch', 'name', 'path', 'opener', 'index'])
         self.assertNotIn('url', arg_names)
 
         body_src = ast.get_source_segment(source, fn)
@@ -1845,7 +1845,8 @@ class TestPeersRoute(_PeersRouteHarness):
         for row in rows:
             self.assertEqual(set(row.keys()),
                              {'name', 'host', 'port', 'state', 'since',
-                              'last_probe', 'consecutive_failures', 'last_error', 'kind'})
+                              'last_probe', 'consecutive_failures', 'last_error', 'kind',
+                              'endpoint_in_use', 'endpoint_changed_at'})
         self.assertEqual(rows[0]['host'], 'ampere.fritz.box')
         self.assertEqual(rows[0]['port'], 8099)
 
@@ -1955,7 +1956,7 @@ class TestPeersFlapCannotActuate(_PeersRouteHarness):
                  patch('roundhouse.run_actuate', side_effect=boom), \
                  patch('roundhouse.subprocess.Popen', side_effect=record), \
                  patch('roundhouse.subprocess.run', side_effect=record), \
-                 patch.object(roundhouse, '_probe_peer', lambda pw, n: next(seq)):
+                 patch.object(roundhouse, '_probe_peer', lambda pw, n, index=0, connect=None: next(seq)):
                 for _ in results:
                     roundhouse.peer_watch_round(peer_watch)
             self.assertEqual(recorder, [])
@@ -2038,7 +2039,8 @@ class TestPeerSSE(_PeersRouteHarness):
             self.assertEqual(payload['name'], 'solo')
             self.assertEqual(set(payload.keys()),
                              {'name', 'host', 'port', 'state', 'since', 'last_probe',
-                              'consecutive_failures', 'last_error', 'prev_state', 'kind'})
+                              'consecutive_failures', 'last_error', 'prev_state', 'kind',
+                              'endpoint_in_use', 'endpoint_changed_at'})
 
             for _ in range(4):                               # four stable rounds
                 self.drive('solo', True)
@@ -3497,10 +3499,15 @@ class TestFetchLockDiscipline(unittest.TestCase):
         opener = self._opener([{'mode': 'read-only', 'units': []}, {'model_list': []}])
         real_fetch = roundhouse._fetch_peer
 
-        def fetch(pw, name, path, _opener=None):
+        def fetch(pw, name, path, _opener=None, index=0):
+            # The parameter is _opener, NOT opener: this body closes over the
+            # outer `opener` (the recording stub). Naming the parameter `opener`
+            # shadows that closure, real_fetch gets None, and the round quietly
+            # does a real connect to 127.0.0.1:9 — the test then reports "no
+            # fetches" as if the lock discipline had broken. It had not.
             return real_fetch(pw, name, path, opener=opener)
 
-        with patch.object(roundhouse, '_probe_peer', lambda pw, name, connect=None: (True, None)), \
+        with patch.object(roundhouse, '_probe_peer', lambda pw, name, index=0, connect=None: (True, None)), \
              patch.object(roundhouse, '_fetch_peer', fetch):
             roundhouse.peer_watch_round(self.pw)
 
@@ -3514,11 +3521,11 @@ class TestFetchLockDiscipline(unittest.TestCase):
     def test_the_second_document_is_skipped_when_the_first_fails(self):
         calls = []
 
-        def fetch(pw, name, path, opener=None):
+        def fetch(pw, name, path, opener=None, index=0):
             calls.append(path)
             return (False, None, 'connect: refused')
 
-        with patch.object(roundhouse, '_probe_peer', lambda pw, name, connect=None: (True, None)), \
+        with patch.object(roundhouse, '_probe_peer', lambda pw, name, index=0, connect=None: (True, None)), \
              patch.object(roundhouse, '_fetch_peer', fetch):
             roundhouse.peer_watch_round(self.pw)
 
@@ -3528,12 +3535,12 @@ class TestFetchLockDiscipline(unittest.TestCase):
     def test_a_peer_that_is_not_up_is_never_fetched(self):
         calls = []
 
-        def fetch(pw, name, path, opener=None):
+        def fetch(pw, name, path, opener=None, index=0):
             calls.append(path)
             return (True, {}, None)
 
         with patch.object(roundhouse, '_probe_peer',
-                          lambda pw, name, connect=None: (False, 'refused')), \
+                          lambda pw, name, index=0, connect=None: (False, 'refused')), \
              patch.object(roundhouse, '_fetch_peer', fetch):
             roundhouse.peer_watch_round(self.pw)
         self.assertEqual(calls, [])
@@ -3599,6 +3606,106 @@ class TestHangingPeerCostsOnlyItsTimeout(unittest.TestCase):
             server.shutdown()
             server.server_close()
             listener.close()
+
+
+class TestBudgetPin(unittest.TestCase):
+    """§7.4, L6: Executable budget test — worst-case round must fit 60s cadence."""
+
+    def test_worst_case_round_under_60s(self):
+        """Verify worst-case round = 56s at FLEET_CANDIDATE_MAX=3, PEER_MAX=8 (§L6)."""
+        # Worst round = (PEER_MAX - FLEET_PEER_MAX) * PEER_TIMEOUT_SEC
+        #             + FLEET_PEER_MAX * ((FLEET_CANDIDATE_MAX - 1) * PEER_TIMEOUT_SEC + 2 * FETCH_TIMEOUT_SEC)
+        tcp_peers = roundhouse.PEER_MAX - roundhouse.FLEET_PEER_MAX
+        fleet_peers = roundhouse.FLEET_PEER_MAX
+        tcp_cost = tcp_peers * roundhouse.PEER_TIMEOUT_SEC
+        fleet_cost = fleet_peers * ((roundhouse.FLEET_CANDIDATE_MAX - 1) * roundhouse.PEER_TIMEOUT_SEC +
+                                    2 * roundhouse.FETCH_TIMEOUT_SEC)
+        worst_round = tcp_cost + fleet_cost
+
+        # Must be <= 60s (the cadence floor)
+        self.assertLessEqual(worst_round, 60.0,
+                           f"Worst round {worst_round}s exceeds 60s cadence; reduce constants per §L6")
+
+        # With current constants, should be exactly 56s
+        self.assertEqual(worst_round, 56.0)
+
+
+class TestEndpointStatics(unittest.TestCase):
+    """§7.5: UI statics for endpoint display (T2)."""
+
+    def test_index_html_has_listener_strip_id(self):
+        """index.html has #listener-strip (§5.4)."""
+        with open(Path(__file__).parent.parent / 'static' / 'index.html') as f:
+            html = f.read()
+        self.assertIn('listener-strip', html, "Missing #listener-strip element per §5.4")
+
+    def test_index_html_listening_title(self):
+        """index.html contains 'listening' title string (§5.4)."""
+        with open(Path(__file__).parent.parent / 'static' / 'index.html') as f:
+            html = f.read()
+        self.assertIn('listening', html.lower(), "Missing 'listening' title per §5.4")
+
+    def test_index_html_peer_endpoint_marker(self):
+        """index.html contains ' · via ' fragment for endpoint display (§5.4)."""
+        with open(Path(__file__).parent.parent / 'static' / 'index.html') as f:
+            html = f.read()
+        self.assertIn(' · via ', html, "Missing ' · via ' endpoint marker per §5.4")
+
+
+class TestPeerEndpointFields(unittest.TestCase):
+    """§7.4: Peer row endpoint fields (endpoint_in_use, endpoint_changed_at)."""
+
+    def test_rows_include_endpoint_fields(self):
+        """Peer rows include endpoint_in_use and endpoint_changed_at (§4.3, §5.3)."""
+        lock = threading.Lock()
+        declared = {'tcp': [('h1', 8080)], 'fleet': [('h2', 8081)]}
+        fleet = {'fleet': ['http://h2:8081']}
+        bus = MagicMock()
+        pw = roundhouse.PeerWatch(declared, lock, bus, fleet=fleet)
+
+        rows = pw.rows_unlocked()
+        for row in rows:
+            self.assertIn('endpoint_in_use', row)
+            self.assertIn('endpoint_changed_at', row)
+
+    def test_fleet_rows_have_endpoints_list(self):
+        """Fleet peer rows include 'endpoints' list of all candidate URLs (§4.3)."""
+        lock = threading.Lock()
+        declared = {'fleet': [('h1', 80), ('h2', 81)]}
+        fleet = {'fleet': ['http://h1:80', 'http://h2:81']}
+        bus = MagicMock()
+        pw = roundhouse.PeerWatch(declared, lock, bus, fleet=fleet)
+
+        rows = pw.rows_unlocked()
+        fleet_row = [r for r in rows if r['name'] == 'fleet'][0]
+        self.assertIn('endpoints', fleet_row)
+        self.assertEqual(len(fleet_row['endpoints']), 2)
+
+    def test_tcp_rows_have_no_endpoints_list(self):
+        """TCP peer rows do NOT include 'endpoints' list (§4.3)."""
+        lock = threading.Lock()
+        declared = {'tcp': [('host', 8080)]}
+        bus = MagicMock()
+        pw = roundhouse.PeerWatch(declared, lock, bus)
+
+        rows = pw.rows_unlocked()
+        tcp_row = rows[0]
+        self.assertNotIn('endpoints', tcp_row)
+
+    def test_endpoint_changed_at_set_on_endpoint_change(self):
+        """endpoint_changed_at is set when endpoint changes (§4.3)."""
+        lock = threading.Lock()
+        declared = {'fleet': [('h1', 80), ('h2', 81)]}
+        fleet = {'fleet': ['http://h1:80', 'http://h2:81']}
+        bus = MagicMock()
+        pw = roundhouse.PeerWatch(declared, lock, bus, fleet=fleet)
+
+        ts = time.time()
+        payload = pw.apply_result_unlocked('fleet', ok=True, error=None, ts=ts, winner_index=1)
+        self.assertIsNotNone(payload)
+        self.assertEqual(pw.peers['fleet']['endpoint_index'], 1)
+        self.assertIsNotNone(pw.peers['fleet']['endpoint_changed_at'])
+        self.assertGreaterEqual(pw.peers['fleet']['endpoint_changed_at'], ts)
 
 
 if __name__ == '__main__':

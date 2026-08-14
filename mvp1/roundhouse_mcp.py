@@ -639,7 +639,7 @@ def handle_message(msg, conn_state) -> dict or None:
                     'capabilities': {'tools': {}},
                     'serverInfo': {
                         'name': 'roundhouse-mcp',
-                        'version': '8.0'
+                        'version': '9.0'
                     }
                 }
             }

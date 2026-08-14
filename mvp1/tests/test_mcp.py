@@ -206,7 +206,7 @@ class TestFraming(unittest.TestCase):
         response = roundhouse_mcp.handle_message(msg, {'url': 'http://localhost', 'client_name': 'unknown'})
         self.assertEqual(response['result']['protocolVersion'], '2025-06-18')
         self.assertEqual(response['result']['serverInfo']['name'], 'roundhouse-mcp')
-        self.assertEqual(response['result']['serverInfo']['version'], '8.0')
+        self.assertEqual(response['result']['serverInfo']['version'], '9.0')
         self.assertIn('tools', response['result']['capabilities'])
 
     def test_initialize_unsupported_version_downgrades(self):

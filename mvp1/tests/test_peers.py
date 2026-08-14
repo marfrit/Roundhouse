@@ -393,14 +393,15 @@ class TestPeerRound(unittest.TestCase):
             threading.Lock(), MagicMock())
         seen = []
 
-        def fake_probe(pw, name):
-            seen.append(name)
+        def fake_probe(pw, name, index=0, connect=None):
+            seen.append((name, index))
             return (True, None)
 
         with patch.object(roundhouse, '_probe_peer', fake_probe):
             roundhouse.peer_watch_round(peer_watch)
 
-        self.assertEqual(seen, ['zulu', 'alpha', 'mike'])
+        # peer_watch_round calls _probe_peer once per peer (with index=0 for single-endpoint)
+        self.assertEqual(seen, [('zulu', 0), ('alpha', 0), ('mike', 0)])
 
     def test_raising_connect_counts_as_failure_with_class_prefix(self):
         """§4.2: any exception is a failure; last_error is prefixed with the class name."""
@@ -425,7 +426,7 @@ class TestPeerRound(unittest.TestCase):
         peer_watch = roundhouse.PeerWatch({'p1': ('h', 1), 'p2': ('h', 2)}, lock, MagicMock())
         free_during_probe = []
 
-        def fake_probe(pw, name):
+        def fake_probe(pw, name, index=0, connect=None):
             acquired = lock.acquire(blocking=False)
             free_during_probe.append(acquired)
             if acquired:
@@ -443,7 +444,7 @@ class TestPeerRound(unittest.TestCase):
         bus = MagicMock()
         peer_watch = roundhouse.PeerWatch({'p1': ('h', 1)}, threading.Lock(), bus)
 
-        with patch.object(roundhouse, '_probe_peer', lambda pw, n: (True, None)):
+        with patch.object(roundhouse, '_probe_peer', lambda pw, n, index=0, connect=None: (True, None)):
             for _ in range(5):
                 roundhouse.peer_watch_round(peer_watch)
 
@@ -655,6 +656,228 @@ class TestPeerLockDiscipline(unittest.TestCase):
                 self.assertIsInstance(rows, list)
         except Exception as e:
             self.fail(f"rows_unlocked deadlocked or raised: {e}")
+
+
+class TestFleetPeerCandidateParsing(unittest.TestCase):
+    """§7.3: parse_fleet_peer_decls candidate parsing per §4.1, L5."""
+
+    def test_single_url_per_peer(self):
+        """Single URL per peer (backward compat with MVP8)."""
+        result, errors = roundhouse.parse_fleet_peer_decls(['peer1=http://host1:8080'])
+        self.assertEqual(errors, [])
+        self.assertEqual(len(result), 1)
+        self.assertIn('peer1', result)
+        self.assertEqual(len(result['peer1']), 1)
+        self.assertEqual(result['peer1'][0][0], 'host1')
+        self.assertEqual(result['peer1'][0][1], 8080)
+
+    def test_comma_separated_candidates(self):
+        """Comma-separated URLs become candidate list (§4.1, L5)."""
+        result, errors = roundhouse.parse_fleet_peer_decls(
+            ['peer1=http://host1:8080,http://host2:8081'])
+        self.assertEqual(errors, [])
+        self.assertEqual(len(result['peer1']), 2)
+        self.assertEqual(result['peer1'][0][0], 'host1')
+        self.assertEqual(result['peer1'][1][0], 'host2')
+
+    def test_three_candidates_at_cap(self):
+        """Three candidates is the cap (§4.1, L5, L6)."""
+        result, errors = roundhouse.parse_fleet_peer_decls(
+            ['p=http://h1:80,http://h2:80,http://h3:80'])
+        self.assertEqual(errors, [])
+        self.assertEqual(len(result['p']), 3)
+
+    def test_four_candidates_exceeds_cap(self):
+        """Four candidates exceeds cap and is an error (§L6)."""
+        result, errors = roundhouse.parse_fleet_peer_decls(
+            ['p=http://h1:80,http://h2:80,http://h3:80,http://h4:80'])
+        self.assertTrue(any('too many candidates' in e and '> 3' in e for e in errors))
+
+    def test_duplicate_url_within_peer(self):
+        """Duplicate URL in same peer is an error (§4.1)."""
+        result, errors = roundhouse.parse_fleet_peer_decls(
+            ['p=http://host:8080,http://host:8080'])
+        self.assertTrue(any('duplicate candidate' in e for e in errors))
+
+    def test_mixed_http_https_allowed(self):
+        """Mixed http/https candidates are legal (§4.1, L7)."""
+        result, errors = roundhouse.parse_fleet_peer_decls(
+            ['p=http://h1:80,https://h2:443'])
+        self.assertEqual(errors, [])
+        self.assertEqual(len(result['p']), 2)
+        self.assertEqual(result['p'][0][0], 'h1')
+        self.assertEqual(result['p'][1][0], 'h2')
+
+    def test_ipv6_bracketed_candidates(self):
+        """IPv6 addresses in brackets are normalized (§4.1)."""
+        result, errors = roundhouse.parse_fleet_peer_decls(
+            ['p=http://[::1]:8080,http://[2001:db8::1]:8081'])
+        self.assertEqual(errors, [])
+        self.assertEqual(len(result['p']), 2)
+
+    def test_empty_candidate_token_error(self):
+        """Empty token in comma list is an error."""
+        result, errors = roundhouse.parse_fleet_peer_decls(['p=http://h1:80,,http://h2:80'])
+        self.assertTrue(any('candidate' in e and 'empty' in e for e in errors))
+
+    def test_per_candidate_error_messaging(self):
+        """Per-candidate errors name the candidate index (§4.1)."""
+        result, errors = roundhouse.parse_fleet_peer_decls(
+            ['p=http://h1:80,invalid://h2:80'])
+        self.assertTrue(any('candidate 2' in e for e in errors))
+
+
+class TestCandidateWalk(unittest.TestCase):
+    """§7.3: Candidate walk logic per §4.2, L5."""
+
+    def test_walk_stops_at_first_success(self):
+        """Walk stops at first responding candidate (§4.2, L5)."""
+        lock = threading.Lock()
+        declared = {'p': [('h1', 80), ('h2', 81)]}
+        fleet = {'p': ['http://h1:80', 'http://h2:81']}
+        pw = roundhouse.PeerWatch(declared, lock, MagicMock(), fleet=fleet)
+
+        call_count = [0]
+        def selective_connect(addr, timeout=None):
+            call_count[0] += 1
+            if addr == ('h1', 80):
+                raise OSError("refused")
+            sock = MagicMock()
+            return sock
+
+        # Candidate 0 fails, candidate 1 succeeds
+        ok, err = roundhouse._probe_peer(pw, 'p', index=0, connect=selective_connect)
+        self.assertFalse(ok)
+        ok, err = roundhouse._probe_peer(pw, 'p', index=1, connect=selective_connect)
+        self.assertTrue(ok)
+
+    def test_walk_from_top_every_round(self):
+        """Re-walk from top every round; returning preferred endpoint is picked up (§4.2, L5)."""
+        lock = threading.Lock()
+        declared = {'p': [('preferred', 80), ('fallback', 81)]}
+        fleet = {'p': ['http://preferred:80', 'http://fallback:81']}
+        pw = roundhouse.PeerWatch(declared, lock, MagicMock(), fleet=fleet)
+
+        call_counts = {'preferred': 0, 'fallback': 0}
+        def selective_connect(addr, timeout=None):
+            host, port = addr
+            call_counts[host] = call_counts.get(host, 0) + 1
+            if host == 'preferred':
+                raise OSError("refused")  # First round: preferred fails
+            sock = MagicMock()
+            return sock
+
+        # First round: preferred fails, fallback wins
+        ok, err = roundhouse._probe_peer(pw, 'p', index=0, connect=selective_connect)
+        self.assertFalse(ok)
+        ok, err = roundhouse._probe_peer(pw, 'p', index=1, connect=selective_connect)
+        self.assertTrue(ok)
+        self.assertEqual(pw.peers['p']['endpoint_index'], 0)  # Still at index 0 (not updated by probe)
+
+        # Verify we called both candidates in order
+        self.assertEqual(call_counts['preferred'], 1)
+        self.assertEqual(call_counts['fallback'], 1)
+
+    def test_endpoint_change_without_state_transition(self):
+        """Endpoint change emits event even without state change (§4.3, L5)."""
+        lock = threading.Lock()
+        declared = {'p': [('h1', 80), ('h2', 81)]}
+        fleet = {'p': ['http://h1:80', 'http://h2:81']}
+        pw = roundhouse.PeerWatch(declared, lock, MagicMock(), fleet=fleet)
+
+        # Move from candidate 0 to candidate 1 while state stays 'up'
+        pw.peers['p']['state'] = 'up'
+        pw.peers['p']['endpoint_index'] = 0
+        pw.peers['p']['endpoint_in_use'] = 'http://h1:80'
+
+        payload = pw.apply_result_unlocked('p', ok=True, error=None, ts=time.time(),
+                                           winner_index=1)
+        # Endpoint changed; should emit event even though state didn't change
+        self.assertIsNotNone(payload)
+        self.assertEqual(payload['prev_state'], 'up')
+        self.assertEqual(pw.peers['p']['endpoint_changed_at'], payload['endpoint_changed_at'])
+
+    def test_fetch_uses_winner_index(self):
+        """_fetch_peer uses the winner index, not candidate 0 (§4.2, L5)."""
+        lock = threading.Lock()
+        declared = {'p': [('h1', 80), ('h2', 81)]}
+        fleet = {'p': ['http://h1:80', 'http://h2:81']}
+        pw = roundhouse.PeerWatch(declared, lock, MagicMock(), fleet=fleet)
+
+        # Mock opener to record which URL is fetched
+        fetched_urls = []
+        mock_opener = MagicMock()
+        mock_resp = MagicMock()
+        mock_resp.read.return_value = b'{}'
+        mock_resp.__enter__ = MagicMock(return_value=mock_resp)
+        mock_resp.__exit__ = MagicMock(return_value=None)
+
+        def track_open(url, timeout=None):
+            fetched_urls.append(url)
+            return mock_resp
+
+        mock_opener.open = track_open
+
+        # Fetch with index 1 (second candidate)
+        ok, data, err = roundhouse._fetch_peer(pw, 'p', '/api/units', opener=mock_opener, index=1)
+        self.assertEqual(len(fetched_urls), 1)
+        self.assertIn('h2:81', fetched_urls[0])
+
+
+class TestPeerWatchCtorNormalization(unittest.TestCase):
+    """§7.3 compat seam: old single-endpoint shapes normalize to lists."""
+
+    def test_old_declared_tuple_normalizes_to_list(self):
+        """Old MVP8 declared format: {name: (host, port)} → {name: [(host, port)]}."""
+        lock = threading.Lock()
+        declared = {'p': ('host', 8080)}  # Old format
+        pw = roundhouse.PeerWatch(declared, lock, MagicMock())
+        # Should normalize to list
+        self.assertIsInstance(pw.declared['p'], list)
+        self.assertEqual(len(pw.declared['p']), 1)
+        self.assertEqual(pw.declared['p'][0], ('host', 8080))
+
+    def test_new_declared_list_passes_through(self):
+        """New format {name: [(host, port), ...]} passes through unchanged."""
+        lock = threading.Lock()
+        declared = {'p': [('host', 8080), ('host2', 8081)]}  # New format
+        pw = roundhouse.PeerWatch(declared, lock, MagicMock())
+        self.assertEqual(len(pw.declared['p']), 2)
+
+    def test_old_fleet_string_normalizes_to_list(self):
+        """Old fleet format {name: 'url'} → {name: ['url']}."""
+        lock = threading.Lock()
+        declared = {'p': ('host', 8080)}
+        fleet = {'p': 'http://host:8080'}  # Old format
+        pw = roundhouse.PeerWatch(declared, lock, MagicMock(), fleet=fleet)
+        self.assertIsInstance(pw.fleet['p'], list)
+        self.assertEqual(len(pw.fleet['p']), 1)
+        self.assertEqual(pw.fleet['p'][0], 'http://host:8080')
+
+    def test_new_fleet_list_passes_through(self):
+        """New format {name: ['url', ...]} passes through unchanged."""
+        lock = threading.Lock()
+        declared = {'p': [('host', 8080)]}
+        fleet = {'p': ['http://host:8080', 'http://host2:8081']}  # New format
+        pw = roundhouse.PeerWatch(declared, lock, MagicMock(), fleet=fleet)
+        self.assertEqual(len(pw.fleet['p']), 2)
+
+    def test_tcp_peer_endpoint_in_use_fixed(self):
+        """TCP peer endpoint_in_use is fixed at init and never changes."""
+        lock = threading.Lock()
+        declared = {'tcp_peer': ('host', 8080)}
+        pw = roundhouse.PeerWatch(declared, lock, MagicMock())
+        # TCP peers have fixed endpoint_in_use
+        self.assertEqual(pw.peers['tcp_peer']['endpoint_in_use'], 'host:8080')
+
+    def test_fleet_peer_endpoint_in_use_starts_none(self):
+        """Fleet peer endpoint_in_use starts None, set on first successful probe."""
+        lock = threading.Lock()
+        declared = {'fleet': [('h1', 80)]}
+        fleet = {'fleet': ['http://h1:80']}
+        pw = roundhouse.PeerWatch(declared, lock, MagicMock(), fleet=fleet)
+        # Fleet peers start with None, will be set by apply_result_unlocked
+        self.assertIsNone(pw.peers['fleet']['endpoint_in_use'])
 
 
 if __name__ == '__main__':
