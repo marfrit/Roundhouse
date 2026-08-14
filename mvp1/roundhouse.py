@@ -3030,9 +3030,7 @@ class RoundhouseRequestHandler(http.server.BaseHTTPRequestHandler):
         if not rollout:
             self.send_json_error(404, 'not_found', f'no rollout {rollout_id}')
             return
-        record = rollout_public_record(rollout)
-        record['host'] = os.uname()[1]
-        self.send_json(record)
+        self.send_json(rollout_public_record(rollout))   # carries `host` (K7)
 
     def serve_mem(self):
         """Serve /api/mem: measured peak rows (§6 schema) plus the current per-unit
@@ -3157,15 +3155,20 @@ class RoundhouseRequestHandler(http.server.BaseHTTPRequestHandler):
             with self.server.watcher_lock:
                 fed_rows = peer_watch.fed_rows_unlocked()
         else:
-            fed_rows = {}
+            fed_rows = FedRows()
 
         # Build fleet response: local units + federated units
         units = []
 
-        # Local units first (from snapshot)
+        # Local units first, through the SAME keep-list a peer's rows pass at
+        # ingestion (K6): the roster is one shape whatever the source, the payload
+        # stays bounded, and the snapshot's own `stale` (sources degraded — a
+        # different axis entirely) cannot be read as federation staleness.
         for row in snapshot.get('units', []):
-            row_with_source = {**row, 'source': snapshot['host'], 'stale': False}
-            units.append(row_with_source)
+            local_row = _fed_unit_row(row)
+            local_row['source'] = snapshot['host']
+            local_row['stale'] = False          # local units are never stale (K4/§6.1)
+            units.append(local_row)
 
         # Federated units (per peer, sorted by peer name)
         for peer_name in sorted(fed_rows.keys()):
@@ -3179,12 +3182,13 @@ class RoundhouseRequestHandler(http.server.BaseHTTPRequestHandler):
         if peer_watch:
             for peer_name in sorted(fed_rows.keys()):
                 fed = fed_rows[peer_name]
-                peer_state = peer_watch.peers.get(peer_name, {})
                 peers.append({
                     'name': peer_name,
                     'kind': 'roundhouse',
                     'url': peer_watch.fleet.get(peer_name, ''),
-                    'state': peer_state.get('state', 'unknown'),
+                    # Reachability rides in the fed row, captured under the same lock
+                    # hold — never a second, unlocked read of peer_watch.peers.
+                    'state': fed.get('peer_state', 'unknown'),
                     'mode': fed.get('mode'),
                     'fed_state': fed['state'],
                     'stale': (fed['state'] != 'fresh'),
@@ -3218,26 +3222,24 @@ class RoundhouseRequestHandler(http.server.BaseHTTPRequestHandler):
 
         # Build local entries
         entries = build_routing_entries(snapshot, advertise_host)
-        meta = routing_meta(snapshot, advertise_host, self.server.port, now_utc)
+        # §5.3: this document is NOT the local one, and says so. routing_meta() builds
+        # the local header (roundhouse@<host> plus a warm-hook that would lie for peer
+        # entries), so the fleet header is built here — the same string the .json twin
+        # reports, keyed on the same identity the contributor list uses.
+        meta = {'generated_by': f'roundhouse@{advertise_host} (fleet)',
+                'generated_at': now_utc.strftime('%Y-%m-%dT%H:%M:%SZ')}
 
-        # Get federated data under lock (short hold)
+        # Get federated data under lock (short hold; rows are copies carrying the
+        # peer's reachability, so the merge decides `up AND fresh` on its own — §5.2)
         peer_watch = getattr(self.server, 'peer_watch', None)
         if peer_watch:
             with self.server.watcher_lock:
                 fed_rows = peer_watch.fed_rows_unlocked()
-                # Capture reachability state for excluded entries
-                peer_states = {name: peer_watch.peers.get(name, {}).get('state', 'unknown')
-                              for name in fed_rows.keys()}
         else:
-            fed_rows = {}
-            peer_states = {}
+            fed_rows = FedRows()
 
-        # Build fleet merge
+        # Build fleet merge (outside the lock)
         merge = build_fleet_merge(entries, advertise_host, fed_rows)
-
-        # Fill in reachability state for excluded entries
-        for excl in merge.get('excluded', []):
-            excl['state'] = peer_states.get(excl['name'], 'unknown')
 
         # Emit YAML
         yaml_text = emit_fleet_yaml(meta, merge)
@@ -3255,31 +3257,25 @@ class RoundhouseRequestHandler(http.server.BaseHTTPRequestHandler):
 
         # Build local entries
         entries = build_routing_entries(snapshot, advertise_host)
-        meta = routing_meta(snapshot, advertise_host, self.server.port, now_utc)
 
-        # Get federated data under lock (short hold)
+        # Get federated data under lock (short hold; rows are copies carrying the
+        # peer's reachability, so the merge decides `up AND fresh` on its own — §5.2)
         peer_watch = getattr(self.server, 'peer_watch', None)
         if peer_watch:
             with self.server.watcher_lock:
                 fed_rows = peer_watch.fed_rows_unlocked()
-                # Capture reachability state for excluded entries
-                peer_states = {name: peer_watch.peers.get(name, {}).get('state', 'unknown')
-                              for name in fed_rows.keys()}
         else:
-            fed_rows = {}
-            peer_states = {}
+            fed_rows = FedRows()
 
-        # Build fleet merge
+        # Build fleet merge (outside the lock)
         merge = build_fleet_merge(entries, advertise_host, fed_rows)
 
-        # Fill in reachability state for excluded entries
-        for excl in merge.get('excluded', []):
-            excl['state'] = peer_states.get(excl['name'], 'unknown')
-
-        # Build JSON response
+        # Build JSON response. The stamp format is routing_meta's, to the second and
+        # ending in Z: isoformat() on an aware datetime already carries +00:00, and
+        # appending Z to that yields a stamp no parser accepts.
         response = {
             'generated_by': f"roundhouse@{advertise_host} (fleet)",
-            'generated_at': now_utc.isoformat() + 'Z',
+            'generated_at': now_utc.strftime('%Y-%m-%dT%H:%M:%SZ'),
             'contributors': merge.get('contributors', []),
             'excluded': merge.get('excluded', []),
             'conflicts': merge.get('conflicts', []),
@@ -3388,7 +3384,7 @@ class RoundhouseRequestHandler(http.server.BaseHTTPRequestHandler):
                 self.send_header('Content-Type', 'application/json; charset=utf-8')
                 self.end_headers()
                 self.wfile.write(json.dumps({
-                    'host': snap['host'],
+                    'host': os.uname()[1],
                     'status': 'already_warm',
                     'unit': target,
                     'rung': rung
@@ -3417,7 +3413,7 @@ class RoundhouseRequestHandler(http.server.BaseHTTPRequestHandler):
                 pending_unit = engine.pending_warm.get('unit')
                 if pending_unit == target:
                     queue_response = (200, {
-                        'host': snap['host'],
+                        'host': os.uname()[1],
                         'status': 'already_queued',
                         'unit': target,
                         'pending': dict(engine.pending_warm)
@@ -3437,7 +3433,7 @@ class RoundhouseRequestHandler(http.server.BaseHTTPRequestHandler):
                     'requester': requester,
                     'requested_at': time.time()
                 }
-                queue_response = (202, {'host': snap['host'], 'queued': True, 'unit': target})
+                queue_response = (202, {'host': os.uname()[1], 'queued': True, 'unit': target})
         if queue_response is not None:
             status, body = queue_response
             self.send_response(status)
@@ -3506,7 +3502,7 @@ class RoundhouseRequestHandler(http.server.BaseHTTPRequestHandler):
             self.send_header('Content-Type', 'application/json; charset=utf-8')
             self.end_headers()
             response = {
-                'host': snap['host'],
+                'host': os.uname()[1],
                 'rollout_id': result.get('rollout_id'),
                 'stops': plan['stops']
             }
@@ -3524,7 +3520,7 @@ class RoundhouseRequestHandler(http.server.BaseHTTPRequestHandler):
                     if engine.pending_warm is not None:
                         pending = dict(engine.pending_warm)
                         if pending.get('unit') == target:
-                            reentry = (200, {'host': snap['host'], 'status': 'already_queued',
+                            reentry = (200, {'host': os.uname()[1], 'status': 'already_queued',
                                              'unit': target, 'pending': pending})
                         else:
                             reentry = (409, {'error': 'warm_queue_full',
@@ -3538,7 +3534,7 @@ class RoundhouseRequestHandler(http.server.BaseHTTPRequestHandler):
                             'requester': requester,
                             'requested_at': time.time()
                         }
-                        reentry = (202, {'host': snap['host'], 'queued': True, 'unit': target})
+                        reentry = (202, {'host': os.uname()[1], 'queued': True, 'unit': target})
                 status, body = reentry
                 self.send_response(status)
                 self.send_header('Content-Type', 'application/json; charset=utf-8')
@@ -4123,8 +4119,18 @@ def validate_peer_entry(entry) -> bool:
 
 
 def _fed_unit_row(unit_dict: dict) -> dict:
-    """Keep-list a fetched unit row per FLEET_UNIT_KEEP (K6)."""
-    return {k: unit_dict[k] for k in FLEET_UNIT_KEEP if k in unit_dict}
+    """Keep-list a unit row per FLEET_UNIT_KEEP (K6) — I5's list verbatim.
+
+    `port_conflict` is kept only when non-null, exactly as the MCP shaper does it: a
+    null there is noise on every row that has no conflict. Applied to a PEER's rows at
+    ingestion (so a peer cannot inject keys into our roster and memory stays bounded)
+    and to the LOCAL rows at serve time (so the roster is one shape whatever the source).
+    """
+    row = {k: unit_dict[k] for k in FLEET_UNIT_KEEP
+           if k in unit_dict and k != 'port_conflict'}
+    if unit_dict.get('port_conflict'):
+        row['port_conflict'] = unit_dict['port_conflict']
+    return row
 
 
 class FedRows:
@@ -4242,22 +4248,33 @@ class PeerWatch:
                     peer['state'] = 'down'
                     peer['since'] = ts
 
-                    # If fleet peer, mark fed data stale on up→down
+                    # §4.2 last rows: an up→down transition makes fed data stale and
+                    # writes the `down:` reason. The reason is written even when the
+                    # row is already stale from this round's failed fetch — absence is
+                    # the operator-visible fact, and it outranks the transport error
+                    # that reported it first (the drill greps for the `down:` prefix).
+                    fed_prev = None
                     if name in self.fleet and name in self.fed:
                         fed = self.fed[name]
-                        if fed['state'] != 'stale':
+                        fed_prev = fed['state']
+                        if fed['state'] == 'fresh':
                             fed['state'] = 'stale'
-                            fed['reason'] = f'down: peer unreachable (tcp probe failed)'
+                        fed['reason'] = 'down: peer unreachable (tcp probe failed)'
 
-                    return self._event_payload(name, old_state)
+                    return self._event_payload(name, old_state, fed_prev=fed_prev)
             elif old_state == 'down':
                 # down + any failure → down, no event
                 return None
 
         return None
 
-    def _event_payload(self, name: str, prev_state: str) -> dict:
-        """Build SSE peer event payload per §5.3."""
+    def _event_payload(self, name: str, prev_state: str, fed_prev=None) -> dict:
+        """Build SSE peer event payload per §5.3.
+
+        fed_prev: the fed state BEFORE this event (§4.2). Reachability transitions
+        that do not touch fed state pass None and report the current value, so the
+        payload shape is uniform per kind.
+        """
         peer = self.peers[name]
         host, port = self.declared[name]
         payload = {
@@ -4283,7 +4300,7 @@ class PeerWatch:
                 'fetched_at': fed['fetched_at'],
                 'unit_count': len(fed['units'])
             }
-            payload['fed_prev'] = fed['state']
+            payload['fed_prev'] = fed['state'] if fed_prev is None else fed_prev
 
         return payload
 
@@ -4405,14 +4422,16 @@ class PeerWatch:
         return None
 
     def _apply_fetch_failure(self, name: str, reason: str, old_state: str, ts: float) -> Optional[dict]:
-        """Helper to apply a fetch failure."""
+        """Helper to apply a fetch failure (§4.2 — same table as a transport failure)."""
         fed = self.fed[name]
+        prev_reason = fed['reason']
         fed['reason'] = reason
         fed['attempted_at'] = ts
 
         if old_state == 'never':
-            # Emit only on first time seeing an error
-            return self._fed_event_payload(name, old_state)
+            # §4.2: emit only when the reason was None — the operator must see the
+            # first failure, and nothing further while it flat-lines.
+            return self._fed_event_payload(name, old_state) if prev_reason is None else None
         elif old_state == 'fresh':
             fed['state'] = 'stale'
             return self._fed_event_payload(name, old_state)
@@ -4446,10 +4465,21 @@ class PeerWatch:
         }
 
     def fed_rows_unlocked(self) -> FedRows:
-        """Return fed rows for fed peers. CALLER HOLDS self.lock."""
+        """Return fed rows for fleet peers. CALLER HOLDS self.lock.
+
+        Rows are COPIES, and they carry the peer's reachability `peer_state`:
+        both fleet handlers serialize after dropping the lock (§6.1), so a live
+        reference would let the next peer round tear the response mid-write, and
+        the merge needs reachability (§5.2) without a second unlocked read.
+        """
         rows = {}
         for name in sorted(self.fleet.keys()):
-            rows[name] = self.fed[name]
+            fed = self.fed[name]
+            row = dict(fed)
+            row['units'] = [dict(u) for u in fed['units']]
+            row['entries'] = list(fed['entries'])
+            row['peer_state'] = self.peers[name]['state']
+            rows[name] = row
         return FedRows(rows)
 
 
@@ -4556,11 +4586,17 @@ def rollout_public_record(rollout: dict) -> dict:
 
     One implementation for both consumers (snapshot merge and GET /api/rollouts/<id>) so
     they cannot drift; `old_raw` (the in-memory pre-edit bytes) is never serialized.
+
+    K7: `host` is injected HERE, at serialization, from os.uname()[1] — so every
+    consumer of a record (the route, the snapshot, the SSE stream) learns which host
+    actuated, and records already in memory need no migration. In a fleet where both
+    hosts run qwen3.6-coding.service, "which host" is the whole question.
     """
     kind = rollout.get('kind', 'rollout')
 
     # Common fields for both kinds
     common = {
+        'host': os.uname()[1],
         'rollout_id': rollout['rollout_id'],
         'kind': kind,
         'unit': rollout['unit'],
@@ -6121,6 +6157,14 @@ class RolloutEngine:
             if not unit:
                 raise ActuationError(f"unit {target} not found")
 
+            # K7 layer 2: every stop must be a LOCAL unit too. The route checks each
+            # stop before it gets here, but the hazard rule is asserted at three
+            # layers, not one — and a stop that only fails at run_actuate would fail
+            # mid-operation, with the slot claimed and earlier stops already actuated.
+            for stop_name in stops:
+                if stop_name not in self.units:
+                    raise ActuationError(f"unit {stop_name} not found")
+
             # Create switch record
             self.counter += 1
             switch_id = f"sw-{int(time.time())}-{self.counter}"
@@ -7378,6 +7422,28 @@ def _yaml_scalar(value):
     return _yaml_str(str(value))
 
 
+def _comment_text(value) -> str:
+    """Render an untrusted string safe for a YAML comment line (H2 boundary).
+
+    Control characters — a newline above all — would end the comment and let a peer
+    write into our document. They become '?'; the result is bounded at 120 chars.
+    """
+    text = value if isinstance(value, str) else str(value)
+    cleaned = ''.join(c if (0x20 <= ord(c) < 0x7f) or ord(c) > 0x9f else '?'
+                      for c in text)
+    return cleaned if len(cleaned) <= 120 else cleaned[:117] + '...'
+
+
+def _copy_entry(entry: Dict) -> Dict:
+    """A full copy of a routing entry (§5.2: the merge holds copies, not the rows).
+
+    validate_peer_entry guarantees depth <= 2 with scalar leaves, so one level of
+    dict copying IS the deep copy — no import, no recursion, and a consumer that
+    edits the merged document can never reach PeerWatch state through it.
+    """
+    return {k: (dict(v) if isinstance(v, dict) else v) for k, v in entry.items()}
+
+
 def build_fleet_merge(local_entries: List[Dict], local_host: str, fed_rows: FedRows) -> Dict:
     """Build the fleet merge per §5.2, K5.
 
@@ -7403,17 +7469,20 @@ def build_fleet_merge(local_entries: List[Dict], local_host: str, fed_rows: FedR
             })
         else:
             seen_model_names[model_name] = (local_host, len(merged_entries))
-            merged_entries.append(entry)
+            merged_entries.append(_copy_entry(entry))
 
     # Add peer entries
     for peer_name in sorted(fed_rows.keys()):
         fed = fed_rows[peer_name]
 
-        # Skip peers that are not up and fresh
-        if fed['state'] != 'fresh':
+        # §5.2: a peer contributes iff reachability is `up` AND fed state is `fresh`.
+        # Both axes, independently (§4.3) — a router must never be handed a backend
+        # on an absent host, and freshness alone does not prove presence.
+        peer_state = fed.get('peer_state', 'unknown')
+        if fed['state'] != 'fresh' or peer_state != 'up':
             excluded.append({
                 'name': peer_name,
-                'state': 'unknown',  # Will be filled by the caller with reachability state
+                'state': peer_state,
                 'fed_state': fed['state'],
                 'reason': fed.get('reason')
             })
@@ -7432,7 +7501,7 @@ def build_fleet_merge(local_entries: List[Dict], local_host: str, fed_rows: FedR
                 })
             else:
                 seen_model_names[model_name] = (peer_name, len(merged_entries))
-                merged_entries.append(entry)
+                merged_entries.append(_copy_entry(entry))
 
         # Add peer to contributors
         fetched_at = fed.get('fetched_at')
@@ -7447,47 +7516,49 @@ def build_fleet_merge(local_entries: List[Dict], local_host: str, fed_rows: FedR
     }
 
 
-def _emit_entry(entry: Dict) -> List[str]:
-    """Emit a single routing entry as YAML lines per §5.3.
+ENTRY_KEY_RE = re.compile(r'[A-Za-z0-9_]+')
 
-    Walk order: model_name, litellm_params, model_info, then remaining keys sorted.
+
+def _emit_entry(entry: Dict) -> List[str]:
+    """Emit a single routing entry as YAML lines per §5.3 — the GENERALIZED walker.
+
+    Walk order: model_name, litellm_params, model_info, then remaining top-level
+    keys sorted (version-skew tolerance); sub-dicts walk in insertion order.
+
+    K5's "verbatim" is what makes this function exist: the local emitter
+    (emit_routing_yaml) walks FIXED key lists, so a peer entry carrying a key this
+    version does not know — a newer model_info field, an extra litellm_param —
+    would be silently dropped, i.e. this host would rewrite another host's truth.
+    Nothing here is filtered; every key is rendered, every value goes through
+    _yaml_scalar (the injection boundary — peer strings are untrusted input to OUR
+    document), and every key must match ENTRY_KEY_RE or the entry was invalid at
+    ingestion (§5.1 guarantees depth ≤ 2 and scalar leaves).
     """
     lines = []
+
+    def emit_key(indent: str, key, value):
+        assert isinstance(key, str) and ENTRY_KEY_RE.fullmatch(key), \
+            f"Invalid key in entry: {key!r}"
+        lines.append(f'{indent}{key}: {_yaml_scalar(value)}')
+
+    head = [k for k in ('litellm_params', 'model_info') if k in entry]
+    rest = sorted(k for k in entry
+                  if k not in ('model_name', 'litellm_params', 'model_info'))
 
     # model_name (always first)
     if 'model_name' in entry:
         lines.append('  - model_name: ' + _yaml_scalar(entry['model_name']))
 
-    # litellm_params dict
-    if 'litellm_params' in entry:
-        lp = entry['litellm_params']
-        lines.append('    litellm_params:')
-        for key in ['model', 'api_base', 'api_key']:
-            if key in lp:
-                # Validate key matches safe pattern
-                if not re.match(r'[A-Za-z0-9_]+', key):
-                    assert False, f"Invalid key in entry: {key}"
-                lines.append(f'      {key}: {_yaml_scalar(lp[key])}')
-
-    # model_info dict
-    if 'model_info' in entry:
-        mi = entry['model_info']
-        lines.append('    model_info:')
-        for key in ['unit', 'logical', 'host', 'rung', 'on_demand',
-                   'load_strategy', 'peak_bytes', 'peak_source', 'load_seconds']:
-            if key in mi:
-                lines.append(f'      {key}: {_yaml_scalar(mi[key])}')
-
-    # Remaining top-level keys (sorted) — version skew tolerance
-    for key in sorted(entry.keys()):
-        if key not in ('model_name', 'litellm_params', 'model_info'):
-            if not re.match(r'[A-Za-z0-9_]+', key):
-                assert False, f"Invalid key in entry: {key}"
-            value = entry[key]
-            if isinstance(value, dict):
-                # Skip nested dicts (already handled above or skipped)
-                continue
-            lines.append(f'    {key}: {_yaml_scalar(value)}')
+    for key in head + rest:
+        value = entry[key]
+        if isinstance(value, dict):
+            assert isinstance(key, str) and ENTRY_KEY_RE.fullmatch(key), \
+                f"Invalid key in entry: {key!r}"
+            lines.append(f'    {key}:')
+            for sub_key, sub_value in value.items():      # insertion order (§5.3)
+                emit_key('      ', sub_key, sub_value)
+        else:
+            emit_key('    ', key, value)
 
     return lines
 
@@ -7535,7 +7606,11 @@ def emit_fleet_yaml(meta: Dict, merge: Dict) -> str:
 
     # Conflict comments
     for conflict in merge.get('conflicts', []):
-        model_name = conflict['model_name']
+        # The ONE place a peer-authored string reaches a comment line (§5.3's frozen
+        # spelling names the model). Comments are not quoted, so H2's boundary is
+        # enforced here instead: a newline in a peer's model_name would otherwise
+        # close the comment and inject a second document.
+        model_name = _comment_text(conflict['model_name'])
         kept = conflict['kept_source']
         dropped = conflict['dropped_source']
         lines.append(f"# conflict: model_name '{model_name}' also advertised by {dropped} — {dropped}'s entry dropped, {kept}'s kept")

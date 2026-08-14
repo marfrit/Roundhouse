@@ -174,7 +174,7 @@ runtime re-resolution vetting.
 | snapshot | a `peers` key carrying the same rows, field for field (it is the same function) |
 | SSE | a `peer` event **on transition only**, carrying the row plus `prev_state`. A host that is simply absent generates no traffic. Clients need no replay: every `snapshot` event already carries current `peers` |
 | UI | a compact, non-interactive strip labelled `peers (reachable)`, one `name · state` cell per peer, rendered in neutral colours — no red, no amber; these are other people's hosts and down is information, not an alarm |
-| MCP | read tool `peer_status` (#17 of 17), a passthrough of `/api/peers`. Peers are never MCP action targets |
+| MCP | read tool `peer_status` (#17 of 18), a passthrough of `/api/peers`. Peers are never MCP action targets |
 
 A row:
 
@@ -214,3 +214,156 @@ reachable, one not), a kill and a restore, with the exact round at which each
 transition is allowed to happen asserted rather than eyeballed. It also covers the D2
 refusal, the legitimate same-port peer, the bind-failure refusal, and the multi-listener
 shared-slot 409. `--live` prints the operator checklist for the boltzmann run.
+
+---
+
+## Federation: `--fleet-peer`
+
+A `--peer` watches whether something is listening; a `--fleet-peer` watches a
+**Roundhouse instance** and, once it answers, asks it what it is running.
+`--fleet-peer NAME=URL` is not a variant of `--peer` — it is reachability-watched
+exactly like a TCP peer (same hysteresis, same `up`/`down` transitions, same SSE
+events) and, in addition, is periodically fetched over HTTP(S) for its own
+roster and its own routing fragment. `--peer` still never knocks on an inference
+port; `--fleet-peer` is the one declaration that is allowed to, because the peer
+named there is Roundhouse itself.
+
+### Declaring a fleet peer
+
+**Syntax:** `--fleet-peer NAME=URL`, repeatable.
+
+- **NAME:** the same `^[A-Za-z0-9][A-Za-z0-9._-]{0,31}$` rule as `--peer`, and
+  the **same namespace** — a name cannot be declared with both flags in the same
+  invocation. Roundhouse refuses at startup:
+  ```
+  'ampere' is declared as both --peer and --fleet-peer — one watch row per name;
+  a fleet peer is reachability-watched already
+  ```
+  A fleet peer needs no separate `--peer` entry; declaring it once is enough to
+  be both reachability-watched and fetched.
+- **URL:** scheme `http` or `https`, a host (DNS name or IP literal, IPv6
+  bracketed), and an optional port (default 80 for `http`, 443 for `https`). A
+  path, query, fragment, or embedded credentials are refused — a fleet peer is
+  an instance root, not an endpoint:
+  ```
+  malformed --fleet-peer 'ampere=https://ampere.fritz.box:8099/api/units': URL
+  must not carry a path, query, fragment, or credentials — declare the instance
+  root (scheme://host[:port])
+  ```
+- **Caps:** at most 4 fleet peers (`too many fleet peers (5 > 4): two fetches per
+  peer per round must finish well inside the 60 s cadence`), inside a combined
+  total of 8 peers shared with `--peer` (`too many peers (9 > 8): 6 TCP + 3
+  fleet; combined probe round must finish well inside 60 s cadence`) — both caps
+  exist because every fleet peer costs two fetches per round on top of its probe.
+  As with `--peer`, every malformed declaration is listed before the single exit;
+  nothing is applied partially.
+- The D2 rule (above) applies identically to a fleet peer's derived host:port —
+  a fleet peer cannot target this instance's own bind address or its own API
+  port.
+
+Packaged-unit example — this replaces the reachability-only `--peer
+ampere=ampere.fritz.box:8099` line shown earlier, once ampere is confirmed to be
+a Roundhouse instance rather than just something worth watching:
+
+```ini
+ExecStart=/usr/bin/python3 /home/roundhouse/roundhouse/mvp1/roundhouse.py --serve \
+    --bind 127.0.0.1 --port 8090 \
+    --peer dirac=dirac.fritz.box:22 \
+    --fleet-peer ampere=https://ampere.fritz.box:8099
+```
+
+### What is fetched, and when
+
+On the existing peer round (`--peer-interval`, default 60 s), for each fleet
+peer that is currently `up`, Roundhouse fetches exactly two documents and
+nothing else:
+
+- `GET <url>/api/units`
+- `GET <url>/api/routing-config.json` — only if the first request succeeded
+
+Both requests happen **sequentially**, on the peer-watch thread, **outside every
+lock** — the same discipline the reachability probe already follows. Each
+request is bounded by a 4-second timeout, and the response read is capped at
+4 MiB; going over the cap is a fetch failure (`body: oversized (> 4194304
+bytes)`), not an unbounded read. Redirects are never followed: a `3xx` response
+is recorded as data, not chased — `http: 301`. A peer that hangs or is absent
+costs only its own timeout; the 3-second local tick, the HTTP API, and the
+operation slot run on other threads and are unaffected.
+
+Nothing else is ever fetched — no detail routes, no operations endpoints, no
+MCP-to-MCP calls. A failed fetch never changes the peer's reachability state and
+never raises into the local loop; it is recorded as federated staleness, below.
+
+### The trust requirement
+
+`https://` fleet peers are verified with `ssl.create_default_context()` against
+the **system trust store** — the same store a fleet CA package installs its
+certificate into. There is **no flag anywhere to disable verification**, no
+environment override, and no way to hand `_fetch_peer` an alternate context; the
+construction lives in exactly one function in the whole codebase. A federation
+that silently accepted any certificate would be worse than no federation at all.
+
+One consequence follows directly from how reachability is measured: the
+`up`/`down` probe is a bare TCP connect (above) that never touches TLS. A peer
+with an untrusted certificate is therefore **`up`** — something answered the
+port — while its federated data never becomes `fresh`, carrying a `tls:`
+reason. That combination is expected behavior, not a bug: reachability and
+trustworthiness are different questions, and Roundhouse answers them
+separately.
+
+### Federated state: `never` / `fresh` / `stale`
+
+Each fleet peer's federated data is one of three states:
+
+| state | meaning |
+|---|---|
+| `never` | no fetch has ever succeeded for this peer (a failed attempt may still set `reason`) |
+| `fresh` | the most recent fetch succeeded for **both** `/api/units` and `/api/routing-config.json`, in the same round |
+| `stale` | the peer had fresh data at some point, and either the last fetch failed or the peer's reachability left `up` |
+
+Failure is always classified into one of six frozen reason prefixes:
+
+| prefix | failure class |
+|---|---|
+| `tls:` | any `ssl.SSLError`, including certificate verification failure |
+| `http:` | a non-200 response, including an unfollowed `3xx` |
+| `timeout:` | the fetch did not complete within the timeout |
+| `connect:` | DNS failure, connection refused, or an unreachable host |
+| `body:` | an oversized response, a non-JSON body, or the wrong document shape |
+| `down:` | the peer's own reachability probe failed (written at the `up`→`down` transition) |
+
+Three surfaces show this state, at increasing detail: `GET /api/peers` rows
+carry a `kind` (`tcp` or `roundhouse`) and, for fleet peers, a `fed` summary
+(`state`, `stale`, `reason`, `fetched_at`, `unit_count`); `GET /api/fleet`
+carries the full per-peer block (state, mode, both timestamps, unit count, and
+invalid-entry count); and the UI peer strip renders `name · state · N units`,
+with a trailing ` · stale` marker whenever the fed state is not `fresh`.
+
+### Retention
+
+The roster (`GET /api/fleet`) keeps a peer's last-known units and marks them
+`stale: true` once the fed state stops being `fresh` — an operator can still see
+what a now-absent peer was last running. The fleet routing fragment
+(`GET /api/routing-config/fleet`) does not retain anything: a peer contributes
+to it only while it is both `up` and `fresh`, so a peer that goes stale or down
+disappears from the fragment entirely. See `docs/ROUTING.md` for the consumer
+side of that distinction.
+
+### Why `/api/routing-config` did not change
+
+`/api/routing-config` and `/api/routing-config.json` remain local-only and
+byte-identical to their pre-federation behavior — pinned by a test. hossenfelder
+already pulls this route live; silently widening it to include peer data would
+change a running consumer's behavior without asking. The fleet-wide merge lives
+at its own URL instead: `GET /api/routing-config/fleet` (YAML) and
+`GET /api/routing-config/fleet.json` (JSON) — see `docs/ROUTING.md`.
+
+### Drill
+
+`mvp1/scripts/fleet-drill.sh` is the federation counterpart to
+`peer-drill.sh`: two Roundhouse instances, one declaring the other as a
+`--fleet-peer`, proving roster aggregation, fragment merge, the conflict case,
+a killed peer leaving the fragment and going stale in the roster, and a TLS leg
+against a self-signed certificate (gated on `openssl` being available) that
+proves the untrusted-cert row above end to end — `up`, `never`/`stale`, `tls:`
+reason, excluded from the fragment.

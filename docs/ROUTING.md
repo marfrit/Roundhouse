@@ -348,6 +348,114 @@ This affects the `warm-hook` header and `litellm_params.api_base` URLs only; `mo
 - **Check pending warm:** `curl http://boltzmann.fritz.box:8090/api/warm`
 - **Monitor warm execution:** Watch the UI stepper (`/api/events` SSE) or poll the rollout (`GET /api/rollouts/{id}`)
 
+## 8. The Fleet Fragment: `/api/routing-config/fleet`
+
+Two more unauthenticated, live-read endpoints exist alongside the ones above,
+merging in every fleet peer's own routing fragment:
+
+- **`/api/routing-config/fleet`** (text/yaml) — the local fragment plus each
+  `up`-and-`fresh` fleet peer's fragment, concatenated.
+- **`/api/routing-config/fleet.json`** (application/json) — the JSON twin.
+
+The consumer-side pattern is the one Section 2 already describes: pull, merge
+into your served config, reload. The only change is that a single URL now
+covers the whole declared fleet instead of one host:
+
+```bash
+curl -fsS http://boltzmann.fritz.box:8090/api/routing-config/fleet.json \
+  -o /etc/litellm/fragments/fleet.json
+```
+
+Pulling this one document from boltzmann is equivalent to pulling
+`/api/routing-config` from boltzmann *and* from every fleet peer boltzmann has
+declared and merging them yourself — Roundhouse has already done the merge.
+`/api/routing-config` and `/api/routing-config.json` (Section 1) are
+unaffected by any of this: they stay local-only, exactly as before.
+
+### Header comments (YAML)
+
+`/api/routing-config/fleet`'s header carries more than the local route's three
+lines, in a frozen order:
+
+```yaml
+# generated-by: roundhouse@boltzmann (fleet)
+# generated-at: 2026-08-14T12:00:00Z
+# contributor: boltzmann (local)
+# contributor: ampere (fetched 2026-08-14T11:59:30Z)
+# excluded: cern (down, stale: connect)
+# conflict: model_name 'boltzmann-qwen3.6-coding' also advertised by ampere — ampere's entry dropped, boltzmann's kept
+model_list:
+  - model_name: ...
+```
+
+One `# contributor:` line per host that actually contributed (local first,
+then fleet peers by name, each carrying the timestamp it was fetched at); one
+`# excluded:` line per declared fleet peer that did **not** contribute, in the
+form `(<reachability>, <fed state>: <reason class>)`; one `# conflict:` line
+per dropped `model_name` collision. There is no `# warm-hook:` line — see
+below.
+
+The `.json` twin carries the same information as fields instead of comments:
+`contributors`, `excluded`, `conflicts`, and `model_list` — and, like the YAML
+document, **no `warm_hook` key**. Both documents say what they are in the same
+words: `generated_by` / `# generated-by:` reads `roundhouse@<host> (fleet)`,
+where the local route reads `roundhouse@<host>`. A fragment saved to disk is
+therefore self-describing — a consumer can tell a fleet document from a local
+one without remembering which URL it came from.
+
+### Merge semantics
+
+Entries are concatenated **verbatim**: no re-namespacing, no `api_base`
+rewriting, no recomputed fields. Each host authors its own entries — the exact
+dicts Section 1's namespacing rule already describes — and the aggregator only
+concatenates them: local entries first, then fleet peers sorted by name, each
+peer's own entries sorted by `model_name`. Roundhouse does not touch another
+host's `litellm_params` or `model_info`, whether that host is the one serving
+the fragment or a peer folded into it.
+
+A `model_name` collision is **first-wins**: the first occurrence in merge
+order (local, then peers by declaration name) is kept, and every later
+occurrence of the same `model_name` is dropped — never a silent overwrite.
+The drop is surfaced in both documents: a `# conflict:` comment in the YAML,
+and an entry in the JSON twin's `conflicts` list (`{"model_name": ...,
+"kept_source": ..., "dropped_source": ...}`).
+
+Because `model_name` is `{host}-{logical_alias}` (Section 1), two hosts
+serving the same logical alias normally produce two distinct entries —
+`boltzmann-qwen3.6-coding` and `ampere-qwen3.6-coding` do not collide. The
+conflict path exists for when the effective `model_name` matches anyway —
+most commonly two hosts (or two test instances) that report the same
+underlying hostname, or a misconfigured `--advertise-host`. That is exactly
+why entries carry the host prefix in the first place: the namespace is what
+keeps a shared alias from colliding, and the conflict path is the safety net
+for the case where it doesn't.
+
+### An absent host's entries vanish — by design
+
+A fleet peer contributes to `/api/routing-config/fleet` only while its
+reachability is `up` **and** its federated state is `fresh`. The moment either
+condition fails — the peer goes down, or a fetch starts failing — its entries
+leave the fragment on the very next read. There is no grace period and no
+cached fallback here: a router must never be handed a backend on a host that
+is not there.
+
+This is a deliberate contrast with the roster at `GET /api/fleet`, which does
+the opposite on purpose: it keeps a stale peer's last-known units, marked
+`stale: true`, so an operator can see what was last running. The roster is
+for looking at; the routing fragment is for handing to something that will
+try to connect to what it lists. See `docs/PEERS.md` for the fed-state
+machine (`never`/`fresh`/`stale`) behind this distinction.
+
+### Per-host warm hooks
+
+The fleet fragment carries no `# warm-hook:` line and no `warm_hook` JSON
+key — a single hook URL would be wrong for every entry except the ones the
+local host authored. A consumer that needs to warm a peer's model gets that
+peer's warm hook the same way it gets boltzmann's: by pulling that peer's own
+`/api/routing-config` (Section 4) directly. The fleet fragment tells you what
+exists and where; it does not collapse every host's warm-up contract into
+one.
+
 ---
 
 **Last Updated:** 2026-08-13 (MVP5 Specification)

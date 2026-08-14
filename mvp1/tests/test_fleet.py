@@ -12,6 +12,7 @@ import time
 import json
 import ssl
 import socket
+import threading
 from pathlib import Path
 from unittest.mock import MagicMock, patch, Mock
 from io import BytesIO
@@ -502,6 +503,7 @@ class TestBuildFleetMerge(unittest.TestCase):
 
         peer_fed = {
             'state': 'fresh',
+            'peer_state': 'up',           # §5.2: contributes iff up AND fresh
             'entries': [{'model_name': 'peer-b', 'litellm_params': {'model': 'b'}}],
             'fetched_at': time.time()
         }
@@ -519,6 +521,7 @@ class TestBuildFleetMerge(unittest.TestCase):
 
         peer_fed = {
             'state': 'fresh',
+            'peer_state': 'up',           # §5.2: contributes iff up AND fresh
             'entries': [{'model_name': 'both-model', 'litellm_params': {'model': 'v2'}}],
             'fetched_at': time.time()
         }
@@ -540,6 +543,7 @@ class TestBuildFleetMerge(unittest.TestCase):
 
         peer_fed = {
             'state': 'stale',
+            'peer_state': 'down',
             'entries': [{'model_name': 'peer-b', 'litellm_params': {'model': 'b'}}],
             'reason': 'connect: refused'
         }
@@ -672,6 +676,225 @@ class TestEmitFleetYaml(unittest.TestCase):
 
         self.assertIn('conflict:', yaml)
         self.assertIn('both', yaml)
+
+
+# ===== MVP8 integration — audit legs against §4.2 / §5.2 / §5.3 (K4, K5) =====
+
+
+def _fed(state='fresh', peer_state='up', entries=None, units=None, **kw):
+    """A fed row shaped as fed_rows_unlocked() emits it (§4.1 + reachability, §5.2)."""
+    row = {'state': state, 'peer_state': peer_state, 'mode': 'read-only',
+           'units': list(units or []), 'entries': list(entries or []),
+           'invalid_entries': 0, 'fetched_at': 1_755_159_990.0,
+           'attempted_at': 1_755_159_990.0, 'reason': None}
+    row.update(kw)
+    return row
+
+
+class TestMergeVerbatim(unittest.TestCase):
+    """§5.2/K5: a peer's entry is concatenated verbatim — no key of it may vanish.
+
+    Recon 6 is the whole reason the fleet emitter exists: the local emitter walks
+    fixed key lists, so an entry carrying a key this host's version does not know
+    would be silently dropped. Verbatim is the contract's word.
+    """
+
+    UNUSUAL = {
+        'model_name': 'ampere-qwen3.6-coding',
+        'litellm_params': {'model': 'openai/qwen3.6-coding',
+                           'api_base': 'http://ampere.fritz.box:8085/v1',
+                           'api_key': 'none',
+                           'rpm': 240},                     # unknown to this version
+        'model_info': {'unit': 'qwen3.6-coding.service', 'rung': 'READY',
+                       'accelerator': 'npu'},               # unknown to this version
+        'tags': {'tier': 'coder'},                          # unknown top-level dict
+        'weight': 3,                                        # unknown top-level scalar
+    }
+
+    def test_unknown_nested_keys_survive_the_emitter(self):
+        yaml = roundhouse.emit_fleet_yaml(
+            {'generated_by': 'roundhouse@host (fleet)', 'generated_at': 'T'},
+            {'model_list': [self.UNUSUAL],
+             'contributors': [{'name': 'host', 'source': 'local'}],
+             'excluded': [], 'conflicts': []})
+        self.assertIn('rpm: 240', yaml)
+        self.assertIn('accelerator: npu', yaml)
+        self.assertIn('weight: 3', yaml)
+
+    def test_unknown_top_level_dict_survives_the_emitter(self):
+        yaml = roundhouse.emit_fleet_yaml(
+            {'generated_by': 'roundhouse@host (fleet)', 'generated_at': 'T'},
+            {'model_list': [self.UNUSUAL],
+             'contributors': [{'name': 'host', 'source': 'local'}],
+             'excluded': [], 'conflicts': []})
+        self.assertIn('tags:', yaml)
+        self.assertIn('tier: coder', yaml)
+
+    def test_merged_entries_are_copies_of_the_watch_state(self):
+        """§5.2: the merged list holds COPIES. The rows come from PeerWatch under the
+        lock; a consumer that touched one in place would be editing watch state from
+        an HTTP thread."""
+        entry = {'model_name': 'ampere-x', 'litellm_params': {'model': 'openai/x'}}
+        merge = roundhouse.build_fleet_merge(
+            [], 'boltzmann', roundhouse.FedRows({'ampere': _fed(entries=[entry])}))
+        merge['model_list'][0]['litellm_params']['model'] = 'openai/tampered'
+        merge['model_list'][0]['injected'] = True
+        self.assertEqual(entry['litellm_params']['model'], 'openai/x')
+        self.assertNotIn('injected', entry)
+
+    def test_merge_does_not_touch_the_peer_entry_object(self):
+        """No re-namespacing, no api_base rewriting (Risk 3)."""
+        entry = dict(self.UNUSUAL)
+        before = json.dumps(entry, sort_keys=True)
+        merge = roundhouse.build_fleet_merge(
+            [], 'boltzmann', roundhouse.FedRows({'ampere': _fed(entries=[entry])}))
+        self.assertEqual(json.dumps(entry, sort_keys=True), before)
+        self.assertEqual(json.dumps(merge['model_list'][0], sort_keys=True), before)
+
+
+class TestFleetYamlIsNotInjectable(unittest.TestCase):
+    """H2 holds at the fleet boundary: a peer-authored model_name reaches a COMMENT
+    line in the conflict header (§5.3's frozen spelling). Peer data is untrusted."""
+
+    def test_conflict_comment_cannot_break_out_of_the_comment(self):
+        hostile = "evil\nmodel_list:\n  - model_name: pwned"
+        yaml = roundhouse.emit_fleet_yaml(
+            {'generated_by': 'roundhouse@host (fleet)', 'generated_at': 'T'},
+            {'model_list': [], 'contributors': [{'name': 'host', 'source': 'local'}],
+             'excluded': [],
+             'conflicts': [{'model_name': hostile, 'kept_source': 'host',
+                            'dropped_source': 'ampere'}]})
+        lines = yaml.split('\n')
+        self.assertEqual(sum(1 for ln in lines if ln.startswith('model_list:')), 1,
+                         f'a second model_list key was injected:\n{yaml}')
+        for ln in lines[:lines.index('model_list:')]:
+            self.assertTrue(ln.startswith('#'),
+                            f'non-comment line above model_list: {ln!r}\n{yaml}')
+
+    def test_conflict_comment_still_names_the_model(self):
+        yaml = roundhouse.emit_fleet_yaml(
+            {'generated_by': 'roundhouse@host (fleet)', 'generated_at': 'T'},
+            {'model_list': [], 'contributors': [{'name': 'host', 'source': 'local'}],
+             'excluded': [],
+             'conflicts': [{'model_name': 'boltzmann-qwen3.6-coding',
+                            'kept_source': 'boltzmann', 'dropped_source': 'ampere'}]})
+        self.assertIn("# conflict: model_name 'boltzmann-qwen3.6-coding' also advertised "
+                      "by ampere — ampere's entry dropped, boltzmann's kept", yaml)
+
+
+class TestMergeRespectsReachability(unittest.TestCase):
+    """§5.2: a peer contributes iff reachability is `up` AND fed state is `fresh`.
+    A router must never be handed a backend on an absent host (contract)."""
+
+    def test_fresh_but_down_peer_is_excluded(self):
+        merge = roundhouse.build_fleet_merge(
+            [{'model_name': 'local-a'}], 'boltzmann',
+            roundhouse.FedRows({'ampere': _fed(state='fresh', peer_state='down',
+                                               entries=[{'model_name': 'ampere-b'}])}))
+        self.assertEqual([e['model_name'] for e in merge['model_list']], ['local-a'])
+        self.assertEqual([e['name'] for e in merge['excluded']], ['ampere'])
+
+    def test_excluded_row_carries_reachability_state_from_the_merge(self):
+        merge = roundhouse.build_fleet_merge(
+            [], 'boltzmann',
+            roundhouse.FedRows({'ampere': _fed(state='stale', peer_state='down',
+                                               reason='down: peer unreachable')}))
+        self.assertEqual(merge['excluded'][0]['state'], 'down')
+        self.assertEqual(merge['excluded'][0]['fed_state'], 'stale')
+        self.assertEqual(merge['excluded'][0]['reason'], 'down: peer unreachable')
+
+    def test_up_and_fresh_contributes(self):
+        merge = roundhouse.build_fleet_merge(
+            [], 'boltzmann',
+            roundhouse.FedRows({'ampere': _fed(entries=[{'model_name': 'ampere-b'}])}))
+        self.assertEqual([e['model_name'] for e in merge['model_list']], ['ampere-b'])
+        self.assertEqual(merge['excluded'], [])
+
+
+class TestFedRowsAreASnapshot(unittest.TestCase):
+    """Both fleet handlers serialize AFTER dropping the lock (§6.1). If
+    fed_rows_unlocked handed out live references, the peer thread's next round
+    would tear the response — and a handler could mutate watch state unlocked."""
+
+    def setUp(self):
+        self.pw = roundhouse.PeerWatch(
+            declared={'ampere': ('ampere.fritz.box', 8099)},
+            lock=threading.Lock(), event_bus=MagicMock(),
+            fleet={'ampere': 'https://ampere.fritz.box:8099'}, now=lambda: 1000.0)
+        self.pw.apply_fetch_unlocked(
+            'ampere', True,
+            {'mode': 'read-only', 'units': [{'unit': 'a.service', 'rung': 'READY'}]},
+            {'model_list': [{'model_name': 'ampere-a'}]}, None, 1000.0)
+
+    def test_rows_are_copies(self):
+        rows = self.pw.fed_rows_unlocked()
+        rows['ampere']['units'].append({'unit': 'injected.service'})
+        rows['ampere']['state'] = 'never'
+        self.assertEqual(len(self.pw.fed['ampere']['units']), 1)
+        self.assertEqual(self.pw.fed['ampere']['state'], 'fresh')
+
+    def test_rows_carry_reachability_state(self):
+        with self.pw.lock:
+            self.pw.apply_result_unlocked('ampere', True, None, 1000.0)
+        self.assertEqual(self.pw.fed_rows_unlocked()['ampere']['peer_state'], 'up')
+
+
+class TestDownTransitionReason(unittest.TestCase):
+    """§4.2 last row: an up→down transition writes the `down:` reason. The fetch
+    that failed first (same round) must not shadow it — the drill greps `down:`."""
+
+    def setUp(self):
+        self.pw = roundhouse.PeerWatch(
+            declared={'bee': ('127.0.0.1', 9)},
+            lock=threading.Lock(), event_bus=MagicMock(),
+            fleet={'bee': 'http://127.0.0.1:9'}, now=lambda: 1000.0)
+        self.pw.apply_fetch_unlocked(
+            'bee', True, {'mode': 'read-only', 'units': []},
+            {'model_list': [{'model_name': 'bee-a'}]}, None, 1000.0)
+        self.pw.apply_result_unlocked('bee', True, None, 1000.0)   # up
+
+    def test_reason_becomes_down_even_when_already_stale(self):
+        # Round 1: the fetch fails first (peer is dead but the probe has one grace round)
+        self.pw.apply_fetch_unlocked('bee', False, None, None, 'connect: refused', 1005.0)
+        self.assertEqual(self.pw.fed['bee']['state'], 'stale')
+        # Rounds 1+2: two failed probes → up→down
+        self.pw.apply_result_unlocked('bee', False, 'refused', 1005.0)
+        self.pw.apply_result_unlocked('bee', False, 'refused', 1010.0)
+        self.assertEqual(self.pw.peers['bee']['state'], 'down')
+        self.assertTrue(self.pw.fed['bee']['reason'].startswith('down: '),
+                        f"reason was {self.pw.fed['bee']['reason']!r}")
+
+    def test_reachability_event_reports_the_previous_fed_state(self):
+        """§4.2: the payload's fed_prev is the fed state BEFORE this event."""
+        self.pw.apply_result_unlocked('bee', False, 'refused', 1005.0)
+        payload = self.pw.apply_result_unlocked('bee', False, 'refused', 1010.0)
+        self.assertEqual(payload['fed_prev'], 'fresh')
+        self.assertEqual(payload['fed']['state'], 'stale')
+
+
+class TestFedFailureEventChatter(unittest.TestCase):
+    """§4.2: `never` + failure emits only when the reason was None (the operator
+    must see the first cert error, and nothing after it while it flat-lines)."""
+
+    def setUp(self):
+        self.pw = roundhouse.PeerWatch(
+            declared={'bee': ('127.0.0.1', 9)}, lock=threading.Lock(),
+            event_bus=MagicMock(), fleet={'bee': 'https://127.0.0.1:9'},
+            now=lambda: 1000.0)
+
+    def test_repeated_body_failure_on_never_is_silent(self):
+        bad = ({'mode': 'read-only', 'units': 'not-a-list'}, {'model_list': []})
+        first = self.pw.apply_fetch_unlocked('bee', True, bad[0], bad[1], None, 1000.0)
+        second = self.pw.apply_fetch_unlocked('bee', True, bad[0], bad[1], None, 1005.0)
+        self.assertIsNotNone(first)
+        self.assertIsNone(second, 'a flat-lining body: failure must not chatter on SSE')
+        self.assertEqual(self.pw.fed['bee']['state'], 'never')
+
+    def test_repeated_transport_failure_on_never_is_silent(self):
+        first = self.pw.apply_fetch_unlocked('bee', False, None, None, 'tls: x', 1000.0)
+        second = self.pw.apply_fetch_unlocked('bee', False, None, None, 'tls: x', 1005.0)
+        self.assertIsNotNone(first)
+        self.assertIsNone(second)
 
 
 if __name__ == '__main__':

@@ -135,6 +135,8 @@ Against the field: an engine-agnostic driver contract, desired-state reconciliat
 
 7. **Listen list + peer watch:** `--bind` takes a list of addresses (so Roundhouse can sit on loopback behind caddy with no second unencrypted door), and `--peer NAME=HOST:PORT` declares other fleet hosts to watch with a once-a-minute TCP connect. Sensing only, in both halves: the watch says *reachable*, never *healthy*, and cannot start, stop, or wake anything. See [docs/PEERS.md](docs/PEERS.md).
 
+8. **Federation (reads only):** `--fleet-peer NAME=URL` declares a peer that *is* a Roundhouse, so it can be asked what it runs. Its answers are merged into a fleet roster (`/api/fleet`) and a fleet-wide routing fragment (`/api/routing-config/fleet`) — concatenated verbatim, never re-derived, with a shared `model_name` surfaced as a conflict rather than silently overwritten. `https://` verifies against the system trust store and there is no flag to skip it. **Every action stays local:** the merged roster contains unit names this host does not own, so an action naming one answers 404, and a name both hosts run binds the local unit and says which host acted. See [docs/PEERS.md](docs/PEERS.md) and [docs/ROUTING.md](docs/ROUTING.md).
+
 ## License / contributing
 
 Do whatever you want with this design. Built as the control plane for a personal heterogeneous inference fleet, and shared as prior art. Issues and better ideas welcome.

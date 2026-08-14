@@ -1139,6 +1139,118 @@ class TestWriteGuards(unittest.TestCase):
                         f"Forbidden socket methods in _probe_peer: {forbidden_in_probe} — "
                         "connect-and-close means no send/recv")
 
+    # ---- MVP8 §8.1: the federated HTTP client is confined and cannot be weakened ----
+
+    FETCH_CALLSITES = {'_fetch_peer'}
+    OPENING_ATTRS = {'urlopen', 'build_opener', 'OpenerDirector', 'HTTPSHandler',
+                     'HTTPHandler', 'HTTPConnection', 'HTTPSConnection'}
+
+    def test_fetch_confined(self):
+        """§8.1(a): every connection-opening urllib/http.client symbol sits in
+        FETCH_CALLSITES = {'_fetch_peer'}.
+
+        _FleetNoRedirect subclasses HTTPRedirectHandler, which opens nothing and is
+        not in the set — the class body is the one place a handler name may appear
+        outside the client.
+        """
+        import ast
+        source, tree = self._tree()
+        parents = self._parents(tree)
+
+        violations = []
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Attribute) and node.attr in self.OPENING_ATTRS:
+                fn = self._enclosing_func(node, parents)
+                if fn not in self.FETCH_CALLSITES:
+                    violations.append((node.lineno, node.attr, fn))
+
+        self.assertEqual(violations, [],
+                         f"connection-opening symbols outside {self.FETCH_CALLSITES}: {violations}")
+
+    def test_default_context_is_the_only_tls_construction(self):
+        """§8.1(b): ssl.create_default_context appears EXACTLY once, inside _fetch_peer.
+
+        Exactly one, not at most one: zero would mean the client stopped verifying,
+        and a guard content with a missing mechanism guards nothing.
+        """
+        import ast
+        source, tree = self._tree()
+        parents = self._parents(tree)
+
+        sites = [(node.lineno, self._enclosing_func(node, parents))
+                 for node in ast.walk(tree)
+                 if isinstance(node, ast.Attribute) and node.attr == 'create_default_context']
+
+        self.assertEqual(len(sites), 1, f"expected exactly one create_default_context, got {sites}")
+        self.assertEqual(sites[0][1], '_fetch_peer', f"create_default_context outside _fetch_peer: {sites}")
+
+    def test_insecure_tls_is_unrepresentable(self):
+        """§8.1(c)/K2: the constructs that would disable verification are ABSENT.
+
+        Not "insecure only outside the client" — absent, full stop. A federation that
+        silently accepts any certificate is worse than no federation (contract), so
+        the bypass must not exist to be reached for when a drill's self-signed cert
+        fails (Risk 2 — the likeliest wrong 'fix' in this milestone).
+        """
+        import ast
+        source, tree = self._tree()
+
+        FORBIDDEN_ATTRS = {'_create_unverified_context', 'CERT_NONE', 'SSLContext', 'set_ciphers'}
+        FORBIDDEN_TARGETS = {'check_hostname', 'verify_mode'}
+
+        found_attrs, found_assigns = [], []
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Attribute) and node.attr in FORBIDDEN_ATTRS:
+                found_attrs.append((node.lineno, node.attr))
+            if isinstance(node, ast.Name) and node.id in FORBIDDEN_ATTRS:
+                found_attrs.append((node.lineno, node.id))
+            targets = []
+            if isinstance(node, ast.Assign):
+                targets = node.targets
+            elif isinstance(node, ast.AnnAssign):
+                targets = [node.target]
+            for t in targets:
+                if isinstance(t, ast.Attribute) and t.attr in FORBIDDEN_TARGETS:
+                    found_assigns.append((node.lineno, t.attr))
+
+        self.assertEqual(found_attrs, [], f"insecure-TLS construct present: {found_attrs}")
+        self.assertEqual(found_assigns, [], f"TLS verification assignment present: {found_assigns}")
+
+        # And no flag can reach it either: argparse must not learn the word.
+        for word in ('insecure', 'no-verify', 'noverify', 'skip-verify'):
+            self.assertNotIn(word, source.lower(),
+                             f"the source mentions {word!r} — there is no bypass flag (K2)")
+
+    def test_fetch_peer_only_reads(self):
+        """§8.1(d): inside _fetch_peer, no send-shaped socket verb beyond read()."""
+        import ast
+        source, tree = self._tree()
+        parents = self._parents(tree)
+
+        SEND_ATTRS = {'send', 'sendall', 'sendto', 'write', 'makefile', 'sendfile'}
+        offenders = [(node.lineno, node.attr) for node in ast.walk(tree)
+                     if isinstance(node, ast.Attribute) and node.attr in SEND_ATTRS
+                     and self._enclosing_func(node, parents) == '_fetch_peer']
+        self.assertEqual(offenders, [], f"_fetch_peer writes application data: {offenders}")
+
+    def test_fetch_peer_takes_no_url(self):
+        """§3.3/K9: the base comes from the startup-frozen fleet table and the path
+        from FLEET_PATHS — an arbitrary URL is unrepresentable at the signature."""
+        import ast
+        import inspect
+        source, tree = self._tree()
+
+        fn = next(n for n in ast.walk(tree)
+                  if isinstance(n, ast.FunctionDef) and n.name == '_fetch_peer')
+        arg_names = [a.arg for a in fn.args.args]
+        self.assertEqual(arg_names, ['peer_watch', 'name', 'path', 'opener'])
+        self.assertNotIn('url', arg_names)
+
+        body_src = ast.get_source_segment(source, fn)
+        self.assertIn('assert path in FLEET_PATHS', body_src)
+        self.assertIn('peer_watch.fleet[name]', body_src)
+        self.assertEqual(roundhouse.FLEET_PATHS, ('/api/units', '/api/routing-config.json'))
+
 
 class TestMultiListener(unittest.TestCase):
     """T1 integration: multi-listener lifecycle per §7.4."""
@@ -1941,6 +2053,85 @@ class TestPeerStripStatic(unittest.TestCase):
                                                self.html.index('function renderHeader')])
 
 
+class TestFleetSectionStatic(unittest.TestCase):
+    """MVP8 §6.4: the strip grows a unit count and a stale marker; a read-only
+    fleet section lists peers' units, visibly separated and non-interactive."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.html = (Path(__file__).parent.parent / 'static' / 'index.html').read_text()
+        cls.css = cls.html[cls.html.index('<style>'):cls.html.index('</style>')]
+        import re as _re
+        cls.fleet_css = '\n'.join(
+            m.group(0) for m in _re.finditer(r'([^{}]+)\{([^{}]*)\}', cls.css)
+            if 'fleet' in m.group(1))
+        start = cls.html.index('function renderFleetSection')
+        cls.renderer = cls.html[start:cls.html.index('\n        function ', start + 10)]
+        start_p = cls.html.index('function renderPeers')
+        cls.peer_renderer = cls.html[start_p:cls.html.index('\n        function ', start_p + 10)]
+        cls.markup = cls.html[cls.html.index('<div class="fleet-section"'):]
+        cls.markup = cls.markup[:cls.markup.index('</div>', cls.markup.index('fleet-peers'))]
+
+    # ---- the strip amendment -------------------------------------------------
+    def test_strip_shows_unit_count_for_a_fleet_peer(self):
+        self.assertIn("peer.kind === 'roundhouse'", self.peer_renderer)
+        self.assertIn('unit_count', self.peer_renderer)
+        self.assertIn("' units'", self.peer_renderer)
+
+    def test_strip_shows_a_stale_marker(self):
+        self.assertIn('fed.stale', self.peer_renderer)
+        self.assertIn("' · stale'", self.peer_renderer)
+
+    def test_strip_stays_textcontent_only(self):
+        self.assertNotIn('innerHTML', self.peer_renderer)
+
+    # ---- the fleet section ---------------------------------------------------
+    def test_section_present_and_labelled_read_only(self):
+        self.assertIn('id="fleet-section"', self.html)
+        self.assertIn('fleet (read-only)', self.markup)
+
+    def test_section_is_hidden_until_a_fleet_peer_exists(self):
+        self.assertIn('style="display: none;"', self.markup)
+        self.assertIn("section.style.display = 'none'", self.renderer)
+
+    def test_section_is_non_interactive(self):
+        for forbidden in ('<button', 'onclick', "addEventListener('click'"):
+            self.assertNotIn(forbidden, self.markup)
+            self.assertNotIn(forbidden, self.renderer)
+        self.assertNotIn('innerHTML', self.renderer)
+        self.assertNotIn('localStorage', self.renderer)
+
+    def test_section_uses_no_alarm_colors(self):
+        import re as _re
+        for token in ('var(--red)', 'var(--amber)', 'var(--green)'):
+            self.assertNotIn(token, self.fleet_css)
+        literals = _re.findall(r'#[0-9a-fA-F]{3,8}|rgba?\([^)]*\)', self.fleet_css)
+        self.assertEqual(literals, [], f'fleet section must use theme tokens only: {literals}')
+
+    def test_section_reads_the_fleet_route(self):
+        self.assertIn("fetch('/api/fleet')", self.renderer)
+        self.assertIn('u.source === peer.name', self.renderer)
+
+    def test_section_refreshes_on_snapshot_and_peer_events_only(self):
+        """Transition-only peer events bound the fetch rate (§6.4)."""
+        peer_handler = self.html[self.html.index("addEventListener('peer'"):
+                                 self.html.index('eventSource.onerror')]
+        self.assertIn('renderFleetSection', peer_handler)
+        render_fn = self.html[self.html.index('function render()'):
+                              self.html.index('function renderHeader')]
+        self.assertIn('renderFleetSection', render_fn)
+        # No timer anywhere in the renderer: the SSE stream is the clock.
+        self.assertNotIn('setInterval', self.renderer)
+
+    def test_the_frozen_44px_touch_target_list_did_not_grow(self):
+        """§6.4/K8: no 44 px amendment — the fleet rows are text, not targets."""
+        self.assertIn('.unit-row, button, .off-section-toggle, .stop-tick-row, '
+                      '#token, .enable-toggle {\n                min-height: 44px;',
+                      self.html)
+        self.assertNotIn('fleet', self.html[self.html.index('min-height: 44px') - 200:
+                                            self.html.index('min-height: 44px')])
+
+
 class TestBindFailureIsLoud(unittest.TestCase):
     """§3.3 / contract acceptance: all-or-nothing startup, and it does not lie first."""
 
@@ -2179,6 +2370,1180 @@ class TestBindFailureIsLoud(unittest.TestCase):
             except subprocess.TimeoutExpired:
                 proc.kill()
                 proc.communicate()
+
+
+# ===== MVP8 §7 — THE HAZARD MATRIX ============================================
+#
+# The merged roster contains unit names that are not local, and both hosts run
+# qwen3.6-coding.service. Every action path must key strictly on LOCAL units:
+#   (a) a peer-only name answers 404 and nothing is actuated,
+#   (b) a name that exists on BOTH hosts binds the LOCAL unit and the 2xx body
+#       says which host did it,
+#   (c) run_actuate still refuses anything outside the local selected set.
+# Every route leg runs with fed data POPULATED — the adversarial condition: the
+# 404 must hold while the roster is displaying the very name being refused.
+
+import shutil
+import subprocess
+import tempfile
+from unittest.mock import patch
+
+PEER_ONLY = 'bee-only.service'
+SHARED = 'both.service'          # exists on BOTH hosts — the collision IS the test
+LOCAL_ONLY = 'local-a.service'
+
+
+class _HazardHarness(unittest.TestCase):
+    """A live server with two local units and a fleet peer advertising one of them."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.temp_dir = tempfile.mkdtemp()
+        fixtures = Path(__file__).resolve().parents[2] / 'docs' / 'fixtures'
+
+        # Real unit files on disk, renamed to the matrix's names.
+        cls.units = {}
+        for name, src in ((SHARED, 'qwen3.6-coding.service'),
+                          (LOCAL_ONLY, 'llama-server-gemma4.service')):
+            dst = Path(cls.temp_dir) / name
+            raw = (fixtures / src).read_bytes()
+            if name == SHARED:
+                raw = raw.replace(b'[Unit]', b'# roundhouse: on-demand\n[Unit]', 1)
+            dst.write_bytes(raw)
+            cls.units[name] = roundhouse.parse_unit(str(dst), dst.read_bytes())
+
+        # The unit dir is a git repo with both files committed: preflight's git check
+        # is orthogonal to the hazard question, and a 422 there would hide the answer.
+        env = {**os.environ, 'GIT_AUTHOR_NAME': 'drill', 'GIT_AUTHOR_EMAIL': 'd@x',
+               'GIT_COMMITTER_NAME': 'drill', 'GIT_COMMITTER_EMAIL': 'd@x'}
+        for argv in (['git', 'init', '-q'], ['git', 'add', '--', SHARED, LOCAL_ONLY],
+                     ['git', 'commit', '-qm', 'fixtures']):
+            subprocess.run(argv, cwd=cls.temp_dir, env=env, check=True,
+                           capture_output=True)
+
+        cls.watcher = MagicMock(spec=roundhouse.Watcher)
+        cls.watcher.lock = threading.Lock()
+        cls.watcher.units = dict(cls.units)
+        cls.watcher.mem_store = None
+        cls.watcher._cgroup_cache = {}
+        cls.watcher.snapshot.return_value = {
+            'host': 'test', 'kernel': '6.1', 'now': time.time(),
+            'mem': {'total_bytes': 32 * 1024 ** 3, 'available_bytes': 24 * 1024 ** 3},
+            'sources': {}, 'self_port': 8090,
+            'self_unit': {'unit': 'roundhouse.service', 'unit_file_state': 'enabled',
+                          'enabled': True},
+            'units': [
+                {'unit': SHARED, 'rung': 'OFF', 'retired': False, 'enabled': False,
+                 'port': 8085, 'alias': 'both', 'on_demand': True, 'badges': [],
+                 'strategy_note': None, 'start_ts_mono': '1234',
+                 'mem': {'bytes': 200 * 1024 ** 2, 'source': 'measured',
+                         'label': 'measured peak'},
+                 'port_conflict': None, 'stale': False},
+                {'unit': LOCAL_ONLY, 'rung': 'READY', 'retired': False, 'enabled': True,
+                 'port': 8093, 'alias': 'local-a', 'on_demand': False, 'badges': [],
+                 'strategy_note': None, 'start_ts_mono': '5678',
+                 'mem': {'bytes': 100 * 1024 ** 2, 'source': 'measured',
+                         'label': 'measured peak'},
+                 'port_conflict': None, 'stale': False},
+            ],
+        }
+
+        cls.event_bus = roundhouse.EventBus()
+        cls.watcher_lock = threading.Lock()
+        cls.clock = [1_755_100_000.0]
+
+        # The peer: a fleet peer whose roster carries BOTH a novel unit name and one
+        # this host also runs. Populated through the real ingestion path.
+        cls.peer_watch = roundhouse.PeerWatch(
+            {'bee': ('127.0.0.1', 9)}, cls.watcher_lock, cls.event_bus,
+            fleet={'bee': 'http://127.0.0.1:9'}, now=lambda: cls.clock[0])
+        with cls.watcher_lock:
+            cls.peer_watch.apply_result_unlocked('bee', True, None, cls.clock[0])
+            cls.peer_watch.apply_fetch_unlocked('bee', True, {
+                'mode': 'read-only',
+                'units': [
+                    {'unit': PEER_ONLY, 'rung': 'READY', 'port': 9001,
+                     'alias': 'bee-only', 'enabled': True, 'on_demand': False,
+                     'retired': False, 'strategy_note': None, 'badges': []},
+                    {'unit': SHARED, 'rung': 'READY', 'port': 9999,
+                     'alias': 'both', 'enabled': True, 'on_demand': False,
+                     'retired': False, 'strategy_note': None, 'badges': []},
+                ]}, {'model_list': [
+                    {'model_name': 'bee-bee-only',
+                     'litellm_params': {'model': 'openai/bee-only',
+                                        'api_base': 'http://bee:9001/v1'}},
+                    {'model_name': 'bee-both',
+                     'litellm_params': {'model': 'openai/both',
+                                        'api_base': 'http://bee:9999/v1'}},
+                ]}, None, cls.clock[0])
+
+        sock = socket.socket()
+        sock.bind(('127.0.0.1', 0))
+        cls.port = sock.getsockname()[1]
+        sock.close()
+
+        cls.engine = MagicMock()
+        cls.engine.current = None
+        cls.engine.rollouts = {}
+        cls.engine.pending_warm = None
+        cls.engine.last_warm = None
+        cls.engine.units = dict(cls.units)
+
+        roundhouse.ACTUATE_ARMED = True
+        roundhouse.TOKEN = 'test-token'
+        cls.server = roundhouse.ThreadingHTTPServer(
+            ('127.0.0.1', cls.port), roundhouse.RoundhouseRequestHandler,
+            cls.watcher, cls.event_bus, cls.port,
+            watcher_lock=cls.watcher_lock, rollout_engine=cls.engine,
+            peer_watch=cls.peer_watch, peer_interval=5)
+        cls.thread = threading.Thread(target=cls.server.serve_forever, daemon=True)
+        cls.thread.start()
+        time.sleep(0.1)
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.server.shutdown()
+        cls.server.server_close()
+        shutil.rmtree(cls.temp_dir, ignore_errors=True)
+        roundhouse.ACTUATE_ARMED = False
+        roundhouse.TOKEN = None
+
+    def setUp(self):
+        self.engine.reset_mock()
+        self.engine.current = None
+        self.engine.pending_warm = None
+        self.engine.rollouts = {}
+
+    # ---- transport -----------------------------------------------------------
+    def get(self, path):
+        conn = http.client.HTTPConnection('127.0.0.1', self.port, timeout=5)
+        try:
+            conn.request('GET', path)
+            r = conn.getresponse()
+            return r.status, r.read()
+        finally:
+            conn.close()
+
+    def post(self, path, data=None, token='test-token'):
+        conn = http.client.HTTPConnection('127.0.0.1', self.port, timeout=5)
+        try:
+            body = json.dumps(data if data is not None else {}).encode('utf-8')
+            headers = {'Content-Type': 'application/json'}
+            if token:
+                headers['Authorization'] = f'Bearer {token}'
+            conn.request('POST', path, body, headers)
+            r = conn.getresponse()
+            return r.status, r.read()
+        finally:
+            conn.close()
+
+    def measured(self):
+        """A measured peak for both fixture units.
+
+        The memory FIT check is orthogonal to the hazard question, and on a test box
+        the fixtures' model files do not exist, so the estimator falls back to its 9
+        GiB default and every (b) leg would 422 before it could say which host acted.
+        _estimate_start_bytes is the one seam all three preflights share; the fit
+        arithmetic, the port check, the retired check and the git check all stay real.
+        """
+        return patch.object(roundhouse, '_estimate_start_bytes',
+                            lambda unit, profile, store: (200 * 1024 ** 2, 'measured peak row'))
+
+    def assert_local_host(self, body):
+        """(b): the 2xx body names the host that acted."""
+        payload = json.loads(body)
+        self.assertIn('host', payload, f'no host key in {payload}')
+        self.assertEqual(payload['host'], os.uname()[1])
+        return payload
+
+
+class TestHazardRosterShowsWhatItRefuses(_HazardHarness):
+    """The adversarial precondition: the peer's names ARE on the roster."""
+
+    def test_roster_carries_both_peer_names(self):
+        status, body = self.get('/api/fleet')
+        self.assertEqual(status, 200)
+        names = [(u['unit'], u['source']) for u in json.loads(body)['units']]
+        self.assertIn((PEER_ONLY, 'bee'), names)
+        self.assertIn((SHARED, 'bee'), names)
+        self.assertIn((SHARED, 'test'), names)
+
+    def test_fed_data_is_disjoint_from_every_actuation_table(self):
+        """§7 structural invariant: fed data is write-only into PeerWatch.fed.
+
+        This is the test that bites the merge-for-convenience shortcut (seed s3):
+        pulling peer rows into watcher.units would make /api/fleet and the UI free
+        and kill the hazard rule silently.
+        """
+        self.assertNotIn(PEER_ONLY, self.watcher.units)
+        self.assertNotIn(PEER_ONLY, self.engine.units)
+        snap = self.server.take_snapshot()
+        self.assertEqual([r['unit'] for r in snap['units']], [SHARED, LOCAL_ONLY])
+        for row in snap['units']:
+            self.assertNotEqual(row.get('source'), 'bee')
+
+        # ... and the roster route may not smuggle one in either: every row it calls
+        # LOCAL must be a unit this host actually owns. This is the leg that bites the
+        # convenience shortcut of appending fed rows to the snapshot so /api/fleet and
+        # the UI come for free.
+        status, body = self.get('/api/fleet')
+        self.assertEqual(status, 200)
+        doc = json.loads(body)
+        local_rows = [u['unit'] for u in doc['units'] if u['source'] == doc['host']]
+        self.assertEqual(sorted(local_rows), sorted(self.watcher.units),
+                         f'a non-local unit is tagged as local: {local_rows}')
+
+        # And the local roster route is unchanged by any of it.
+        status, body = self.get('/api/units')
+        self.assertEqual(sorted(u['unit'] for u in json.loads(body)['units']),
+                         sorted(self.watcher.units))
+
+    def test_local_units_route_is_untouched_by_federation(self):
+        status, body = self.get('/api/units')
+        self.assertEqual(status, 200)
+        names = [u['unit'] for u in json.loads(body)['units']]
+        self.assertNotIn(PEER_ONLY, names)
+
+
+class TestHazardUnitDetail(_HazardHarness):
+    """Row 1: GET /api/units/<u>."""
+
+    def test_peer_only_name_is_404(self):
+        status, _ = self.get(f'/api/units/{PEER_ONLY}')
+        self.assertEqual(status, 404)
+
+    def test_shared_name_resolves_the_local_unit(self):
+        status, body = self.get(f'/api/units/{SHARED}')
+        self.assertEqual(status, 200)
+        detail = json.loads(body)
+        # The peer advertises this same unit on port 9999; the local one is 8085.
+        self.assertEqual(detail['unit'], SHARED)
+        self.assertEqual(detail['port'], 8085)
+        self.assertTrue(detail['path'].startswith(self.temp_dir))
+
+    def test_local_only_control(self):
+        status, _ = self.get(f'/api/units/{LOCAL_ONLY}')
+        self.assertEqual(status, 200)
+
+
+class TestHazardEditPreview(_HazardHarness):
+    """Row 2a: POST /api/units/<u>/edit."""
+
+    EDITS = {'edits': {'ctx': '8192'}}
+
+    def test_peer_only_name_is_404_and_nothing_is_planned(self):
+        with patch.object(roundhouse, 'plan_edits') as planner:
+            status, body = self.post(f'/api/units/{PEER_ONLY}/edit', self.EDITS)
+        self.assertEqual(status, 404)
+        self.assertEqual(json.loads(body)['error'], 'not_found')
+        planner.assert_not_called()
+
+    def test_shared_name_previews_the_local_unit_and_says_which_host(self):
+        with self.measured():
+            status, body = self.post(f'/api/units/{SHARED}/edit', self.EDITS)
+        self.assertEqual(status, 200, body)
+        payload = self.assert_local_host(body)
+        self.assertEqual(payload['unit'], SHARED)
+
+    def test_local_only_control(self):
+        with self.measured():
+            status, body = self.post(f'/api/units/{LOCAL_ONLY}/edit', self.EDITS)
+        self.assertEqual(status, 200, body)
+        self.assert_local_host(body)
+
+
+class TestHazardRollout(_HazardHarness):
+    """Row 2b: POST /api/units/<u>/rollout — the actuating twin of the preview."""
+
+    def _confirm(self, unit_name):
+        unit = self.units[unit_name]
+        edits = roundhouse.plan_edits(unit, {'ctx': '8192'})
+        return roundhouse.compute_confirm(unit_name, unit.raw, edits)
+
+    def test_peer_only_name_is_404_and_no_rollout_starts(self):
+        status, _ = self.post(f'/api/units/{PEER_ONLY}/rollout',
+                              {'edits': {'ctx': '8192'}, 'confirm': 'whatever'})
+        self.assertEqual(status, 404)
+        self.engine.start_rollout.assert_not_called()
+
+    def test_shared_name_rolls_out_the_local_unit_and_says_which_host(self):
+        self.engine.start_rollout.return_value = {'rollout_id': 'ro-1-1'}
+        status, body = self.post(f'/api/units/{SHARED}/rollout',
+                                 {'edits': {'ctx': '8192'},
+                                  'confirm': self._confirm(SHARED)})
+        self.assertEqual(status, 202, body)
+        self.assert_local_host(body)
+        self.assertEqual(self.engine.start_rollout.call_args[0][0], SHARED)
+
+    def test_local_only_control(self):
+        self.engine.start_rollout.return_value = {'rollout_id': 'ro-1-2'}
+        status, body = self.post(f'/api/units/{LOCAL_ONLY}/rollout',
+                                 {'edits': {'ctx': '8192'},
+                                  'confirm': self._confirm(LOCAL_ONLY)})
+        self.assertEqual(status, 202, body)
+        self.assert_local_host(body)
+
+
+class TestHazardEnablement(_HazardHarness):
+    """Row 2c: POST /api/units/<u>/enablement."""
+
+    def test_peer_only_name_is_404_and_nothing_is_set(self):
+        status, _ = self.post(f'/api/units/{PEER_ONLY}/enablement', {'enabled': True})
+        self.assertEqual(status, 404)
+        self.engine._set_enablement.assert_not_called()
+
+    def test_shared_name_toggles_the_local_unit_and_says_which_host(self):
+        self.watcher.apply_unit_file_state = MagicMock()
+        status, body = self.post(f'/api/units/{SHARED}/enablement', {'enabled': True})
+        self.assertEqual(status, 200, body)
+        payload = self.assert_local_host(body)
+        self.assertEqual(payload['unit'], SHARED)
+        self.assertEqual(self.engine._set_enablement.call_args[0][0], SHARED)
+
+    def test_local_only_control(self):
+        self.watcher.apply_unit_file_state = MagicMock()
+        status, body = self.post(f'/api/units/{LOCAL_ONLY}/enablement', {'enabled': False})
+        self.assertEqual(status, 200, body)
+        self.assert_local_host(body)
+
+
+class TestHazardSwitchPreview(_HazardHarness):
+    """Row 3: POST /api/switch/preview — target AND every stops member."""
+
+    def test_peer_only_target_is_404(self):
+        status, _ = self.post('/api/switch/preview', {'target': PEER_ONLY})
+        self.assertEqual(status, 404)
+
+    def test_peer_only_stop_member_is_404(self):
+        """The per-stop check: a legitimate local target does not launder a peer stop."""
+        status, _ = self.post('/api/switch/preview',
+                              {'target': SHARED, 'stops': [PEER_ONLY]})
+        self.assertEqual(status, 404)
+
+    def test_shared_target_previews_locally_and_says_which_host(self):
+        with self.measured():
+            status, body = self.post('/api/switch/preview', {'target': SHARED})
+        self.assertEqual(status, 200, body)
+        payload = self.assert_local_host(body)
+        # The peer advertises `both.service` on 9999; the preview bound the local 8085.
+        self.assertEqual(payload['target']['unit'], SHARED)
+        self.assertEqual(payload['target']['port'], 8085)
+
+    def test_local_only_control(self):
+        with self.measured():
+            status, body = self.post('/api/switch/preview',
+                                     {'target': SHARED, 'stops': [LOCAL_ONLY]})
+        self.assertEqual(status, 200, body)
+        self.assertEqual(json.loads(body)['stop_candidates'][0]['unit'], LOCAL_ONLY)
+
+
+class TestHazardSwitchExecute(_HazardHarness):
+    """Row 4: POST /api/switch."""
+
+    def _confirm(self, target, stops):
+        fingerprint = roundhouse.fleet_fingerprint(self.watcher.snapshot.return_value)
+        return roundhouse.compute_switch_confirm(target, stops, fingerprint)
+
+    def test_peer_only_target_is_404_and_no_switch_starts(self):
+        status, _ = self.post('/api/switch', {'target': PEER_ONLY, 'confirm': 'x'})
+        self.assertEqual(status, 404)
+        self.engine.start_switch.assert_not_called()
+
+    def test_peer_only_stop_member_is_404_and_no_switch_starts(self):
+        status, _ = self.post('/api/switch',
+                              {'target': SHARED, 'stops': [PEER_ONLY], 'confirm': 'x'})
+        self.assertEqual(status, 404)
+        self.engine.start_switch.assert_not_called()
+
+    def test_shared_target_switches_the_local_unit_and_says_which_host(self):
+        self.engine.start_switch.return_value = {'rollout_id': 'sw-1-1'}
+        with self.measured():
+            status, body = self.post('/api/switch',
+                                     {'target': SHARED, 'stops': [],
+                                      'confirm': self._confirm(SHARED, [])})
+        self.assertEqual(status, 202, body)
+        self.assert_local_host(body)
+        self.assertEqual(self.engine.start_switch.call_args[0][0], SHARED)
+
+    def test_local_only_control(self):
+        self.engine.start_switch.return_value = {'rollout_id': 'sw-1-2'}
+        with self.measured():
+            status, body = self.post('/api/switch',
+                                     {'target': SHARED, 'stops': [LOCAL_ONLY],
+                                      'confirm': self._confirm(SHARED, [LOCAL_ONLY])})
+        self.assertEqual(status, 202, body)
+        self.assertEqual(list(self.engine.start_switch.call_args[0][1]), [LOCAL_ONLY])
+
+
+class TestHazardWarm(_HazardHarness):
+    """Rows 5-6: POST /api/warm by unit= and by logical=."""
+
+    def test_peer_only_unit_is_404_unknown_unit(self):
+        status, body = self.post('/api/warm', {'unit': PEER_ONLY})
+        self.assertEqual(status, 404)
+        self.assertEqual(json.loads(body)['error'], 'unknown_unit')
+        self.assertIsNone(self.engine.pending_warm)
+
+    def test_peer_namespaced_logical_is_404_unknown_alias(self):
+        """Only the LOCAL host prefix strips: a peer's namespaced model_name
+        (`bee-both`, straight out of the merged fragment) never resolves here."""
+        status, body = self.post('/api/warm', {'logical': 'bee-both'})
+        self.assertEqual(status, 404)
+        self.assertEqual(json.loads(body)['error'], 'unknown_alias')
+        self.assertIsNone(self.engine.pending_warm)
+
+    def test_shared_unit_resolves_locally_and_says_which_host(self):
+        self.engine.start_switch.return_value = {'rollout_id': 'sw-warm-1'}
+        with self.measured():
+            status, body = self.post('/api/warm', {'unit': SHARED})
+        self.assertIn(status, (200, 202), body)
+        self.assert_local_host(body)
+        # It fired a switch at the LOCAL both.service, not the peer's.
+        self.assertEqual(self.engine.start_switch.call_args[0][0], SHARED)
+
+    def test_local_only_control_is_already_warm(self):
+        status, body = self.post('/api/warm', {'unit': LOCAL_ONLY})
+        self.assertEqual(status, 200, body)
+        payload = self.assert_local_host(body)
+        self.assertEqual(payload['status'], 'already_warm')
+
+
+class TestHazardWarmCancel(_HazardHarness):
+    """Row 7: POST /api/warm/cancel — no unit name crosses the wire, so the hazard
+    is only "which host answered"; the queue it cancels is local by construction."""
+
+    def test_cancel_says_which_host(self):
+        self.engine.pending_warm = {'unit': SHARED, 'requester': 'test'}
+        status, body = self.post('/api/warm/cancel')
+        self.assertEqual(status, 200, body)
+        payload = self.assert_local_host(body)
+        self.assertEqual(payload['unit'], SHARED)
+
+    def test_empty_queue_is_404(self):
+        self.engine.pending_warm = None
+        status, _ = self.post('/api/warm/cancel')
+        self.assertEqual(status, 404)
+
+
+class TestHazardRollbackDismiss(_HazardHarness):
+    """Rows 8-9: POST /api/rollouts/<id>/rollback and /dismiss.
+
+    These key on a rollout id, and a rollout id is minted by the host that ran it —
+    a peer's record is simply not in this host's table, which is the 404. The `host`
+    key on the record is what tells an operator whose rollout they are looking at.
+    """
+
+    RECORD = {'rollout_id': 'ro-9-9', 'kind': 'rollout', 'unit': SHARED,
+              'phase': 'failed', 'detail': '', 'edits': [], 'was_active': True,
+              'commit': None, 'restored': False, 'failure': 'verify',
+              'rollback': {'offered': True}, 'started_at': 1.0, 'updated_at': 2.0}
+
+    def test_unknown_rollout_id_is_404_on_both_routes(self):
+        for path in ('/api/rollouts/ro-from-bee/rollback', '/api/rollouts/ro-from-bee/dismiss'):
+            status, _ = self.post(path)
+            self.assertEqual(status, 404, path)
+        self.engine.rollback.assert_not_called()
+
+    def test_rollback_of_a_local_record_says_which_host(self):
+        self.engine.rollouts = {'ro-9-9': dict(self.RECORD)}
+        self.engine.rollback.return_value = 'ro-9-9'
+        status, body = self.post('/api/rollouts/ro-9-9/rollback')
+        self.assertEqual(status, 202, body)
+        self.assert_local_host(body)
+
+    def test_dismiss_of_a_local_record_says_which_host(self):
+        self.engine.rollouts = {'ro-9-9': dict(self.RECORD)}
+        status, body = self.post('/api/rollouts/ro-9-9/dismiss')
+        self.assertEqual(status, 200, body)
+        self.assert_local_host(body)
+
+    def test_public_record_carries_the_host_at_serialization(self):
+        """K7: injected in rollout_public_record itself, so the snapshot and the SSE
+        stream carry it too — and records already in memory need no migration."""
+        record = roundhouse.rollout_public_record(dict(self.RECORD))
+        self.assertEqual(record['host'], os.uname()[1])
+        self.engine.rollouts = {'ro-9-9': dict(self.RECORD)}
+        status, body = self.get('/api/rollouts/ro-9-9')
+        self.assertEqual(status, 200)
+        self.assertEqual(json.loads(body)['host'], os.uname()[1])
+
+
+class TestHazardLayer3RunActuate(unittest.TestCase):
+    """(c): run_actuate refuses anything outside the local selected set — layer 3,
+    below every route and every engine, where a peer name has no standing at all."""
+
+    def setUp(self):
+        fixtures = Path(__file__).resolve().parents[2] / 'docs' / 'fixtures'
+        self.temp_dir = tempfile.mkdtemp()
+        dst = Path(self.temp_dir) / SHARED
+        dst.write_bytes((fixtures / 'qwen3.6-coding.service').read_bytes())
+        self.local = {SHARED: roundhouse.parse_unit(str(dst), dst.read_bytes())}
+
+    def tearDown(self):
+        shutil.rmtree(self.temp_dir, ignore_errors=True)
+        roundhouse.ACTUATE_ARMED = False
+
+    def test_peer_only_unit_is_refused_even_when_armed(self):
+        roundhouse.ACTUATE_ARMED = True
+        calls = []
+        with patch.object(roundhouse.subprocess, 'run',
+                          lambda *a, **k: calls.append(a) or MagicMock(returncode=0)):
+            with self.assertRaises(roundhouse.ActuationError) as ctx:
+                roundhouse.run_actuate(
+                    ['systemctl', '--user', 'stop', '--', PEER_ONLY], self.local)
+        self.assertIn('not in selected units', str(ctx.exception))
+        self.assertEqual(calls, [], 'a subprocess ran for a peer unit')
+
+    def test_shared_name_is_accepted_as_the_local_unit(self):
+        roundhouse.ACTUATE_ARMED = True
+        seen = []
+
+        def fake_run(argv, **kw):
+            seen.append(argv)
+            return subprocess.CompletedProcess(argv, 0, '', '')
+
+        with patch.object(roundhouse.subprocess, 'run', fake_run):
+            roundhouse.run_actuate(['systemctl', '--user', 'stop', '--', SHARED], self.local)
+        self.assertEqual(seen, [['systemctl', '--user', 'stop', '--', SHARED]])
+
+
+class TestHazardLayer2Engine(unittest.TestCase):
+    """Layer 2: the engine's own lookup misses for a peer name (§7 row 7)."""
+
+    def setUp(self):
+        fixtures = Path(__file__).resolve().parents[2] / 'docs' / 'fixtures'
+        self.temp_dir = tempfile.mkdtemp()
+        units = {}
+        for name, src in ((SHARED, 'qwen3.6-coding.service'),
+                          (LOCAL_ONLY, 'llama-server-gemma4.service')):
+            dst = Path(self.temp_dir) / name
+            dst.write_bytes((fixtures / src).read_bytes())
+            units[name] = roundhouse.parse_unit(str(dst), dst.read_bytes())
+        watcher = MagicMock()
+        watcher.units = units
+        watcher.mem_store = None
+        watcher._cgroup_cache = {}
+        watcher.lock = threading.Lock()
+        watcher.snapshot.return_value = {'host': 'test', 'units': [
+            {'unit': SHARED, 'rung': 'OFF', 'retired': False, 'enabled': False,
+             'since': 1.0, 'badges': [], 'port': 8085, 'mem': {}, 'start_ts_mono': '1'},
+            {'unit': LOCAL_ONLY, 'rung': 'READY', 'retired': False, 'enabled': True,
+             'since': 1.0, 'badges': [], 'port': 8093, 'mem': {}, 'start_ts_mono': '2'},
+        ], 'mem': {}, 'sources': {}}
+        self.engine = roundhouse.RolloutEngine(watcher, units, self.temp_dir, 8090,
+                                               roundhouse.EventBus(), threading.Lock())
+
+    def tearDown(self):
+        shutil.rmtree(self.temp_dir, ignore_errors=True)
+
+    def test_start_switch_refuses_a_peer_only_target(self):
+        with self.assertRaises(roundhouse.ActuationError):
+            self.engine.start_switch(PEER_ONLY, [], 'confirm')
+
+    def test_start_switch_refuses_a_peer_only_stop(self):
+        with self.assertRaises(roundhouse.ActuationError):
+            self.engine.start_switch(SHARED, [PEER_ONLY], 'confirm')
+
+    def test_start_rollout_refuses_a_peer_only_unit(self):
+        with self.assertRaises(roundhouse.ActuationError):
+            self.engine.start_rollout(PEER_ONLY, [], 'confirm')
+
+
+# ===== MVP8 §6 — the fleet surfaces, and the promise to the local consumer =====
+
+
+class _FleetSurfaceHarness(unittest.TestCase):
+    """A server with one fleet peer whose federated data is populated by hand.
+
+    The peer's fragment carries a key this version does not know (`rpm`) and an
+    entry namespaced by the peer's own host — verbatim means both survive.
+    """
+
+    PEER_ENTRIES = [
+        {'model_name': 'ampere-qwen3.6-coding',
+         'litellm_params': {'model': 'openai/qwen3.6-coding',
+                            'api_base': 'http://ampere.fritz.box:8085/v1',
+                            'api_key': 'none', 'rpm': 240},
+         'model_info': {'unit': 'qwen3.6-coding.service', 'logical': 'qwen3.6-coding',
+                        'host': 'ampere', 'rung': 'READY', 'accelerator': 'npu'}},
+    ]
+    PEER_UNITS = [
+        {'unit': 'qwen3.6-coding.service', 'rung': 'READY', 'port': 8085,
+         'alias': 'qwen3.6-coding', 'enabled': True, 'on_demand': False,
+         'retired': False, 'strategy_note': None, 'badges': [],
+         'sensed_at': 1.0, 'description': 'peer-only key that must be dropped'},
+    ]
+
+    @classmethod
+    def setUpClass(cls):
+        cls.watcher = StubWatcher()
+        cls.event_bus = roundhouse.EventBus()
+        cls.watcher_lock = threading.Lock()
+        cls.clock = [1_755_100_000.0]
+        cls.peer_watch = roundhouse.PeerWatch(
+            {'ampere': ('ampere.fritz.box', 8099)}, cls.watcher_lock, cls.event_bus,
+            fleet={'ampere': 'https://ampere.fritz.box:8099'}, now=lambda: cls.clock[0])
+
+        sock = socket.socket()
+        sock.bind(('127.0.0.1', 0))
+        cls.port = sock.getsockname()[1]
+        sock.close()
+        cls.server = roundhouse.ThreadingHTTPServer(
+            ('127.0.0.1', cls.port), roundhouse.RoundhouseRequestHandler,
+            cls.watcher, cls.event_bus, cls.port,
+            watcher_lock=cls.watcher_lock, peer_watch=cls.peer_watch,
+            advertise_host='boltzmann', peer_interval=60)
+        cls.thread = threading.Thread(target=cls.server.serve_forever, daemon=True)
+        cls.thread.start()
+        time.sleep(0.1)
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.server.shutdown()
+        cls.server.server_close()
+
+    def feed(self, state='fresh', up=True):
+        """Put the peer into (reachability, fed) = (up|down, fresh|stale|never)."""
+        with self.watcher_lock:
+            pw = self.peer_watch
+            pw.peers['ampere'].update({'state': 'up' if up else 'down',
+                                       'consecutive_failures': 0})
+            if state == 'never':
+                pw.fed['ampere'].update({'state': 'never', 'units': [], 'entries': [],
+                                         'mode': None, 'fetched_at': None,
+                                         'reason': 'tls: SSLCertVerificationError'})
+                return
+            pw.apply_fetch_unlocked(
+                'ampere', True,
+                {'mode': 'read-only', 'units': [dict(u) for u in self.PEER_UNITS]},
+                {'model_list': [dict(e) for e in self.PEER_ENTRIES]}, None,
+                1_755_159_990.0)
+            if state == 'stale':
+                pw.fed['ampere']['state'] = 'stale'
+                pw.fed['ampere']['reason'] = 'down: peer unreachable (tcp probe failed)'
+
+    def clear(self):
+        with self.watcher_lock:
+            self.peer_watch.fed['ampere'].update(
+                {'state': 'never', 'units': [], 'entries': [], 'mode': None,
+                 'invalid_entries': 0, 'fetched_at': None, 'attempted_at': None,
+                 'reason': None})
+            self.peer_watch.peers['ampere']['state'] = 'unknown'
+
+    def get(self, path):
+        conn = http.client.HTTPConnection('127.0.0.1', self.port, timeout=5)
+        try:
+            conn.request('GET', path)
+            r = conn.getresponse()
+            return r.status, r.read()
+        finally:
+            conn.close()
+
+    def post(self, path):
+        conn = http.client.HTTPConnection('127.0.0.1', self.port, timeout=5)
+        try:
+            conn.request('POST', path, b'{}', {'Content-Type': 'application/json'})
+            r = conn.getresponse()
+            return r.status, r.read()
+        finally:
+            conn.close()
+
+
+class TestRoutingConfigIsPinned(_FleetSurfaceHarness):
+    """MVP8 acceptance: /api/routing-config is byte-identical to MVP7 behaviour.
+
+    hossenfelder pulls this route live. Widening it to the fleet would change a
+    running consumer's behaviour without asking — so the pin runs the route WITH
+    federated data populated and diffs it against the unfederated body.
+    """
+
+    def _frozen_clock_body(self, path):
+        """Both bodies under one frozen clock, so 'byte-identical' means bytes."""
+        class _FrozenDatetime(roundhouse.datetime):
+            @classmethod
+            def now(cls, tz=None):
+                return roundhouse.datetime(2026, 8, 14, 12, 0, 0, tzinfo=tz)
+
+        with patch.object(roundhouse, 'datetime', _FrozenDatetime):
+            status, body = self.get(path)
+        self.assertEqual(status, 200)
+        return body
+
+    def test_yaml_is_byte_identical_with_and_without_federation(self):
+        self.clear()
+        without = self._frozen_clock_body('/api/routing-config')
+        self.feed()
+        with_fed = self._frozen_clock_body('/api/routing-config')
+        self.assertEqual(with_fed, without)
+
+    def test_json_is_byte_identical_with_and_without_federation(self):
+        self.clear()
+        without = self._frozen_clock_body('/api/routing-config.json')
+        self.feed()
+        with_fed = self._frozen_clock_body('/api/routing-config.json')
+        self.assertEqual(with_fed, without)
+
+    def test_no_peer_entry_and_no_fleet_header_while_federated(self):
+        self.feed()
+        _, body = self.get('/api/routing-config')
+        text = body.decode()
+        self.assertNotIn('ampere', text)
+        self.assertNotIn('contributor:', text)
+        self.assertNotIn('excluded:', text)
+        self.assertNotIn('conflict:', text)
+        self.assertIn('# warm-hook:', text)          # the local header, unchanged
+        _, jbody = self.get('/api/routing-config.json')
+        data = json.loads(jbody)
+        self.assertEqual(set(data), {'generated_by', 'generated_at', 'warm_hook', 'model_list'})
+        self.assertTrue(all('ampere' not in e['model_name'] for e in data['model_list']))
+
+    def test_the_fleet_route_is_where_the_peers_live(self):
+        """The other half of the promise: the fleet view exists, at its own URL."""
+        self.feed()
+        _, body = self.get('/api/routing-config/fleet')
+        text = body.decode()
+        self.assertIn('ampere-qwen3.6-coding', text)
+        self.assertIn('# contributor: ampere (fetched ', text)
+        _, jbody = self.get('/api/routing-config/fleet.json')
+        data = json.loads(jbody)
+        self.assertIn('ampere-qwen3.6-coding', [e['model_name'] for e in data['model_list']])
+
+
+class TestFleetFragment(_FleetSurfaceHarness):
+    """§5: the merged fragment — verbatim, contributor-named, absent hosts excluded."""
+
+    def test_peer_entry_is_merged_verbatim(self):
+        self.feed()
+        _, body = self.get('/api/routing-config/fleet.json')
+        merged = next(e for e in json.loads(body)['model_list']
+                      if e['model_name'] == 'ampere-qwen3.6-coding')
+        self.assertEqual(merged, self.PEER_ENTRIES[0],
+                         'the peer entry was reshaped — merging is concatenation')
+
+    def test_unknown_keys_reach_the_yaml_too(self):
+        self.feed()
+        _, body = self.get('/api/routing-config/fleet')
+        self.assertIn('rpm: 240', body.decode())
+        self.assertIn('accelerator: npu', body.decode())
+
+    def test_local_entries_come_first_and_keep_their_own_namespace(self):
+        self.feed()
+        _, body = self.get('/api/routing-config/fleet.json')
+        names = [e['model_name'] for e in json.loads(body)['model_list']]
+        local = [n for n in names if not n.startswith('ampere-')]
+        self.assertTrue(names[:len(local)] == local, names)
+
+    def test_a_peer_that_is_not_up_contributes_nothing(self):
+        self.feed(state='stale', up=False)
+        _, body = self.get('/api/routing-config/fleet.json')
+        data = json.loads(body)
+        self.assertNotIn('ampere-qwen3.6-coding', [e['model_name'] for e in data['model_list']])
+        self.assertEqual(data['excluded'][0]['name'], 'ampere')
+        self.assertEqual(data['excluded'][0]['state'], 'down')
+        _, yml = self.get('/api/routing-config/fleet')
+        self.assertIn('# excluded: ampere (down, stale: down)', yml.decode())
+
+    def test_the_yaml_header_says_it_is_the_fleet_view(self):
+        """§5.3's frozen spelling. Without the `(fleet)` marker the two documents
+        disagree about what they are — the JSON twin already says it — and a consumer
+        that saved a fragment cannot tell a fleet document from a local one."""
+        self.feed()
+        _, yml = self.get('/api/routing-config/fleet')
+        _, jsn = self.get('/api/routing-config/fleet.json')
+        generated_by = json.loads(jsn)['generated_by']
+        self.assertEqual(generated_by, 'roundhouse@boltzmann (fleet)')
+        self.assertIn(f'# generated-by: {generated_by}', yml.decode())
+
+    def test_the_two_fleet_documents_agree_on_their_contributor(self):
+        self.feed()
+        _, yml = self.get('/api/routing-config/fleet')
+        _, jsn = self.get('/api/routing-config/fleet.json')
+        local = json.loads(jsn)['contributors'][0]['name']
+        self.assertIn(f'# contributor: {local} (local)', yml.decode())
+        self.assertIn(f'roundhouse@{local} (fleet)', yml.decode())
+
+    def test_the_json_twin_timestamp_is_a_real_iso_z_stamp(self):
+        """`datetime.isoformat()` on an aware datetime already ends in +00:00;
+        appending 'Z' to it produces a stamp no parser accepts. The local route's
+        format is the one to match — consumers read both documents."""
+        self.feed()
+        _, jsn = self.get('/api/routing-config/fleet.json')
+        _, local = self.get('/api/routing-config.json')
+        stamp = json.loads(jsn)['generated_at']
+        self.assertRegex(stamp, r'^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$')
+        self.assertEqual(len(stamp), len(json.loads(local)['generated_at']))
+
+    def test_the_fragment_carries_no_warm_hook(self):
+        """K5: one hook URL would lie for peer entries."""
+        self.feed()
+        _, body = self.get('/api/routing-config/fleet')
+        self.assertNotIn('warm-hook', body.decode())
+        _, jbody = self.get('/api/routing-config/fleet.json')
+        self.assertNotIn('warm_hook', json.loads(jbody))
+
+    def test_conflict_is_surfaced_in_both_documents(self):
+        """Two hosts advertising one model_name: first wins, loudly."""
+        _, local = self.get('/api/routing-config.json')
+        clash = json.loads(local)['model_list'][0]['model_name']
+        with self.watcher_lock:
+            self.peer_watch.peers['ampere']['state'] = 'up'
+            self.peer_watch.apply_fetch_unlocked(
+                'ampere', True, {'mode': 'read-only', 'units': []},
+                {'model_list': [{'model_name': clash,
+                                 'litellm_params': {'model': 'openai/theirs'}}]},
+                None, 1_755_159_990.0)
+        _, jbody = self.get('/api/routing-config/fleet.json')
+        data = json.loads(jbody)
+        self.assertEqual(data['conflicts'],
+                         [{'model_name': clash, 'kept_source': 'boltzmann',
+                           'dropped_source': 'ampere'}])
+        kept = [e for e in data['model_list'] if e['model_name'] == clash]
+        self.assertEqual(len(kept), 1)
+        self.assertNotEqual(kept[0]['litellm_params']['model'], 'openai/theirs')
+        _, yml = self.get('/api/routing-config/fleet')
+        self.assertIn(f"# conflict: model_name '{clash}' also advertised by ampere", yml.decode())
+
+
+class TestFleetRosterShape(_FleetSurfaceHarness):
+    """§6.1: the frozen shape of GET /api/fleet."""
+
+    LOCAL_KEYS = {'unit', 'rung', 'port', 'alias', 'enabled', 'on_demand', 'retired',
+                  'strategy_note', 'badges', 'source', 'stale'}
+    PEER_BLOCK_KEYS = {'name', 'kind', 'url', 'state', 'mode', 'fed_state', 'stale',
+                       'reason', 'fetched_at', 'attempted_at', 'unit_count',
+                       'invalid_entries'}
+
+    def test_envelope(self):
+        self.feed()
+        status, body = self.get('/api/fleet')
+        self.assertEqual(status, 200)
+        data = json.loads(body)
+        self.assertEqual(set(data), {'host', 'mode', 'generated_at', 'fetch', 'units', 'peers'})
+        self.assertEqual(set(data['fetch']), {'timeout_seconds', 'max_bytes', 'cadence_seconds'})
+        self.assertEqual(data['fetch']['timeout_seconds'], roundhouse.FETCH_TIMEOUT_SEC)
+        self.assertEqual(data['fetch']['max_bytes'], roundhouse.FETCH_MAX_BYTES)
+
+    def test_local_rows_are_keep_listed_first_and_never_stale(self):
+        self.feed()
+        _, body = self.get('/api/fleet')
+        data = json.loads(body)
+        local = [u for u in data['units'] if u['source'] == data['host']]
+        self.assertTrue(data['units'][:len(local)] == local, 'local units are not first')
+        for row in local:
+            self.assertLessEqual(set(row) - {'port_conflict'}, self.LOCAL_KEYS,
+                                 f'unexpected key on a local row: {set(row)}')
+            self.assertIs(row['stale'], False)
+
+    def test_peer_rows_are_keep_listed_and_tagged_with_their_source(self):
+        self.feed()
+        _, body = self.get('/api/fleet')
+        peer_rows = [u for u in json.loads(body)['units'] if u['source'] == 'ampere']
+        self.assertEqual(len(peer_rows), 1)
+        self.assertNotIn('description', peer_rows[0],
+                         'a peer key outside the keep-list reached the roster')
+        self.assertNotIn('sensed_at', peer_rows[0])
+        self.assertIs(peer_rows[0]['stale'], False)
+
+    def test_a_null_port_conflict_is_omitted_on_every_row(self):
+        """K6: I5's rule verbatim — port_conflict only when non-null."""
+        self.feed()
+        _, body = self.get('/api/fleet')
+        rows = json.loads(body)['units']
+        for row in rows:
+            if 'port_conflict' in row:
+                self.assertTrue(row['port_conflict'], row)   # present only when real
+        clean = [r for r in rows if 'port_conflict' not in r]
+        self.assertTrue(clean, 'every row carried a port_conflict key')
+
+    def test_peer_block(self):
+        self.feed()
+        _, body = self.get('/api/fleet')
+        peer = json.loads(body)['peers'][0]
+        self.assertEqual(set(peer), self.PEER_BLOCK_KEYS)
+        self.assertEqual(peer['kind'], 'roundhouse')
+        self.assertEqual(peer['url'], 'https://ampere.fritz.box:8099')
+        self.assertEqual(peer['mode'], 'read-only')
+        self.assertEqual(peer['fed_state'], 'fresh')
+        self.assertEqual(peer['unit_count'], 1)
+        self.assertEqual(peer['invalid_entries'], 0)
+
+    def test_retained_rows_serve_while_stale(self):
+        """K4 retention: the roster keeps the last-known units and marks them."""
+        self.feed(state='stale', up=False)
+        _, body = self.get('/api/fleet')
+        data = json.loads(body)
+        peer_rows = [u for u in data['units'] if u['source'] == 'ampere']
+        self.assertEqual(len(peer_rows), 1)
+        self.assertIs(peer_rows[0]['stale'], True)
+        self.assertIs(data['peers'][0]['stale'], True)
+        self.assertEqual(data['peers'][0]['state'], 'down')
+        self.assertTrue(data['peers'][0]['reason'].startswith('down: '))
+        for row in [u for u in data['units'] if u['source'] == data['host']]:
+            self.assertIs(row['stale'], False, 'a local row went stale')
+
+    def test_untrusted_certificate_is_up_but_never_fresh(self):
+        """The contract's oddest row: reachable by TCP, not trustworthy over TLS."""
+        self.feed(state='never')
+        _, body = self.get('/api/fleet')
+        peer = json.loads(body)['peers'][0]
+        self.assertEqual(peer['state'], 'up')
+        self.assertEqual(peer['fed_state'], 'never')
+        self.assertIs(peer['stale'], True)
+        self.assertTrue(peer['reason'].startswith('tls: '))
+        self.assertEqual(peer['unit_count'], 0)
+
+    def test_post_is_405(self):
+        for path in ('/api/fleet', '/api/routing-config/fleet', '/api/routing-config/fleet.json'):
+            status, _ = self.post(path)
+            self.assertEqual(status, 405, path)
+
+    def test_route_is_unauthenticated(self):
+        roundhouse.TOKEN = 'a-token'
+        try:
+            status, _ = self.get('/api/fleet')
+        finally:
+            roundhouse.TOKEN = None
+        self.assertEqual(status, 200)
+
+
+class TestFleetRosterWithoutFleetPeers(unittest.TestCase):
+    """§6.1: the route always exists; with no fleet peers it is the local view."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.watcher = StubWatcher()
+        cls.event_bus = roundhouse.EventBus()
+        sock = socket.socket()
+        sock.bind(('127.0.0.1', 0))
+        cls.port = sock.getsockname()[1]
+        sock.close()
+        cls.server = roundhouse.ThreadingHTTPServer(
+            ('127.0.0.1', cls.port), roundhouse.RoundhouseRequestHandler,
+            cls.watcher, cls.event_bus, cls.port)
+        cls.thread = threading.Thread(target=cls.server.serve_forever, daemon=True)
+        cls.thread.start()
+        time.sleep(0.1)
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.server.shutdown()
+        cls.server.server_close()
+
+    def test_local_only(self):
+        conn = http.client.HTTPConnection('127.0.0.1', self.port, timeout=5)
+        conn.request('GET', '/api/fleet')
+        data = json.loads(conn.getresponse().read())
+        conn.close()
+        self.assertEqual(data['peers'], [])
+        self.assertTrue(data['units'])
+        self.assertTrue(all(u['source'] == data['host'] and u['stale'] is False
+                            for u in data['units']))
+
+    def test_fleet_fragment_equals_the_local_view(self):
+        conn = http.client.HTTPConnection('127.0.0.1', self.port, timeout=5)
+        conn.request('GET', '/api/routing-config/fleet.json')
+        fleet = json.loads(conn.getresponse().read())
+        conn.close()
+        conn = http.client.HTTPConnection('127.0.0.1', self.port, timeout=5)
+        conn.request('GET', '/api/routing-config.json')
+        local = json.loads(conn.getresponse().read())
+        conn.close()
+        self.assertEqual(fleet['model_list'], local['model_list'])
+        self.assertEqual(fleet['excluded'], [])
+        self.assertEqual(fleet['conflicts'], [])
+
+
+class TestFedSSEEvents(_FleetSurfaceHarness):
+    """§4.2/§6.3: a fed transition publishes exactly one `peer` event; a repeat
+    success publishes none. Flat-lining peers stay silent, of either kind."""
+
+    def _subscribe(self):
+        q = self.event_bus.subscribe()
+        return q
+
+    def test_never_to_fresh_fires_once_then_goes_quiet(self):
+        self.clear()
+        q = self.event_bus.subscribe()
+        try:
+            with self.watcher_lock:
+                self.peer_watch.peers['ampere']['state'] = 'up'
+                first = self.peer_watch.apply_fetch_unlocked(
+                    'ampere', True, {'mode': 'read-only', 'units': []},
+                    {'model_list': []}, None, 1_755_159_990.0)
+                second = self.peer_watch.apply_fetch_unlocked(
+                    'ampere', True, {'mode': 'read-only', 'units': []},
+                    {'model_list': []}, None, 1_755_159_995.0)
+        finally:
+            self.event_bus.unsubscribe(q)
+        self.assertIsNotNone(first)
+        self.assertEqual(first['fed_prev'], 'never')
+        self.assertEqual(first['fed']['state'], 'fresh')
+        self.assertIsNone(second, 'a repeated success must not publish')
+
+    def test_fresh_to_stale_fires_with_the_reason(self):
+        self.clear()
+        with self.watcher_lock:
+            self.peer_watch.peers['ampere']['state'] = 'up'
+            self.peer_watch.apply_fetch_unlocked(
+                'ampere', True, {'mode': 'read-only', 'units': []},
+                {'model_list': []}, None, 1_755_159_990.0)
+            payload = self.peer_watch.apply_fetch_unlocked(
+                'ampere', False, None, None, 'tls: SSLCertVerificationError',
+                1_755_159_995.0)
+        self.assertIsNotNone(payload)
+        self.assertEqual(payload['fed_prev'], 'fresh')
+        self.assertEqual(payload['fed']['state'], 'stale')
+        self.assertTrue(payload['fed']['reason'].startswith('tls: '))
+        self.assertEqual(payload['kind'], 'roundhouse')
+
+
+class TestFetchLockDiscipline(unittest.TestCase):
+    """Risk #1: no fetch — and no _fetch_peer call of any kind — while a lock is held."""
+
+    def setUp(self):
+        self.lock = threading.Lock()
+        self.free_during_fetch = []
+        self.pw = roundhouse.PeerWatch(
+            {'bee': ('127.0.0.1', 9)}, self.lock, roundhouse.EventBus(),
+            fleet={'bee': 'http://127.0.0.1:9'}, now=lambda: 1000.0)
+
+    def _opener(self, payloads):
+        """An opener that checks the lock is FREE at the moment of the request."""
+        test = self
+
+        class _Resp:
+            def __init__(self, body):
+                self._body = body
+
+            def read(self, n=-1):
+                return self._body
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+        class _Opener:
+            def __init__(self):
+                self.calls = []
+
+            def open(self, url, timeout=None):
+                acquired = test.lock.acquire(blocking=False)
+                test.free_during_fetch.append(acquired)
+                if acquired:
+                    test.lock.release()
+                self.calls.append(url)
+                return _Resp(json.dumps(payloads[len(self.calls) - 1]).encode())
+
+        return _Opener()
+
+    def test_the_watcher_lock_is_free_while_the_round_fetches(self):
+        opener = self._opener([{'mode': 'read-only', 'units': []}, {'model_list': []}])
+        real_fetch = roundhouse._fetch_peer
+
+        def fetch(pw, name, path, _opener=None):
+            return real_fetch(pw, name, path, opener=opener)
+
+        with patch.object(roundhouse, '_probe_peer', lambda pw, name, connect=None: (True, None)), \
+             patch.object(roundhouse, '_fetch_peer', fetch):
+            roundhouse.peer_watch_round(self.pw)
+
+        self.assertEqual(self.free_during_fetch, [True, True],
+                         'a lock was held across a federated fetch')
+        self.assertEqual(opener.calls,
+                         ['http://127.0.0.1:9/api/units',
+                          'http://127.0.0.1:9/api/routing-config.json'])
+        self.assertEqual(self.pw.fed['bee']['state'], 'fresh')
+
+    def test_the_second_document_is_skipped_when_the_first_fails(self):
+        calls = []
+
+        def fetch(pw, name, path, opener=None):
+            calls.append(path)
+            return (False, None, 'connect: refused')
+
+        with patch.object(roundhouse, '_probe_peer', lambda pw, name, connect=None: (True, None)), \
+             patch.object(roundhouse, '_fetch_peer', fetch):
+            roundhouse.peer_watch_round(self.pw)
+
+        self.assertEqual(calls, ['/api/units'])
+        self.assertEqual(self.pw.fed['bee']['reason'], 'connect: refused')
+
+    def test_a_peer_that_is_not_up_is_never_fetched(self):
+        calls = []
+
+        def fetch(pw, name, path, opener=None):
+            calls.append(path)
+            return (True, {}, None)
+
+        with patch.object(roundhouse, '_probe_peer',
+                          lambda pw, name, connect=None: (False, 'refused')), \
+             patch.object(roundhouse, '_fetch_peer', fetch):
+            roundhouse.peer_watch_round(self.pw)
+        self.assertEqual(calls, [])
+
+
+class TestHangingPeerCostsOnlyItsTimeout(unittest.TestCase):
+    """MVP8 acceptance, measured as MVP7 measured it: a fleet peer that accepts and
+    never answers must cost only its own timeout — the 3 s tick, the API and the
+    operation slot live on other threads and are provably unaffected."""
+
+    def test_api_latency_is_unaffected_while_a_fetch_hangs(self):
+        listener = socket.socket()
+        listener.bind(('127.0.0.1', 0))
+        listener.listen(4)
+        hang_port = listener.getsockname()[1]
+
+        watcher = StubWatcher()
+        bus = roundhouse.EventBus()
+        lock = threading.Lock()
+        pw = roundhouse.PeerWatch({'hang': ('127.0.0.1', hang_port)}, lock, bus,
+                                  fleet={'hang': f'http://127.0.0.1:{hang_port}'})
+
+        sock = socket.socket()
+        sock.bind(('127.0.0.1', 0))
+        port = sock.getsockname()[1]
+        sock.close()
+        server = roundhouse.ThreadingHTTPServer(
+            ('127.0.0.1', port), roundhouse.RoundhouseRequestHandler,
+            watcher, bus, port, watcher_lock=lock, peer_watch=pw, peer_interval=5)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        time.sleep(0.1)
+
+        round_done = threading.Event()
+        started = time.monotonic()
+        rounder = threading.Thread(
+            target=lambda: (roundhouse.peer_watch_round(pw), round_done.set()),
+            daemon=True)
+        rounder.start()
+        time.sleep(0.3)                       # the fetch is now blocked on the listener
+
+        try:
+            latencies = []
+            for _ in range(5):
+                t0 = time.monotonic()
+                conn = http.client.HTTPConnection('127.0.0.1', port, timeout=5)
+                conn.request('GET', '/api/units')
+                self.assertEqual(conn.getresponse().status, 200)
+                conn.close()
+                latencies.append(time.monotonic() - t0)
+            self.assertFalse(round_done.is_set(), 'the fetch did not actually hang')
+            self.assertLess(max(latencies), 1.0,
+                            f'API latency degraded while a peer hung: {latencies}')
+
+            round_done.wait(timeout=roundhouse.FETCH_TIMEOUT_SEC * 3)
+            self.assertTrue(round_done.is_set(), 'the round never gave up on the peer')
+            elapsed = time.monotonic() - started
+            self.assertLess(elapsed, roundhouse.FETCH_TIMEOUT_SEC * 2 + 2,
+                            f'the hang cost more than its own timeout: {elapsed:.1f}s')
+            self.assertTrue(pw.fed['hang']['reason'].startswith(('timeout:', 'connect:')),
+                            pw.fed['hang']['reason'])
+        finally:
+            server.shutdown()
+            server.server_close()
+            listener.close()
 
 
 if __name__ == '__main__':
