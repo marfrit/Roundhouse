@@ -29,6 +29,9 @@ import threading
 import queue
 import http.server
 import urllib.parse
+import urllib.request
+import urllib.error
+import ssl
 import subprocess
 import signal
 import hmac
@@ -3470,12 +3473,19 @@ class ThreadingHTTPServer(http.server.ThreadingHTTPServer):
             return snapshot
 
 
-# ===== SECTION F: PEER WATCH + LISTEN LIST (sensing only: the ONE outbound-connect site is _probe_peer; no data on the wire, no subprocess, no writes, no actuation) =====
+# ===== SECTION F: PEER WATCH + LISTEN LIST (sensing only: the ONE outbound-connect site is _probe_peer for TCP, _fetch_peer is the ONE federated-HTTP site; no data on the wire, no subprocess, no writes, no actuation) =====
 
 # Constants (§4.3, J6)
 PEER_TIMEOUT_SEC = 2.0
 PEER_INTERVAL_SEC = 60
 PEER_MAX = 8
+
+# Fleet federation constants (K1-K3)
+FLEET_PEER_MAX = 4
+FETCH_TIMEOUT_SEC = 4.0
+FETCH_MAX_BYTES = 4 * 1024 * 1024
+FLEET_PATHS = ('/api/units', '/api/routing-config.json')
+FLEET_UNIT_KEEP = ('unit', 'rung', 'port', 'alias', 'enabled', 'on_demand', 'retired', 'strategy_note', 'badges', 'port_conflict')
 
 # The contract's Part 2.5 statement, made machine-visible on /api/peers (§5.1). Frozen.
 PEER_MEANS = ('reachable, not healthy: a TCP connect proves something is listening '
@@ -3664,6 +3674,125 @@ def parse_peer_decls(values: Optional[List[str]]) -> tuple[dict[str, tuple[str, 
     return peers, errors
 
 
+def parse_fleet_peer_decls(values: Optional[List[str]]) -> tuple[dict[str, tuple[str, int, str]], List[str]]:
+    """Parse --fleet-peer NAME=URL declarations per §3.1, K1.
+
+    Returns: ({name: (host, port, normalized_url)}, [errors, ...])
+    Errors collected; caller exits with all listed (§3.1, J3).
+    """
+    if values is None:
+        return {}, []
+
+    errors = []
+    fleet = {}
+    seen_names = set()
+
+    for val in values:
+        # Split on first '='
+        if '=' not in val:
+            errors.append(f"malformed --fleet-peer '{val}': expected NAME=URL")
+            continue
+
+        name, url_str = val.split('=', 1)
+
+        # Validate name per §4.1 (same as --peer)
+        if not name:
+            errors.append(f"malformed --fleet-peer '{val}': NAME is empty")
+            continue
+        if not re.match(r'^[A-Za-z0-9][A-Za-z0-9._-]{0,31}$', name):
+            errors.append(f"malformed --fleet-peer '{val}': NAME '{name}' does not match ^[A-Za-z0-9][A-Za-z0-9._-]{{0,31}}$")
+            continue
+        if name in seen_names:
+            errors.append(f"duplicate fleet peer name: '{name}'")
+            continue
+        seen_names.add(name)
+
+        # Parse URL per K1: scheme, host, optional port; no path, query, fragment, credentials
+        try:
+            parsed = urllib.parse.urlsplit(url_str)
+        except ValueError as e:
+            errors.append(f"malformed --fleet-peer '{val}': {e}")
+            continue
+
+        # Validate scheme
+        if parsed.scheme not in ('http', 'https'):
+            errors.append(f"malformed --fleet-peer '{val}': URL scheme must be http or https")
+            continue
+
+        # Validate hostname (non-empty)
+        if not parsed.hostname:
+            errors.append(f"malformed --fleet-peer '{val}': URL must have a hostname")
+            continue
+
+        # Validate no path, query, fragment, credentials
+        if parsed.path and parsed.path != '/':
+            errors.append(f"malformed --fleet-peer '{val}': URL must not carry a path, query, fragment, or credentials — declare the instance root (scheme://host[:port])")
+            continue
+        if parsed.query:
+            errors.append(f"malformed --fleet-peer '{val}': URL must not carry a path, query, fragment, or credentials — declare the instance root (scheme://host[:port])")
+            continue
+        if parsed.fragment:
+            errors.append(f"malformed --fleet-peer '{val}': URL must not carry a path, query, fragment, or credentials — declare the instance root (scheme://host[:port])")
+            continue
+        if parsed.username or parsed.password:
+            errors.append(f"malformed --fleet-peer '{val}': URL must not carry a path, query, fragment, or credentials — declare the instance root (scheme://host[:port])")
+            continue
+
+        # Get port with defaults
+        if parsed.port:
+            port = parsed.port
+        else:
+            port = 443 if parsed.scheme == 'https' else 80
+
+        # Normalize host display (bracket IPv6)
+        host = parsed.hostname
+        try:
+            # Try to parse as IP to check if it's IPv6
+            ip_obj = ipaddress.ip_address(host)
+            if isinstance(ip_obj, ipaddress.IPv6Address):
+                host_display = f'[{host}]'
+            else:
+                host_display = host
+        except ValueError:
+            # Not an IP literal (hostname)
+            host_display = host
+
+        # Build normalized URL
+        normalized_url = f'{parsed.scheme}://{host_display}:{port}'
+
+        fleet[name] = (host, port, normalized_url)
+
+    # Check cap (K1)
+    if len(fleet) > FLEET_PEER_MAX:
+        errors.append(f"too many fleet peers ({len(fleet)} > {FLEET_PEER_MAX}): two fetches per peer per round must finish well inside the 60 s cadence")
+
+    return fleet, errors
+
+
+def validate_peer_sets(tcp: dict, fleet: dict) -> List[str]:
+    """Validate cross-flag peer configuration per §3.2, K1.
+
+    Returns: [errors, ...]
+    """
+    errors = []
+
+    # Check for shared namespace
+    tcp_names = set(tcp.keys())
+    fleet_names = set(fleet.keys())
+    duplicates = tcp_names & fleet_names
+
+    if duplicates:
+        for name in sorted(duplicates):
+            errors.append(f"'{name}' is declared as both --peer and --fleet-peer — one watch row per name; a fleet peer is reachability-watched already")
+
+    # Check combined cap
+    combined_count = len(tcp) + len(fleet)
+    if combined_count > PEER_MAX:
+        errors.append(f"too many peers ({combined_count} > {PEER_MAX}): {len(tcp)} TCP + {len(fleet)} fleet; combined probe round must finish well inside 60 s cadence")
+
+    return errors
+
+
 def local_host_forms(nodename: str, advertise_host: str, bind_addrs: List[str]) -> set[str]:
     """Build the set of LOCAL_FORMS per §6.3.
 
@@ -3793,23 +3922,82 @@ def validate_peers(peers: dict[str, tuple[str, int]], units: dict,
     return errors
 
 
+def validate_peer_entry(entry) -> bool:
+    """Validate a peer routing entry per §5.1.
+
+    Valid iff: dict with model_name (non-empty str); all top-level values are
+    scalars (str|int|float|bool) or depth-≤2 dicts with scalar values.
+    Returns: True if valid, False otherwise.
+    """
+    if not isinstance(entry, dict):
+        return False
+
+    # Must have model_name as non-empty str
+    model_name = entry.get('model_name')
+    if not isinstance(model_name, str) or not model_name:
+        return False
+
+    # Check all values: scalars or depth-≤2 dicts with scalar values
+    for key, value in entry.items():
+        if value is None:
+            return False
+        if isinstance(value, (str, int, float, bool)):
+            continue
+        if isinstance(value, dict):
+            # All values in nested dict must be scalars
+            for nested_val in value.values():
+                if not isinstance(nested_val, (str, int, float, bool)) or nested_val is None:
+                    return False
+        else:
+            # List, tuple, or other type
+            return False
+
+    return True
+
+
+def _fed_unit_row(unit_dict: dict) -> dict:
+    """Keep-list a fetched unit row per FLEET_UNIT_KEEP (K6)."""
+    return {k: unit_dict[k] for k in FLEET_UNIT_KEEP if k in unit_dict}
+
+
+class FedRows:
+    """Container for federated peer data, keyed by peer name."""
+    def __init__(self, data=None):
+        self._data = data or {}
+
+    def __getitem__(self, name):
+        return self._data[name]
+
+    def __contains__(self, name):
+        return name in self._data
+
+    def items(self):
+        return self._data.items()
+
+    def keys(self):
+        return self._data.keys()
+
+
 class PeerWatch:
     """Peer reachability watch: state machine per §4.3 with lock discipline per §4.4.
 
     - declared: {name: (host, port)}, never mutated after init
+    - fleet: {name: url}, subset of declared that are fleet peers (never mutated after init)
     - peers: {name: state_dict}, mutations guarded by lock
+    - fed: {name: fed_state_dict}, federated data per fleet peer, mutations guarded by lock
     - lock: watcher.lock (shared, non-reentrant)
     - now: injected clock for testing
     """
 
     def __init__(self, declared: dict[str, tuple[str, int]], lock, event_bus,
-                 now=None):
+                 fleet=None, now=None):
         self.declared = dict(declared)  # Snapshot declared peers at startup
+        self.fleet = dict(fleet) if fleet else {}  # Fleet peers (subset of declared)
         self.lock = lock
         self.event_bus = event_bus
         self.now = now or time.time
 
-        # Initialize state: all peers start unknown
+        # Initialize reachability state: all peers start unknown
         self.peers = {name: {
             'state': 'unknown',
             'since': self.now(),
@@ -3817,6 +4005,18 @@ class PeerWatch:
             'consecutive_failures': 0,
             'last_error': None
         } for name in declared}
+
+        # Initialize federated state: fleet peers only
+        self.fed = {name: {
+            'state': 'never',
+            'mode': None,
+            'units': [],
+            'entries': [],
+            'invalid_entries': 0,
+            'fetched_at': None,
+            'attempted_at': None,
+            'reason': None
+        } for name in (fleet or {})}
 
     def apply_result_unlocked(self, name: str, ok: bool, error: Optional[str],
                               ts: float) -> Optional[dict]:
@@ -3874,6 +4074,14 @@ class PeerWatch:
                     # up + 2nd failure → down, emit event
                     peer['state'] = 'down'
                     peer['since'] = ts
+
+                    # If fleet peer, mark fed data stale on up→down
+                    if name in self.fleet and name in self.fed:
+                        fed = self.fed[name]
+                        if fed['state'] != 'stale':
+                            fed['state'] = 'stale'
+                            fed['reason'] = f'down: peer unreachable (tcp probe failed)'
+
                     return self._event_payload(name, old_state)
             elif old_state == 'down':
                 # down + any failure → down, no event
@@ -3885,7 +4093,7 @@ class PeerWatch:
         """Build SSE peer event payload per §5.3."""
         peer = self.peers[name]
         host, port = self.declared[name]
-        return {
+        payload = {
             'name': name,
             'host': host,
             'port': port,
@@ -3894,19 +4102,35 @@ class PeerWatch:
             'last_probe': peer['last_probe'],
             'consecutive_failures': peer['consecutive_failures'],
             'last_error': peer['last_error'],
-            'prev_state': prev_state
+            'prev_state': prev_state,
+            'kind': 'roundhouse' if name in self.fleet else 'tcp'
         }
+
+        # Add fed data for fleet peers
+        if name in self.fleet:
+            fed = self.fed[name]
+            payload['fed'] = {
+                'state': fed['state'],
+                'stale': fed['state'] != 'fresh',
+                'reason': fed['reason'],
+                'fetched_at': fed['fetched_at'],
+                'unit_count': len(fed['units'])
+            }
+            payload['fed_prev'] = fed['state']
+
+        return payload
 
     def rows_unlocked(self) -> List[dict]:
         """Snapshot of peer rows per §5 shape, sorted by name. CALLER HOLDS self.lock.
 
         Used in take_snapshot; lock is non-reentrant, acquiring here would deadlock.
+        Adds 'kind' ('tcp'|'roundhouse') and for fleet peers adds 'fed' with fed state summary.
         """
         rows = []
         for name in sorted(self.peers.keys()):
             peer = self.peers[name]
             host, port = self.declared[name]
-            rows.append({
+            row = {
                 'name': name,
                 'host': host,
                 'port': port,
@@ -3914,9 +4138,152 @@ class PeerWatch:
                 'since': peer['since'],
                 'last_probe': peer['last_probe'],
                 'consecutive_failures': peer['consecutive_failures'],
-                'last_error': peer['last_error']
-            })
+                'last_error': peer['last_error'],
+                'kind': 'roundhouse' if name in self.fleet else 'tcp'
+            }
+
+            # Add fed data for fleet peers
+            if name in self.fleet:
+                fed = self.fed[name]
+                row['fed'] = {
+                    'state': fed['state'],
+                    'stale': fed['state'] != 'fresh',
+                    'reason': fed['reason'],
+                    'fetched_at': fed['fetched_at'],
+                    'unit_count': len(fed['units'])
+                }
+
+            rows.append(row)
         return rows
+
+    def apply_fetch_unlocked(self, name: str, ok: bool, units_doc: Optional[dict],
+                             routing_doc: Optional[dict], error: Optional[str],
+                             ts: float) -> Optional[dict]:
+        """Apply fetch result to federated state per §4.2. CALLER HOLDS self.lock.
+
+        Returns SSE payload on state transition, else None.
+        """
+        if name not in self.fed:
+            return None
+
+        fed = self.fed[name]
+        old_state = fed['state']
+        fed['attempted_at'] = ts
+
+        if ok:
+            # Validate document shapes
+            if not isinstance(units_doc, dict) or 'units' not in units_doc or not isinstance(units_doc['units'], list):
+                return self._apply_fetch_failure(name, f'body: invalid units doc shape', old_state, ts)
+            if 'mode' not in units_doc or not isinstance(units_doc['mode'], str):
+                return self._apply_fetch_failure(name, f'body: invalid mode in units doc', old_state, ts)
+            if not isinstance(routing_doc, dict) or 'model_list' not in routing_doc or not isinstance(routing_doc['model_list'], list):
+                return self._apply_fetch_failure(name, f'body: invalid routing doc shape', old_state, ts)
+
+            # Keep-list units
+            kept_units = []
+            for unit_dict in units_doc['units']:
+                kept_units.append(_fed_unit_row(unit_dict))
+
+            # Validate and keep-list entries
+            entries = []
+            invalid_count = 0
+            for entry_dict in routing_doc['model_list']:
+                if validate_peer_entry(entry_dict):
+                    entries.append(entry_dict)
+                else:
+                    invalid_count += 1
+
+            # Sort entries by model_name
+            entries.sort(key=lambda e: e.get('model_name', ''))
+
+            # Apply changes atomically
+            fed['mode'] = units_doc['mode']
+            fed['units'] = kept_units
+            fed['entries'] = entries
+            fed['invalid_entries'] = invalid_count
+            fed['fetched_at'] = ts
+            fed['reason'] = None
+
+            # State transitions
+            if old_state == 'never':
+                fed['state'] = 'fresh'
+                return self._fed_event_payload(name, old_state)
+            elif old_state == 'fresh':
+                # fresh → fresh, no event
+                return None
+            elif old_state == 'stale':
+                fed['state'] = 'fresh'
+                return self._fed_event_payload(name, old_state)
+
+        else:
+            # Failure
+            fed['attempted_at'] = ts
+
+            if old_state == 'never':
+                # never + failure; emit only if first time seeing error (prev_reason was None)
+                prev_reason = fed['reason']
+                fed['reason'] = error
+                if prev_reason is None:
+                    return self._fed_event_payload(name, old_state)
+                return None
+            elif old_state == 'fresh':
+                fed['state'] = 'stale'
+                fed['reason'] = error
+                return self._fed_event_payload(name, old_state)
+            elif old_state == 'stale':
+                # stale + failure → stale, no event (just update reason)
+                fed['reason'] = error
+                return None
+
+        return None
+
+    def _apply_fetch_failure(self, name: str, reason: str, old_state: str, ts: float) -> Optional[dict]:
+        """Helper to apply a fetch failure."""
+        fed = self.fed[name]
+        fed['reason'] = reason
+        fed['attempted_at'] = ts
+
+        if old_state == 'never':
+            # Emit only on first time seeing an error
+            return self._fed_event_payload(name, old_state)
+        elif old_state == 'fresh':
+            fed['state'] = 'stale'
+            return self._fed_event_payload(name, old_state)
+
+        return None
+
+    def _fed_event_payload(self, name: str, prev_state: str) -> dict:
+        """Build SSE peer event payload for fed transitions."""
+        peer = self.peers[name]
+        fed = self.fed[name]
+        host, port = self.declared[name]
+
+        return {
+            'name': name,
+            'host': host,
+            'port': port,
+            'state': peer['state'],
+            'since': peer['since'],
+            'last_probe': peer['last_probe'],
+            'last_error': peer['last_error'],
+            'prev_state': prev_state,
+            'kind': 'roundhouse',
+            'fed': {
+                'state': fed['state'],
+                'stale': fed['state'] != 'fresh',
+                'reason': fed['reason'],
+                'fetched_at': fed['fetched_at'],
+                'unit_count': len(fed['units'])
+            },
+            'fed_prev': prev_state
+        }
+
+    def fed_rows_unlocked(self) -> FedRows:
+        """Return fed rows for fed peers. CALLER HOLDS self.lock."""
+        rows = {}
+        for name in sorted(self.fleet.keys()):
+            rows[name] = self.fed[name]
+        return FedRows(rows)
 
 
 def _probe_peer(peer_watch: PeerWatch, name: str,
@@ -3935,8 +4302,55 @@ def _probe_peer(peer_watch: PeerWatch, name: str,
         return (False, f'{type(e).__name__}: {e}'[:200])
 
 
+class _FleetNoRedirect(urllib.request.HTTPRedirectHandler):
+    """K2: a redirect is data, never followed — returning None makes 3xx raise HTTPError."""
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+def _fetch_peer(peer_watch: PeerWatch, name: str, path: str, opener=None) -> tuple[bool, Optional[dict], Optional[str]]:
+    """THE one federated-HTTP call site (AST-guarded, §8). Base URL comes only from
+    the startup-frozen fleet table; path only from FLEET_PATHS — unrepresentable
+    otherwise (K9). Returns (ok, payload_dict_or_None, error_str_or_None); error
+    strings carry a frozen class prefix: tls:/http:/timeout:/connect:/body:."""
+    assert path in FLEET_PATHS
+    url = peer_watch.fleet[name] + path          # KeyError = programming error, loudly
+    if opener is None:                            # test seam, same shape as _probe_peer's
+        ctx = ssl.create_default_context()        # system trust store; NEVER weakened (K2/§8)
+        opener = urllib.request.build_opener(
+            urllib.request.HTTPSHandler(context=ctx), _FleetNoRedirect())
+    try:
+        with opener.open(url, timeout=FETCH_TIMEOUT_SEC) as resp:
+            body = resp.read(FETCH_MAX_BYTES + 1)
+    except urllib.error.HTTPError as e:           # before URLError — HTTPError subclasses it (recon 8)
+        return (False, None, f'http: {e.code}')
+    except urllib.error.URLError as e:
+        r = getattr(e, 'reason', e)
+        if isinstance(r, ssl.SSLError):
+            return (False, None, f'tls: {type(r).__name__}: {r}'[:200])
+        if isinstance(r, (TimeoutError, socket.timeout)):
+            return (False, None, f'timeout: {r}'[:200])
+        return (False, None, f'connect: {type(r).__name__}: {r}'[:200])
+    except ssl.SSLError as e:                     # a bare SSLError can escape mid-read
+        return (False, None, f'tls: {type(e).__name__}: {e}'[:200])
+    except (TimeoutError, socket.timeout) as e:
+        return (False, None, f'timeout: {e}'[:200])
+    except Exception as e:
+        return (False, None, f'connect: {type(e).__name__}: {e}'[:200])
+    if len(body) > FETCH_MAX_BYTES:
+        return (False, None, f'body: oversized (> {FETCH_MAX_BYTES} bytes)')
+    try:
+        payload = json.loads(body.decode('utf-8'))
+    except Exception as e:
+        return (False, None, f'body: invalid JSON: {type(e).__name__}'[:200])
+    if not isinstance(payload, dict):
+        return (False, None, 'body: not a JSON object')
+    return (True, payload, None)
+
+
 def peer_watch_round(peer_watch: PeerWatch) -> None:
-    """Run one round of peer probing. §4.4 pattern: probe outside lock, apply inside.
+    """Run one round of peer probing and fetching. §4.4/K3 pattern: probe outside lock,
+    apply inside; fetch outside lock if peer is up and is a fleet peer.
 
     Probe order = declaration order; transitions published immediately.
     """
@@ -3947,8 +4361,25 @@ def peer_watch_round(peer_watch: PeerWatch) -> None:
         # Apply result with lock held for dict mutation only
         with peer_watch.lock:
             payload = peer_watch.apply_result_unlocked(name, ok, error, peer_watch.now())
+            state_now = peer_watch.peers[name]['state']
             if payload:
                 peer_watch.event_bus.publish('peer', payload)
+
+        # Fetch fleet peer data if it's a fleet peer and is up (per K3, outside lock)
+        if name in peer_watch.fleet and state_now == 'up':
+            # Fetch /api/units
+            ok_u, units_doc, err = _fetch_peer(peer_watch, name, '/api/units')
+            # Fetch /api/routing-config.json only if /api/units succeeded
+            ok_r, routing_doc, err_r = (_fetch_peer(peer_watch, name, '/api/routing-config.json')
+                                        if ok_u else (False, None, err))
+
+            # Apply fetch result under lock
+            with peer_watch.lock:
+                fed_payload = peer_watch.apply_fetch_unlocked(
+                    name, ok_u and ok_r, units_doc, routing_doc, err if not ok_u else err_r,
+                    peer_watch.now())
+                if fed_payload:
+                    peer_watch.event_bus.publish('peer', fed_payload)
 
 
 # ===== SECTION E: ACTUATION (armed only by --actuate; run_actuate + run_git are the only mutation gateways) =====
@@ -6780,6 +7211,183 @@ def _yaml_scalar(value):
     return _yaml_str(str(value))
 
 
+def build_fleet_merge(local_entries: List[Dict], local_host: str, fed_rows: FedRows) -> Dict:
+    """Build the fleet merge per §5.2, K5.
+
+    Merge order: local first, then peers by name. Conflicts: first-wins.
+    Returns: {'model_list': [...], 'contributors': [...], 'excluded': [...], 'conflicts': [...]}
+    """
+    seen_model_names = {}  # model_name -> (source, entry_index)
+    merged_entries = []
+    contributors = [{'name': local_host, 'source': 'local'}]
+    excluded = []
+    conflicts = []
+
+    # Add local entries first
+    for entry in local_entries:
+        model_name = entry.get('model_name')
+        if model_name in seen_model_names:
+            # Local-local conflict (shouldn't happen but apply rule)
+            kept_source, kept_idx = seen_model_names[model_name]
+            conflicts.append({
+                'model_name': model_name,
+                'kept_source': kept_source,
+                'dropped_source': local_host
+            })
+        else:
+            seen_model_names[model_name] = (local_host, len(merged_entries))
+            merged_entries.append(entry)
+
+    # Add peer entries
+    for peer_name in sorted(fed_rows.keys()):
+        fed = fed_rows[peer_name]
+
+        # Skip peers that are not up and fresh
+        if fed['state'] != 'fresh':
+            excluded.append({
+                'name': peer_name,
+                'state': 'unknown',  # Will be filled by the caller with reachability state
+                'fed_state': fed['state'],
+                'reason': fed.get('reason')
+            })
+            continue
+
+        # Add peer entries
+        for entry in fed['entries']:
+            model_name = entry.get('model_name')
+            if model_name in seen_model_names:
+                # Peer-peer or local-peer conflict: first wins
+                kept_source, kept_idx = seen_model_names[model_name]
+                conflicts.append({
+                    'model_name': model_name,
+                    'kept_source': kept_source,
+                    'dropped_source': peer_name
+                })
+            else:
+                seen_model_names[model_name] = (peer_name, len(merged_entries))
+                merged_entries.append(entry)
+
+        # Add peer to contributors
+        fetched_at = fed.get('fetched_at')
+        contributor = {'name': peer_name, 'fetched_at': fetched_at}
+        contributors.append(contributor)
+
+    return {
+        'model_list': merged_entries,
+        'contributors': contributors,
+        'excluded': excluded,
+        'conflicts': conflicts
+    }
+
+
+def _emit_entry(entry: Dict) -> List[str]:
+    """Emit a single routing entry as YAML lines per §5.3.
+
+    Walk order: model_name, litellm_params, model_info, then remaining keys sorted.
+    """
+    lines = []
+
+    # model_name (always first)
+    if 'model_name' in entry:
+        lines.append('  - model_name: ' + _yaml_scalar(entry['model_name']))
+
+    # litellm_params dict
+    if 'litellm_params' in entry:
+        lp = entry['litellm_params']
+        lines.append('    litellm_params:')
+        for key in ['model', 'api_base', 'api_key']:
+            if key in lp:
+                # Validate key matches safe pattern
+                if not re.match(r'[A-Za-z0-9_]+', key):
+                    assert False, f"Invalid key in entry: {key}"
+                lines.append(f'      {key}: {_yaml_scalar(lp[key])}')
+
+    # model_info dict
+    if 'model_info' in entry:
+        mi = entry['model_info']
+        lines.append('    model_info:')
+        for key in ['unit', 'logical', 'host', 'rung', 'on_demand',
+                   'load_strategy', 'peak_bytes', 'peak_source', 'load_seconds']:
+            if key in mi:
+                lines.append(f'      {key}: {_yaml_scalar(mi[key])}')
+
+    # Remaining top-level keys (sorted) — version skew tolerance
+    for key in sorted(entry.keys()):
+        if key not in ('model_name', 'litellm_params', 'model_info'):
+            if not re.match(r'[A-Za-z0-9_]+', key):
+                assert False, f"Invalid key in entry: {key}"
+            value = entry[key]
+            if isinstance(value, dict):
+                # Skip nested dicts (already handled above or skipped)
+                continue
+            lines.append(f'    {key}: {_yaml_scalar(value)}')
+
+    return lines
+
+
+def emit_fleet_yaml(meta: Dict, merge: Dict) -> str:
+    """Emit a fleet routing config fragment in YAML per §5.3.
+
+    Args:
+        meta: dict with 'generated_by', 'generated_at'
+        merge: result of build_fleet_merge
+
+    Returns:
+        YAML string with header comments + model_list
+    """
+    lines = []
+
+    # Header comments (server-controlled strings only, no untrusted data)
+    lines.append(f"# generated-by: {meta.get('generated_by', 'unknown')}")
+    lines.append(f"# generated-at: {meta.get('generated_at', '?')}")
+
+    # Contributor comments
+    for contrib in merge.get('contributors', []):
+        source = contrib.get('source', '')
+        if source == 'local':
+            lines.append(f"# contributor: {contrib['name']} (local)")
+        else:
+            fetched_at = contrib.get('fetched_at')
+            if fetched_at:
+                ts = datetime.fromtimestamp(fetched_at, tz=timezone.utc).isoformat(timespec='seconds').replace('+00:00', 'Z')
+                lines.append(f"# contributor: {contrib['name']} (fetched {ts})")
+            else:
+                lines.append(f"# contributor: {contrib['name']}")
+
+    # Excluded comments
+    for excl in merge.get('excluded', []):
+        name = excl['name']
+        state = excl.get('state', '?')
+        fed_state = excl.get('fed_state', '?')
+        reason = excl.get('reason')
+        reason_class = reason.split(':')[0] if reason and ':' in reason else ''
+        if reason_class:
+            lines.append(f"# excluded: {name} ({state}, {fed_state}: {reason_class})")
+        else:
+            lines.append(f"# excluded: {name} ({state}, {fed_state})")
+
+    # Conflict comments
+    for conflict in merge.get('conflicts', []):
+        model_name = conflict['model_name']
+        kept = conflict['kept_source']
+        dropped = conflict['dropped_source']
+        lines.append(f"# conflict: model_name '{model_name}' also advertised by {dropped} — {dropped}'s entry dropped, {kept}'s kept")
+
+    # model_list key
+    lines.append('model_list:')
+
+    if not merge.get('model_list'):
+        # Empty list
+        return '\n'.join(lines) + '\n'
+
+    # Emit entries
+    for entry in merge['model_list']:
+        entry_lines = _emit_entry(entry)
+        lines.extend(entry_lines)
+
+    return '\n'.join(lines) + '\n'
+
+
 def emit_routing_yaml(meta: Dict, entries: List[Dict]) -> str:
     """Emit a routing config fragment in YAML per §3.2.
 
@@ -7102,6 +7710,8 @@ def main():
                         help='Bind address(es); repeatable and/or comma-separated; default 0.0.0.0')
     parser.add_argument('--peer', action='append', default=None,
                         help='Peer declaration NAME=HOST:PORT; repeatable, max 8')
+    parser.add_argument('--fleet-peer', action='append', default=None,
+                        help='Fleet peer declaration NAME=URL (http(s)://host[:port]); repeatable, max 4')
     parser.add_argument('--peer-interval', type=int, default=PEER_INTERVAL_SEC,
                         help=f'Peer probe cadence in seconds (default: {PEER_INTERVAL_SEC})')
 
@@ -7497,30 +8107,47 @@ def cmd_serve(args):
     journal_thread = threading.Thread(target=journal_with_backfill, daemon=True)
     journal_thread.start()
 
-    # Parse and validate --bind and --peer arguments (§3.1, §4.1)
+    # Parse and validate --bind, --peer, and --fleet-peer arguments (§3.1, §4.1, §3.1 K1)
     bind_list, bind_errors = parse_bind_list(args.bind)
     peer_decls, peer_errors = parse_peer_decls(args.peer)
+    fleet_decls, fleet_errors = parse_fleet_peer_decls(args.fleet_peer)
 
     # Collect all errors (J3: every parse/validation offense is reported before the exit)
-    all_errors = bind_errors + peer_errors + validate_peer_interval(args.peer_interval)
+    all_errors = bind_errors + peer_errors + fleet_errors + validate_peer_interval(args.peer_interval)
     if all_errors:
         for error in all_errors:
             print(error, file=sys.stderr)
         return 1
 
-    # Validate peer declarations (D2 rule, §6.3)
+    # Validate peer declarations (D2 rule, §6.3; K1 for fleet peers)
     advertise_host = args.advertise_host or os.uname()[1]
     nodename = os.uname()[1]
     bind_addrs = [addr for addr, _ in bind_list]
+
+    # D2: TCP peer validation
     peer_validation_errors = validate_peers(peer_decls, units, port, bind_addrs,
                                             advertise_host, nodename)
-    if peer_validation_errors:
-        for error in peer_validation_errors:
+
+    # K1: shared namespace and cap validation
+    peer_set_errors = validate_peer_sets(peer_decls, fleet_decls)
+
+    # D2: Fleet peer validation (endpoints derived from URLs)
+    fleet_endpoints = {name: (host, port) for name, (host, port, url) in fleet_decls.items()}
+    fleet_peer_validation_errors = validate_peers(fleet_endpoints, units, port, bind_addrs,
+                                                   advertise_host, nodename)
+
+    all_validation_errors = peer_validation_errors + peer_set_errors + fleet_peer_validation_errors
+    if all_validation_errors:
+        for error in all_validation_errors:
             print(error, file=sys.stderr)
         return 1
 
-    # Create PeerWatch (before servers, before threads — J6 construction order)
-    peer_watch = PeerWatch(peer_decls, watcher_lock, event_bus) if peer_decls else None
+    # Merge declared peers for PeerWatch (all TCP + fleet endpoints)
+    all_declared = {**peer_decls, **fleet_endpoints}
+    fleet_urls = {name: url for name, (host, port, url) in fleet_decls.items()}
+
+    # Create PeerWatch (before servers, before threads — J6 construction order, K1)
+    peer_watch = PeerWatch(all_declared, watcher_lock, event_bus, fleet=fleet_urls) if all_declared else None
 
     # Start HTTP servers (all-or-nothing multi-bind loop per §3.3, J1)
     try:

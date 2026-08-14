@@ -1677,7 +1677,7 @@ class TestPeersRoute(_PeersRouteHarness):
         for row in rows:
             self.assertEqual(set(row.keys()),
                              {'name', 'host', 'port', 'state', 'since',
-                              'last_probe', 'consecutive_failures', 'last_error'})
+                              'last_probe', 'consecutive_failures', 'last_error', 'kind'})
         self.assertEqual(rows[0]['host'], 'ampere.fritz.box')
         self.assertEqual(rows[0]['port'], 8099)
 
@@ -1870,7 +1870,7 @@ class TestPeerSSE(_PeersRouteHarness):
             self.assertEqual(payload['name'], 'solo')
             self.assertEqual(set(payload.keys()),
                              {'name', 'host', 'port', 'state', 'since', 'last_probe',
-                              'consecutive_failures', 'last_error', 'prev_state'})
+                              'consecutive_failures', 'last_error', 'prev_state', 'kind'})
 
             for _ in range(4):                               # four stable rounds
                 self.drive('solo', True)
