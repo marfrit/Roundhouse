@@ -4041,8 +4041,9 @@ class BindWatch:
         """
         desired = {}  # addr -> (family, decl_idx)
         name_resolutions = {}  # name_token -> [(addr, family), ...]
+        name_errors = {}  # name_token -> resolver failure text (L2: the row's only clue)
         current_ts = self.now()
-        changes = {}  # addr -> (old_state, new_state, error, resolved)
+        changes = {}  # addr -> (state, error) for binds that did not happen this cycle
 
         # Phase 1: Desire - compute what we want bound
         for decl_idx, decl in enumerate(self.optional_decls):
@@ -4083,8 +4084,12 @@ class BindWatch:
                             if any(maddr == addr for maddr, _ in self.mandatory):
                                 continue
                             desired[addr] = (family, decl_idx)
-                except (socket.gaierror, Exception):
+                except (socket.gaierror, OSError, UnicodeError) as e:
+                    # L2: the name contributes no addresses this cycle and the row
+                    # carries the resolver's own words — "absent" with no reason is
+                    # indistinguishable from a typo in the unit file.
                     name_resolutions[name] = []
+                    name_errors[name] = str(e)
 
         # Phase 2: Remove - addresses no longer desired or now absent
         to_remove = []
@@ -4129,9 +4134,9 @@ class BindWatch:
                 except OSError as e:
                     # Classify error per L2: only EADDRNOTAVAIL is absence
                     if e.errno == errno.EADDRNOTAVAIL:
-                        changes[addr] = ('absent', 'absent', None, None)
+                        changes[addr] = ('absent', None)
                     else:
-                        changes[addr] = ('absent', 'error', f'[Errno {e.errno}] {e.strerror}', None)
+                        changes[addr] = ('error', f'[Errno {e.errno}] {e.strerror}')
 
         # Phase 4: Publish updates under lock
         with self.lock:
@@ -4142,6 +4147,7 @@ class BindWatch:
                 # Determine new state for this row
                 addr = row['addr']
                 old_state = row['state']
+                old_resolved = row['resolved']
                 new_state = old_state
                 last_error = None
                 resolved = None
@@ -4151,28 +4157,31 @@ class BindWatch:
                                  for decl in self.optional_decls)
 
                 if is_name_row:
-                    # Name row: check resolved addresses
-                    resolved_list = [r[0] for r in name_resolutions.get(addr, [])]
-                    resolved = resolved_list
+                    # L4: `resolved` is the addresses this name currently has a door
+                    # on — the resolver's list is a wish, the servers registry is fact.
+                    this_cycle = name_resolutions.get(addr, [])
+                    resolved = [a for a, _fam in this_cycle if a in self.servers]
 
-                    # Name row is bound if any resolved address is bound
-                    bound_addrs = [r[0] for r in name_resolutions.get(addr, [])
-                                   if r[0] in self.servers]
-                    if bound_addrs:
+                    # Errors that stopped one of this name's addresses from binding.
+                    # EADDRNOTAVAIL is not among them (L2: absence, not error), so a
+                    # laptop whose VPN name still resolves at home reads `absent`.
+                    errs = [changes[a][1] for a, _fam in this_cycle
+                            if changes.get(a, ('', None))[0] == 'error']
+
+                    if resolved:
                         new_state = 'bound'
-                    elif resolved_list:
-                        # Resolved but not bound - check errors
+                    elif errs:
                         new_state = 'error'
+                        last_error = errs[0]
                     else:
-                        # Resolution failed
                         new_state = 'absent'
+                        last_error = name_errors.get(addr)
                 else:
                     # Literal row
                     if addr in self.servers:
                         new_state = 'bound'
                     elif addr in changes:
-                        new_state = changes[addr][1]
-                        last_error = changes[addr][2]
+                        new_state, last_error = changes[addr]
                     else:
                         new_state = 'absent'
 
@@ -4180,16 +4189,22 @@ class BindWatch:
                 row['state'] = new_state
                 row['last_error'] = last_error
                 if is_name_row:
-                    row['resolved'] = resolved if resolved else []
+                    row['resolved'] = resolved
 
-                # Emit event on transition
+                # L4: a state change is an event, and so is a bound name row whose
+                # resolved set moved — that flip IS the roaming moment, and it is
+                # invisible in `state`, which stayed `bound` the whole way across.
+                resolved_flipped = (is_name_row and new_state == 'bound'
+                                    and old_state == 'bound'
+                                    and list(old_resolved or []) != list(resolved or []))
                 if old_state != new_state:
                     row['since'] = current_ts
+                if old_state != new_state or resolved_flipped:
                     payload = {
                         **row,
                         'prev_state': old_state
                     }
-                    self.event_bus.put_nowait(('listener', payload))
+                    self.event_bus.publish('listener', payload)
 
 
 def parse_peer_decls(values: Optional[List[str]]) -> tuple[dict[str, tuple[str, int]], List[str]]:
@@ -4752,12 +4767,15 @@ class PeerWatch:
         # Handle endpoint change for fleet peers (§4.3, L5)
         if ok and winner_index is not None and name in self.fleet:
             old_endpoint_index = peer.get('endpoint_index', 0)
-            if winner_index != old_endpoint_index:
-                peer['endpoint_index'] = winner_index
+            # §4.3: a different winner OR nothing named yet. Fleet rows start with
+            # endpoint_in_use None and endpoint_index 0, so the ordinary case —
+            # candidate 1 answering on the first round — sets the field here or
+            # never: the row would read `up` while naming no door at all.
+            if winner_index != old_endpoint_index or peer.get('endpoint_in_use') is None:
                 urls = self.fleet[name]
                 if 0 <= winner_index < len(urls):
-                    url = urls[winner_index]
-                    peer['endpoint_in_use'] = url
+                    peer['endpoint_index'] = winner_index
+                    peer['endpoint_in_use'] = urls[winner_index]
                     peer['endpoint_changed_at'] = ts
                     endpoint_changed = True
 
@@ -9002,11 +9020,14 @@ def cmd_serve(args):
 
     # D2: Fleet peer validation per candidate (§4.1, L7 — candidates are full D2 citizens)
     # Validate each candidate with name like 'peer[1]', 'peer[2]', etc. for error clarity
+    # The loop variables are named for what they are — a candidate's host and port,
+    # somewhere else on the network. Unpacking them as `port` walked over cmd_serve's
+    # own listening port, so declaring a fleet peer moved this host's door to the last
+    # candidate's port and told D2 the wrong thing about which port is ours.
     fleet_candidate_endpoints = {}
     for name, candidates in fleet_decls.items():
-        for i, (host, port, url) in enumerate(candidates, 1):
-            candidate_name = f'{name}[{i}]'
-            fleet_candidate_endpoints[candidate_name] = (host, port)
+        for i, (cand_host, cand_port, _cand_url) in enumerate(candidates, 1):
+            fleet_candidate_endpoints[f'{name}[{i}]'] = (cand_host, cand_port)
 
     fleet_peer_validation_errors = validate_peers(fleet_candidate_endpoints, units, port, bind_addrs,
                                                    advertise_host, nodename)

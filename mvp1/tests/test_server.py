@@ -3651,6 +3651,16 @@ class TestEndpointStatics(unittest.TestCase):
             html = f.read()
         self.assertIn(' · via ', html, "Missing ' · via ' endpoint marker per §5.4")
 
+    def test_the_resolved_addresses_are_not_gated_on_a_kind_that_cannot_occur(self):
+        """§5.4/L4: a listener row's `kind` is mandatory|optional. Gating the ` → a1, a2`
+        rendering on kind === 'name' hides the resolved set on every row there is —
+        and the resolved set IS the roaming moment the strip exists to show."""
+        with open(Path(__file__).parent.parent / 'static' / 'index.html') as f:
+            html = f.read()
+        self.assertNotIn("kind === 'name'", html,
+                         "listener rows are never kind 'name'; test `resolved` itself")
+        self.assertIn(' → ', html, "Missing the resolved-address fragment per §5.4")
+
 
 class TestPeerEndpointFields(unittest.TestCase):
     """§7.4: Peer row endpoint fields (endpoint_in_use, endpoint_changed_at)."""
@@ -3706,6 +3716,219 @@ class TestPeerEndpointFields(unittest.TestCase):
         self.assertEqual(pw.peers['fleet']['endpoint_index'], 1)
         self.assertIsNotNone(pw.peers['fleet']['endpoint_changed_at'])
         self.assertGreaterEqual(pw.peers['fleet']['endpoint_changed_at'], ts)
+
+
+class _LiveServeHarness(unittest.TestCase):
+    """Runs a real `roundhouse.py --serve` and talks to it over TCP (§7.4).
+
+    The optional-bind story is made of real sockets: 127.0.0.0/8 binds without
+    configuration, so 127.0.0.2 proves a genuine optional listener and 192.0.2.1
+    (TEST-NET-1, unassigned) proves genuine absence — appearance itself needs the
+    root container drill (recon 8).
+    """
+
+    def free_port(self):
+        s = socket.socket()
+        s.bind(('127.0.0.1', 0))
+        port = s.getsockname()[1]
+        s.close()
+        return port
+
+    def serve(self, extra_args, port=None):
+        import subprocess
+        port = port or self.free_port()
+        repo = Path(__file__).resolve().parents[2]
+        proc = subprocess.Popen(
+            [sys.executable, str(repo / 'mvp1' / 'roundhouse.py'), '--serve',
+             '--unit-dir', str(repo / 'docs' / 'fixtures'), '--no-db',
+             '--port', str(port)] + extra_args,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        self.addCleanup(self._reap, proc)
+        return proc, port
+
+    @staticmethod
+    def _reap(proc):
+        import subprocess
+        if proc.poll() is None:
+            proc.terminate()
+            try:
+                proc.communicate(timeout=10)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.communicate()
+
+    def get(self, host, port, path='/api/units', timeout=1.0):
+        conn = http.client.HTTPConnection(host, port, timeout=timeout)
+        try:
+            conn.request('GET', path)
+            resp = conn.getresponse()
+            return resp.status, resp.read()
+        finally:
+            conn.close()
+
+    def wait_for(self, host, port, proc, path='/api/units', deadline=25.0):
+        end = time.time() + deadline
+        while time.time() < end:
+            if proc.poll() is not None:
+                out, err = proc.communicate()
+                self.fail(f'server exited early: rc={proc.returncode} err={err[-800:]}')
+            try:
+                status, body = self.get(host, port, path)
+                if status == 200:
+                    return body
+            except (OSError, http.client.HTTPException):
+                time.sleep(0.2)
+        self.fail(f'nothing answered on {host}:{port}{path}')
+
+    def snapshot(self, port, path='/api/units'):   # /api/units IS the snapshot (§5.1)
+        status, body = self.get('127.0.0.1', port, path)
+        self.assertEqual(status, 200)
+        return json.loads(body)
+
+
+class TestOptionalBindsServeForReal(_LiveServeHarness):
+    """§7.4 T1 integration: optional doors on real sockets, no root."""
+
+    def listeners(self, port):
+        snap = self.snapshot(port)
+        self.assertIn('listeners', snap, 'the snapshot is the whole listeners surface (§5.1)')
+        return {row['addr']: row for row in snap['listeners']}
+
+    def test_an_absent_optional_address_never_stops_the_start(self):
+        """The milestone in one line: the laptop starts on the sofa."""
+        proc, port = self.serve(['--bind', '127.0.0.1',
+                                 '--bind-optional', '127.0.0.2,192.0.2.1',
+                                 '--bind-retry', '1'])
+        self.wait_for('127.0.0.1', port, proc)
+
+        # both real doors answer; the absent one is simply not there
+        self.assertEqual(self.get('127.0.0.2', port)[0], 200)
+        with self.assertRaises(OSError):
+            self.get('192.0.2.1', port, timeout=0.5)
+
+        rows = self.listeners(port)
+        self.assertEqual(rows['127.0.0.1']['kind'], 'mandatory')
+        self.assertEqual(rows['127.0.0.1']['state'], 'bound')
+        self.assertEqual(rows['127.0.0.2']['kind'], 'optional')
+        self.assertEqual(rows['127.0.0.2']['state'], 'bound')
+        self.assertEqual(rows['192.0.2.1']['state'], 'absent')
+        self.assertIsNone(rows['192.0.2.1']['last_error'],
+                          'EADDRNOTAVAIL is absence, not an error (L2)')
+
+    def test_the_listener_row_shape_is_frozen(self):
+        """L4: {addr, port, kind, state, since, last_error, resolved} — no more, no less."""
+        proc, port = self.serve(['--bind', '127.0.0.1', '--bind-optional', '127.0.0.2',
+                                 '--bind-retry', '1'])
+        self.wait_for('127.0.0.1', port, proc)
+
+        snap = self.snapshot(port)
+        expected = {'addr', 'port', 'kind', 'state', 'since', 'last_error', 'resolved'}
+        for row in snap['listeners']:
+            self.assertEqual(set(row.keys()), expected, f'row shape drifted: {row}')
+            self.assertEqual(row['port'], port)
+        self.assertIsNone(snap['listeners'][0]['resolved'],
+                          'literal and mandatory rows carry no resolved list')
+
+    def test_an_occupied_optional_address_is_an_error_row_and_serving_continues(self):
+        """L2: EADDRINUSE is reported per address and never kills the process."""
+        port = self.free_port()
+        blocker = socket.socket()
+        blocker.bind(('127.0.0.3', port))
+        blocker.listen(1)
+        self.addCleanup(blocker.close)
+
+        proc, _ = self.serve(['--bind', '127.0.0.1', '--bind-optional', '127.0.0.3',
+                              '--bind-retry', '1'], port=port)
+        self.wait_for('127.0.0.1', port, proc)
+
+        deadline, row = time.time() + 10, None
+        while time.time() < deadline:
+            row = self.listeners(port).get('127.0.0.3')
+            if row and row['state'] == 'error':
+                break
+            time.sleep(0.5)
+        self.assertEqual(row['state'], 'error')
+        self.assertIn('Errno', row['last_error'])
+        self.assertIsNone(proc.poll(), 'an occupied optional address is not fatal')
+        self.assertEqual(self.get('127.0.0.1', port)[0], 200)
+
+    def test_shutdown_closes_the_optional_door_too(self):
+        """§3.4: the optional listener is torn down with the mandatory ones."""
+        import signal
+        proc, port = self.serve(['--bind', '127.0.0.1', '--bind-optional', '127.0.0.2',
+                                 '--bind-retry', '1'])
+        self.wait_for('127.0.0.1', port, proc)
+        self.assertEqual(self.get('127.0.0.2', port)[0], 200)
+
+        proc.send_signal(signal.SIGTERM)
+        proc.communicate(timeout=20)
+        self.assertEqual(proc.returncode, 0)
+
+        for host in ('127.0.0.1', '127.0.0.2'):
+            with self.assertRaises(OSError, msg=f'{host} still answers after shutdown'):
+                self.get(host, port, timeout=1.0)
+
+    def test_the_watch_is_joined_before_the_doors_are_closed(self):
+        """§3.4's load-bearing order, asserted on the source: no listener can be
+        added after the close pass because the only thread that adds them is gone.
+        Instrumented structurally because the race it prevents is unobservable when
+        the code is right and intermittent when it is not."""
+        import ast
+        source = (Path(__file__).resolve().parents[1] / 'roundhouse.py').read_text()
+        tree = ast.parse(source)
+        serve = next(n for n in ast.walk(tree)
+                     if isinstance(n, ast.FunctionDef) and n.name == 'cmd_serve')
+
+        join_lines = [n.lineno for n in ast.walk(serve)
+                      if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)
+                      and n.func.attr == 'join'
+                      and isinstance(n.func.value, ast.Name)
+                      and n.func.value.id == 'bind_watch_thread']
+        close_lines = [n.lineno for n in ast.walk(serve)
+                       if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)
+                       and n.func.attr == 'server_close']
+
+        self.assertEqual(len(join_lines), 1, 'the bind watch is joined exactly once')
+        shutdown_closes = [ln for ln in close_lines if ln > join_lines[0]]
+        self.assertTrue(shutdown_closes, 'the close pass must follow the join')
+        self.assertTrue(all(ln > join_lines[0] for ln in shutdown_closes))
+
+
+class TestFleetCandidatesDoNotDisturbTheServer(_LiveServeHarness):
+    """§4.1/L7 wiring: per-candidate D2 runs, and it costs the server nothing."""
+
+    def test_candidates_do_not_move_the_listening_port(self):
+        """The per-candidate D2 loop unpacks (host, port, url) — over cmd_serve's own
+        `port`. A peer declaration must not be able to decide which port this host
+        serves on; the candidate's port is data about somewhere else."""
+        proc, port = self.serve(['--bind', '127.0.0.1', '--peer-interval', '3600',
+                                 '--fleet-peer',
+                                 'ampere=http://ampere.fritz.box:9101,http://ampere.fritz.box:9102'])
+        self.wait_for('127.0.0.1', port, proc)
+
+        snap = self.snapshot(port)
+        self.assertEqual(snap['self_port'], port)
+        self.assertEqual(self.listener_ports(snap), {port})
+
+    @staticmethod
+    def listener_ports(snap):
+        return {row['port'] for row in snap['listeners']}
+
+    def test_a_candidate_that_targets_a_managed_unit_is_refused_by_name(self):
+        """L7: every candidate is a full D2 citizen and the refusal says which one."""
+        import subprocess
+        port = self.free_port()
+        repo = Path(__file__).resolve().parents[2]
+        result = subprocess.run(
+            [sys.executable, str(repo / 'mvp1' / 'roundhouse.py'), '--serve',
+             '--unit-dir', str(repo / 'docs' / 'fixtures'), '--no-db',
+             '--port', str(port), '--bind', '127.0.0.1',
+             '--fleet-peer', 'bee=http://127.0.0.1:9109,http://127.0.0.1:8085'],
+            capture_output=True, text=True, timeout=30)
+
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("peer 'bee[2]' targets 127.0.0.1:8085", result.stderr)
+        self.assertIn('qwen3.6-coding', result.stderr)
 
 
 if __name__ == '__main__':

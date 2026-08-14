@@ -1232,8 +1232,10 @@
                 item.className = 'listener-cell ' + (listener.state || 'error');
 
                 let label = listener.addr + ' · ' + (listener.state || 'error');
-                // Name rows show resolved addresses when bound
-                if (listener.kind === 'name' && listener.resolved && listener.resolved.length > 0) {
+                // Name rows carry a `resolved` list (literals carry null): show the
+                // addresses the name currently has doors on. `kind` is mandatory or
+                // optional and never says 'name', so the list itself is the test.
+                if (Array.isArray(listener.resolved) && listener.resolved.length > 0) {
                     label += ' → ' + listener.resolved.join(', ');
                 }
 

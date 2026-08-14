@@ -207,6 +207,10 @@ ExecStart=/usr/bin/python3 /home/roundhouse/roundhouse/mvp1/roundhouse.py --serv
     --peer ampere=ampere.fritz.box:8099 --peer dirac=dirac.fritz.box:22
 ```
 
+The mandatory loopback bind stays mandatory in every example, including the roaming
+ones below: optional binds come and go, and one door that cannot is what keeps the
+host answerable wherever it is.
+
 ## Drill
 
 `mvp1/scripts/peer-drill.sh` runs the container leg end to end: two peers (one
@@ -367,3 +371,220 @@ a killed peer leaving the fragment and going stale in the roster, and a TLS leg
 against a self-signed certificate (gated on `openssl` being available) that
 proves the untrusted-cert row above end to end — `up`, `never`/`stale`, `tls:`
 reason, excluded from the fragment.
+
+---
+
+## Roaming: optional binds and candidate lists
+
+A laptop is a host with more than one identity and no obligation to hold any of
+them. Ampere is `ampere.fritz.box` (192.168.88.168) on the sofa and `ampere.vpn`
+(`fd96:cafe:cafe::1000`) at the work desk, and never both. Two flags make each
+side of federation survive that: `--bind-optional` on the serving side,
+comma-separated candidates on `--fleet-peer` on the federating side.
+
+### Optional binds: `--bind-optional`
+
+**Syntax:** `--bind-optional ADDR|NAME [--bind-optional ...]` and/or
+`--bind-optional ADDR,NAME,...` — repeatable *and* comma-separated, like `--bind`.
+Meaning: **bind this when it exists here; carry on when it does not.**
+
+- **`--bind` is unchanged.** Mandatory, all-or-nothing, loud: a host that must be
+  reachable still refuses to start when it cannot be. Optional binds are the other
+  case, and they are never fatal — not absent, not in use, not permission-denied.
+- **Names are allowed here, and that is the whole point.** `--bind` refuses
+  hostnames because resolving once at boot silently pins whatever DNS said then.
+  An optional bind re-resolves the name **every cycle**, so `ampere.vpn` becoming
+  an address at the desk is a thing Roundhouse notices rather than a thing it
+  assumed at boot. Literals are still literals: an all-digits-and-dots token or
+  anything with a colon must parse as an IP or it is refused
+  (`'999.1.1.1': not a valid IP literal`) — never quietly treated as a hostname
+  that will never resolve.
+- **Wildcards are refused:**
+  `'0.0.0.0': a wildcard cannot be absent — optional binds are for addresses that
+  come and go; bind it with --bind or not at all`. A wildcard cannot be absent, so
+  "optional" would be a lie, and accepting it would reintroduce exactly the
+  exposure the loopback pattern exists to prevent.
+- **The two lists may not overlap.** The same address in both is a configuration
+  error (`is declared both --bind and --bind-optional — an address is mandatory or
+  optional, not both`), and an optional literal behind a mandatory wildcard of the
+  same family is refused too
+  (`'0.0.0.0' already covers '192.168.88.168' — an optional bind behind a wildcard
+  can never matter`). That second one is load-bearing rather than pedantic:
+  `SO_REUSEADDR` lets the specific bind *succeed* beside our own wildcard on Linux,
+  so without the refusal you would get a second, pointless door and no complaint.
+- **Caps:** 8 optional declarations; at most 4 addresses per name per cycle.
+- **`--bind-retry SECONDS`** (default 30, minimum 1) is the re-check cadence, on
+  its own thread and its own clock — *not* the peer round. Changing desks should
+  cost you half a minute of unreachability, not a full peer interval.
+
+**The bind attempt is the presence probe.** There is no address inventory to
+consult and no interface to watch:
+
+| what the kernel says | what it means | what Roundhouse does |
+|---|---|---|
+| bind succeeds | the address is here | serve on it; row `bound` |
+| `EADDRNOTAVAIL` | the address is not on this machine right now | row `absent`, no error, retry next cycle |
+| `EADDRINUSE`, `EACCES`, anything else | a real error about a real address | row `error` with the errno, **process keeps running**, retry next cycle |
+
+That table is the milestone in miniature. `EADDRNOTAVAIL` read as an error would
+kill the laptop at the wrong desk; `EADDRINUSE` read as absence would silently
+swallow a port collision — the collision that moved Roundhouse to :8099 on ampere
+in the first place (its packaged :8090 was already gemma-npu's). Loudness for
+collisions, silence for absence.
+
+Loss is detected the same way: every cycle, each bound optional address gets a
+throwaway `bind(addr, 0)`. `EADDRNOTAVAIL` means the address left and its listener
+is closed; **any other errno leaves the listener alone** — a serving door is never
+torn down on a surprising error.
+
+**Recommendation, not enforcement: keep one mandatory loopback bind.**
+`--bind 127.0.0.1` alongside the optional addresses guarantees exactly one door
+that cannot vanish, so the host is always answerable locally (and to a reverse
+proxy on the same box) no matter where it is. This is advice and not code: a host
+that serves only VPN addresses is a legitimate operator choice, and enforcing
+loopback would be guessing at intent. The packaged unit keeps the mandatory
+loopback bind in its `ExecStart`.
+
+### The laptop pattern, worked out on ampere
+
+At home, ampere has `lo` and `wlP2p33s0` and nothing else: `192.168.88.168` exists,
+`ampere.vpn` resolves (it is in `/etc/hosts`) but its address is not on any
+interface. At the desk the mirror image is true. One `ExecStart` covers both:
+
+```ini
+# ampere: ~/.config/systemd/user/roundhouse.service
+ExecStart=/usr/bin/python3 /path/to/mvp1/roundhouse.py --serve \
+    --bind 127.0.0.1 \
+    --bind-optional 192.168.88.168,ampere.vpn \
+    --port 8099
+```
+
+Port 8099 rather than the 8090 default because gemma-npu already owns :8090 on
+that host — and Roundhouse said so, loudly, at startup instead of half-binding.
+That is the all-or-nothing rule doing its job, and it is why the mandatory list
+stays mandatory.
+
+One caveat about the *name* half, learned on this exact host: a name is only as
+good as `getaddrinfo`. Ampere's `/etc/nsswitch.conf` reads
+`hosts: mymachines resolve [!UNAVAIL=return] files myhostname dns`, so
+systemd-resolved answers first and `[!UNAVAIL=return]` can end the lookup before
+`files` is consulted — an `ampere.vpn` entry that lives only in `/etc/hosts` then
+resolves for `getent hosts` and *not* for Roundhouse. The row says which case you
+are in: `absent` with `last_error` naming the resolver failure means the name did
+not resolve, while `absent` with `last_error: null` means it resolved and the
+address simply is not here. If a name cannot be resolved on the host that must
+bind it, declare the literal (`--bind-optional [fd96:cafe:cafe::1000]`) — a
+literal never depends on a resolver.
+
+On boltzmann, ampere is **one peer with two candidates**:
+
+```ini
+# boltzmann: ~/.config/systemd/user/roundhouse.service
+ExecStart=/usr/bin/python3 /path/to/mvp1/roundhouse.py --serve \
+    --bind 127.0.0.1 --port 8099 \
+    --fleet-peer ampere=http://ampere.fritz.box:8099,http://[fd96:cafe:cafe::1000]:8099 \
+    --peer-interval 60
+```
+
+One identity, two doors. Neither side knows or cares where the laptop is.
+
+### What `listeners` says
+
+Every snapshot carries a `listeners` list — one row per declaration, mandatory
+first, then optional in the order you declared them (the order is yours; it is
+honoured). The UI shows the same rows in the `listening` strip. There is no
+separate route and no MCP tool: "why is the fleet view empty" begins with "what
+am I bound to", and that answer travels with every snapshot.
+
+```json
+{"addr": "127.0.0.1",     "port": 8099, "kind": "mandatory", "state": "bound",
+ "since": 1755200000.0, "last_error": null, "resolved": null}
+{"addr": "192.168.88.168","port": 8099, "kind": "optional",  "state": "bound",
+ "since": 1755200000.1, "last_error": null, "resolved": null}
+{"addr": "ampere.vpn",    "port": 8099, "kind": "optional",  "state": "absent",
+ "since": 1755200000.1, "last_error": null, "resolved": []}
+```
+
+- `addr` — the canonical literal, or the **name as you declared it** for name rows.
+- `kind` — `mandatory` or `optional`. Mandatory rows are always `bound`; if one
+  could not be bound the process would not be running.
+- `state` — `bound` | `absent` | `error`, per the errno table above.
+- `since` — when the row entered its current state, so a flapping address is
+  visible as a fresh timestamp rather than as folklore.
+- `last_error` — `null` while bound; the errno text on `error`; on a name row that
+  did not resolve, the resolver's own words (an unresolvable name and an absent
+  address are both `absent`, and this is what tells them apart).
+- `resolved` — `null` on literal and mandatory rows. On a **name** row it is the
+  list of addresses that name currently has a door on. It is deliberately what is
+  *bound*, not what DNS returned: at home, `ampere.vpn` resolves and binds nothing,
+  so the row reads `absent` with `resolved: []`.
+
+A `listener` SSE event fires on every state change **and** whenever a bound name
+row's `resolved` set changes — that second case is the roaming moment itself, and
+it is invisible in `state`, which stays `bound` while the address underneath it
+moves. Steady state is silent: an unchanged world publishes nothing.
+
+Two honest edge cases. A reconfiguration that removes and re-adds an address
+within one cycle can cost a single `--bind-retry` blip (listener closed, re-bound
+next cycle); and an IPv6 address still doing duplicate-address detection reads
+`absent` until DAD completes, which self-heals on the next cycle. One residual is
+outside the threat model: `net.ipv4.ip_nonlocal_bind=1` makes every bind succeed
+and would blind the presence probe entirely. Roundhouse never sets it, and never
+sets `IP_FREEBIND`.
+
+### Candidate lists on `--fleet-peer`
+
+**Syntax:** `--fleet-peer NAME=URL[,URL...]` — an ordered candidate list for **one**
+peer. Each candidate is a full URL under the same rules as a single one (scheme
+`http` or `https`, host, optional port; no path, query, fragment, or credentials).
+
+- **Ordered by you, honoured as given.** No scoring, no learning, no reordering:
+  the sofa is first because you said so.
+- **Cap 3 per peer, and the number is arithmetic, not taste.** A worst-case round
+  is `4 TCP peers × 2 s + 4 fleet peers × ((3−1) × 2 s + 2 × 4 s)` = **56 s**, which
+  fits the 60 s cadence. At 4 candidates it is 64 s and the cadence is a fiction.
+  A test computes that expression from the live constants, so raising a cap without
+  redoing the arithmetic fails loudly.
+- **The walk starts from the top every round** and stops at the first candidate that
+  answers. That candidate is `endpoint_in_use`, and it is the *only* one fetched
+  from. A preferred endpoint that comes back is therefore picked up within one round
+  — there is no sticky winner to unstick.
+- **Hysteresis stays peer-level.** A round in which *any* candidate answers is a
+  success and resets the failure count; the count rises only when the **whole walk**
+  fails, and two consecutive whole-walk failures are what make the peer `down`.
+  Moving from candidate 1 to candidate 2 never flaps the peer's own state — it
+  emits one `peer` event carrying the new `endpoint_in_use` and `endpoint_changed_at`.
+- **When the walk fails while the peer is still `up`** (one failure, not yet two),
+  the fetch is skipped and the federated data is left exactly as it was — one round
+  of fresh-but-slightly-old data rather than a fabricated one.
+- **Every candidate is a full citizen of the rules.** The D2 refusal applies per
+  candidate and names it: `peer 'ampere[2]' targets 127.0.0.1:8085, which is managed
+  unit …`. TLS verification is per candidate (the certificate is checked against the
+  host in the URL actually being fetched), there is still no bypass flag, redirects
+  are still never followed, and the 4 s / 4 MiB limits still apply to each.
+
+On the peer row and in the fleet view, `host` and `port` name the endpoint
+**currently in use**, `endpoints` lists the choices, and `endpoint_in_use` /
+`endpoint_changed_at` say which one and since when. The peer strip appends
+` · via <host>` for a fleet peer with more than one candidate.
+
+**Mixing `http` and `https` candidates for one peer is legal**, because trust is a
+property of the path, not of the peer. A LAN candidate fronted by caddy speaks
+https against the fritz.box CA; a ULA VPN candidate speaks plain http inside a
+tunnel that is already encrypted. Refusing the mix would force either a fake
+certificate onto the VPN leg or a stripped TLS on the LAN leg — both strictly
+worse than saying so out loud here.
+
+**`--peer` deliberately has no candidate list.** A roaming host you want to watch
+is declared as a fleet peer instead: one candidate mechanism, one set of rules.
+
+### Drill
+
+`mvp1/scripts/roam-drill.sh` proves both halves in one container run, with a
+**real** address (`ip addr add/del 192.0.2.9/32 dev lo`, root-gated and
+trap-cleaned) rather than a mock: instance B binds the scratch address optionally
+while instance A federates B through a candidate list whose *first* candidate is
+that address. Adding the address makes B bind it and A switch to candidate 1;
+removing it closes B's listener and drops A back to candidate 2 — with the peer
+never leaving `up` and only `endpoint_in_use` changing. The wildcard and
+both-lists refusals and the `EADDRINUSE`-keeps-serving leg ride the same script.

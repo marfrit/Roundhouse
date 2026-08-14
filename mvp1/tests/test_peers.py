@@ -880,5 +880,154 @@ class TestPeerWatchCtorNormalization(unittest.TestCase):
         self.assertIsNone(pw.peers['fleet']['endpoint_in_use'])
 
 
+class _RoundHarness(unittest.TestCase):
+    """peer_watch_round with the probe and the fetch injected, so a round can be
+    played out endpoint by endpoint (§7.3: the walk is round-level behaviour and
+    was only ever tested one _probe_peer call at a time)."""
+
+    def build(self, candidates, urls, name='bee'):
+        self.bus = MagicMock()
+        self.clock = [1000.0]
+        pw = roundhouse.PeerWatch({name: list(candidates)}, threading.Lock(), self.bus,
+                                  fleet={name: list(urls)}, now=lambda: self.clock[0])
+        self.pw = pw
+        return pw
+
+    def run_round(self, alive, fetch_ok=True):
+        """One round where `alive` is the set of (host, port) that answer."""
+        probed, fetched = [], []
+
+        def fake_probe(peer_watch, name, index=0, connect=None):
+            endpoint = peer_watch.declared[name][index]
+            probed.append(endpoint)
+            if endpoint in alive:
+                return (True, None)
+            return (False, 'ConnectionRefusedError: refused')
+
+        def fake_fetch(peer_watch, name, path, opener=None, index=0):
+            fetched.append((peer_watch.fleet[name][index], path))
+            if not fetch_ok:
+                return (False, None, 'connect: refused')
+            if path == '/api/units':
+                return (True, {'mode': 'observe', 'units': []}, None)
+            return (True, {'model_list': []}, None)
+
+        with patch.object(roundhouse, '_probe_peer', fake_probe), \
+             patch.object(roundhouse, '_fetch_peer', fake_fetch):
+            roundhouse.peer_watch_round(self.pw)
+        return probed, fetched
+
+    def peer(self, name='bee'):
+        return self.pw.peers[name]
+
+    def peer_events(self):
+        return [call.args[1] for call in self.bus.publish.call_args_list
+                if call.args[0] == 'peer']
+
+
+class TestCandidateWalkRounds(_RoundHarness):
+    """§7.3/§4.3: what a whole round does to the peer row."""
+
+    def test_the_first_answering_candidate_is_named_in_endpoint_in_use(self):
+        """§4.3: set the endpoint when the winner differs from the index OR when
+        nothing has been named yet. Candidate 1 winning on the first round is the
+        ordinary case — a peer that is up `via` nothing is the fleet view's whole
+        question ('which door is this coming through?') left unanswered."""
+        self.build([('sofa', 8099), ('desk', 8099)],
+                   ['http://sofa:8099', 'http://desk:8099'])
+
+        probed, fetched = self.run_round(alive={('sofa', 8099)})
+
+        self.assertEqual(probed, [('sofa', 8099)], 'stop at the first answer')
+        self.assertEqual(self.peer()['state'], 'up')
+        self.assertEqual(self.peer()['endpoint_index'], 0)
+        self.assertEqual(self.peer()['endpoint_in_use'], 'http://sofa:8099')
+        self.assertIsNotNone(self.peer()['endpoint_changed_at'])
+        self.assertEqual(fetched, [('http://sofa:8099', '/api/units'),
+                                   ('http://sofa:8099', '/api/routing-config.json')])
+
+    def test_a_dead_first_candidate_costs_the_peer_nothing(self):
+        """L5: hysteresis is peer-level — a round that any candidate answers is a
+        success, and consecutive_failures stays at zero."""
+        self.build([('sofa', 8099), ('desk', 8099)],
+                   ['http://sofa:8099', 'http://desk:8099'])
+
+        probed, fetched = self.run_round(alive={('desk', 8099)})
+
+        self.assertEqual(probed, [('sofa', 8099), ('desk', 8099)])
+        self.assertEqual(self.peer()['state'], 'up')
+        self.assertEqual(self.peer()['consecutive_failures'], 0)
+        self.assertEqual(self.peer()['endpoint_index'], 1)
+        self.assertEqual(self.peer()['endpoint_in_use'], 'http://desk:8099')
+        self.assertEqual([url for url, _path in fetched],
+                         ['http://desk:8099', 'http://desk:8099'])
+
+    def test_moving_endpoint_is_one_event_and_no_flap(self):
+        """The roaming moment: candidate 2 → candidate 1 changes the endpoint and
+        emits exactly one `peer` event whose prev_state equals its state."""
+        self.build([('sofa', 8099), ('desk', 8099)],
+                   ['http://sofa:8099', 'http://desk:8099'])
+        self.run_round(alive={('desk', 8099)})
+        self.bus.publish.reset_mock()
+
+        self.clock[0] += 20
+        self.run_round(alive={('sofa', 8099), ('desk', 8099)})
+
+        events = self.peer_events()
+        self.assertEqual(len(events), 1, 'one endpoint move, one event')
+        self.assertEqual(events[0]['state'], 'up')
+        self.assertEqual(events[0]['prev_state'], 'up')
+        self.assertEqual(events[0]['endpoint_in_use'], 'http://sofa:8099')
+        self.assertEqual(events[0]['host'], 'sofa',
+                         'the row names the endpoint in use, `endpoints` names the choices')
+        self.assertEqual(self.peer()['consecutive_failures'], 0)
+
+    def test_a_whole_walk_failure_names_every_candidate_and_counts_once(self):
+        """L5: cf counts whole walks, and the error says what each door said."""
+        self.build([('sofa', 8099), ('desk', 8099)],
+                   ['http://sofa:8099', 'http://desk:8099'])
+        self.run_round(alive={('sofa', 8099)})
+
+        self.clock[0] += 20
+        self.run_round(alive=set())
+        self.assertEqual(self.peer()['state'], 'up', 'one failure is not down')
+        self.assertEqual(self.peer()['consecutive_failures'], 1)
+        self.assertIn('candidate 1:', self.peer()['last_error'])
+        self.assertIn('candidate 2:', self.peer()['last_error'])
+        self.assertLessEqual(len(self.peer()['last_error']), 200)
+
+        self.clock[0] += 20
+        self.run_round(alive=set())
+        self.assertEqual(self.peer()['state'], 'down', 'two whole walks, then down')
+        self.assertEqual(self.peer()['consecutive_failures'], 2)
+
+    def test_a_failed_walk_leaves_the_endpoint_where_it_was(self):
+        """§4.3: after `down` the row still says where the peer was last reached."""
+        self.build([('sofa', 8099), ('desk', 8099)],
+                   ['http://sofa:8099', 'http://desk:8099'])
+        self.run_round(alive={('desk', 8099)})
+        changed_at = self.peer()['endpoint_changed_at']
+
+        self.clock[0] += 20
+        self.run_round(alive=set())
+
+        self.assertEqual(self.peer()['endpoint_in_use'], 'http://desk:8099')
+        self.assertEqual(self.peer()['endpoint_changed_at'], changed_at)
+        self.assertEqual(self.peer()['endpoint_index'], 1)
+
+    def test_a_failed_walk_while_still_up_skips_the_fetch(self):
+        """L5's fetch-skip rule: no winner, no fetch — fed data is left alone."""
+        self.build([('sofa', 8099)], ['http://sofa:8099'])
+        self.run_round(alive={('sofa', 8099)})
+        fetched_at = self.pw.fed['bee']['fetched_at']
+
+        self.clock[0] += 20
+        probed, fetched = self.run_round(alive=set())
+
+        self.assertEqual(fetched, [], 'nothing was reachable to fetch from')
+        self.assertEqual(self.pw.fed['bee']['state'], 'fresh')
+        self.assertEqual(self.pw.fed['bee']['fetched_at'], fetched_at)
+
+
 if __name__ == '__main__':
     unittest.main()
