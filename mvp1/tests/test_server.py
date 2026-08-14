@@ -3889,9 +3889,29 @@ class TestOptionalBindsServeForReal(_LiveServeHarness):
                        and n.func.attr == 'server_close']
 
         self.assertEqual(len(join_lines), 1, 'the bind watch is joined exactly once')
-        shutdown_closes = [ln for ln in close_lines if ln > join_lines[0]]
-        self.assertTrue(shutdown_closes, 'the close pass must follow the join')
-        self.assertTrue(all(ln > join_lines[0] for ln in shutdown_closes))
+        self.assertTrue(close_lines, 'cmd_serve must close its listeners')
+
+        # MVP9 review: the previous form filtered close_lines to those AFTER the
+        # join and then asserted they were after the join — tautological, and the
+        # reviewer proved it by reordering the OPTIONAL close pass before the join
+        # (the exact race §3.4 exists to prevent) without turning this red.
+        # Anchor on the thing that actually matters instead: the loop that closes
+        # the watch's own listeners must come after the join, because that is the
+        # set the watch can still be recreating.
+        watch_close_loops = [n.lineno for n in ast.walk(serve)
+                             if isinstance(n, ast.For)
+                             and any(isinstance(sub, ast.Attribute)
+                                     and sub.attr == 'servers'
+                                     and isinstance(sub.value, ast.Name)
+                                     and sub.value.id == 'bind_watch'
+                                     for sub in ast.walk(n.iter))]
+        self.assertTrue(watch_close_loops,
+                        'cmd_serve must close the bind watch listeners explicitly')
+        for loop_line in watch_close_loops:
+            self.assertGreater(
+                loop_line, join_lines[0],
+                'the watch must be joined BEFORE its listeners are closed — otherwise '
+                'the next cycle rebinds an address shutdown has just torn down')
 
 
 class TestFleetCandidatesDoNotDisturbTheServer(_LiveServeHarness):

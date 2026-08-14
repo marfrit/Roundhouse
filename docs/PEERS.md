@@ -518,6 +518,12 @@ am I bound to", and that answer travels with every snapshot.
   list of addresses that name currently has a door on. It is deliberately what is
   *bound*, not what DNS returned: at home, `ampere.vpn` resolves and binds nothing,
   so the row reads `absent` with `resolved: []`.
+  One corner where that reading misleads, so know it before 2am: if a name
+  resolves **only** onto an address a mandatory `--bind` already holds, the name
+  row reads `absent` with `resolved: []` even though requests to that name are
+  being served — by the mandatory door, which owns the address. Nothing is
+  broken; the optional row simply has nothing left to bind. Check the mandatory
+  rows before concluding a name is unreachable.
 
 A `listener` SSE event fires on every state change **and** whenever a bound name
 row's `resolved` set changes — that second case is the roaming moment itself, and

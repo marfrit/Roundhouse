@@ -10,6 +10,7 @@ import unittest
 import socket
 import time
 import threading
+import queue
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -1031,3 +1032,50 @@ class TestCandidateWalkRounds(_RoundHarness):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class TestRoundLevelUsesTheRealEventBus(unittest.TestCase):
+    """MVP9 review item 2: close the last in-suite door for the mock-shape-lie class.
+
+    B3 was: BindWatch published through event_bus.put_nowait(), which EventBus
+    does not have — invisible because the tests injected a queue.Queue, which
+    does. The BindWatch side now publishes against a double carrying only the
+    production API; peer_watch_round's two publish sites, however, still only
+    ever met MagicMock in-suite, which absorbs any attribute at all. This drives
+    a real round against a REAL EventBus, so a put_nowait-style regression on
+    the peer path fails here instead of on a host.
+    """
+
+    def _watch(self, bus):
+        return roundhouse.PeerWatch(
+            declared={'p': [('127.0.0.1', 9)]},
+            lock=threading.Lock(),
+            event_bus=bus,
+            fleet={},
+        )
+
+    def test_a_round_publishes_through_the_real_event_bus(self):
+        bus = roundhouse.EventBus()
+        q = bus.subscribe()
+        pw = self._watch(bus)
+        with patch.object(roundhouse, '_probe_peer',
+                          lambda pw_, name, index=0, connect=None: (True, None)):
+            roundhouse.peer_watch_round(pw)
+        # unknown -> up is a transition, so exactly one event must arrive, and it
+        # must have travelled through EventBus.publish, not a mock's black hole.
+        kind, payload, _seq = q.get_nowait()   # EventBus queues (event, data, seq)
+        self.assertEqual(kind, 'peer')
+        self.assertEqual(payload['name'], 'p')
+        self.assertEqual(payload['state'], 'up')
+
+    def test_a_flat_round_publishes_nothing_through_the_real_bus(self):
+        bus = roundhouse.EventBus()
+        q = bus.subscribe()
+        pw = self._watch(bus)
+        with patch.object(roundhouse, '_probe_peer',
+                          lambda pw_, name, index=0, connect=None: (True, None)):
+            roundhouse.peer_watch_round(pw)
+            q.get_nowait()                       # the unknown -> up transition
+            roundhouse.peer_watch_round(pw)      # steady state
+        with self.assertRaises(queue.Empty):
+            q.get_nowait()

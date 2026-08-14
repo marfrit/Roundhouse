@@ -3946,7 +3946,7 @@ class BindWatch:
     """
 
     def __init__(self, mandatory: List[tuple[str, int]], optional_decls: List[dict],
-                 port: int, server_kwargs: dict, lock: threading.Lock, event_bus: queue.Queue,
+                 port: int, server_kwargs: dict, lock: threading.Lock, event_bus: 'EventBus',
                  shutdown_event: threading.Event, now=time.time, resolver=socket.getaddrinfo,
                  presence=_presence_probe, make_listener=_make_listener):
         """Initialize BindWatch with mandatory and optional declarations.
