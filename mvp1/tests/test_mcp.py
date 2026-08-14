@@ -182,7 +182,7 @@ class TestFraming(unittest.TestCase):
         msg = {'jsonrpc': '2.0', 'id': 5, 'method': 'tools/list', 'params': None}
         response = roundhouse_mcp.handle_message(msg, {'url': 'http://127.0.0.1:1',
                                                        'client_name': 'unknown'})
-        self.assertEqual(len(response['result']['tools']), 16)
+        self.assertEqual(len(response['result']['tools']), 17)
 
     def test_ping_returns_empty_result(self):
         """ping method -> empty result dict."""
@@ -206,7 +206,7 @@ class TestFraming(unittest.TestCase):
         response = roundhouse_mcp.handle_message(msg, {'url': 'http://localhost', 'client_name': 'unknown'})
         self.assertEqual(response['result']['protocolVersion'], '2025-06-18')
         self.assertEqual(response['result']['serverInfo']['name'], 'roundhouse-mcp')
-        self.assertEqual(response['result']['serverInfo']['version'], '6.0')
+        self.assertEqual(response['result']['serverInfo']['version'], '7.0')
         self.assertIn('tools', response['result']['capabilities'])
 
     def test_initialize_unsupported_version_downgrades(self):
@@ -251,8 +251,8 @@ class TestRegistry(unittest.TestCase):
     """Test tool registry structure and frozen list."""
 
     def test_exactly_16_tools(self):
-        """Registry has exactly 16 tools."""
-        self.assertEqual(len(roundhouse_mcp.TOOLS), 16)
+        """Registry has exactly 17 tools."""
+        self.assertEqual(len(roundhouse_mcp.TOOLS), 17)
 
     def test_frozen_names_in_order(self):
         """Tool names match the frozen list."""
@@ -260,7 +260,7 @@ class TestRegistry(unittest.TestCase):
             'fleet_status', 'unit_detail', 'port_board', 'deployments',
             'routing_config', 'operation_status', 'warm_state',
             'switch_preview', 'switch_execute', 'edit_preview', 'edit_rollout',
-            'set_boot', 'warm', 'warm_cancel', 'operation_rollback', 'operation_dismiss'
+            'set_boot', 'warm', 'warm_cancel', 'operation_rollback', 'operation_dismiss', 'peer_status'
         ]
         actual_names = list(roundhouse_mcp.TOOLS.keys())
         self.assertEqual(actual_names, expected_names)
@@ -701,6 +701,7 @@ FROZEN_CATALOG = {
     'operation_dismiss': ('POST', '/api/rollouts/{rollout_id}/dismiss', True, (), False, False,
                           {'type': 'object', 'properties': {'rollout_id': S},
                            'required': ['rollout_id'], 'additionalProperties': False}),
+    'peer_status': ('GET', '/api/peers', False, (), False, False, _EMPTY_OBJ),
 }
 
 
@@ -994,7 +995,7 @@ class TestTokenSource(unittest.TestCase):
                      'params': {'name': name, 'arguments': args}},
                     {'url': 'http://127.0.0.1:8090', 'client_name': 'x'})
                 self.assertFalse(response['result']['isError'], name)
-        self.assertEqual(len(seen), 7)
+        self.assertEqual(len(seen), 8)
         self.assertTrue(all(token is None for _p, token in seen),
                         'a read tool attached a bearer token')
 

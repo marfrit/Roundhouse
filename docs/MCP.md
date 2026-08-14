@@ -53,7 +53,7 @@ Or set the env var in Claude Code's `.mcp.json`:
 }
 ```
 
-## The 16-Tool Catalog
+## The 17-Tool Catalog
 
 ### Read Tools (work in any mode: actuate or read-only)
 
@@ -161,11 +161,64 @@ Or set the env var in Claude Code's `.mcp.json`:
 #### 7. `warm_state`
 **Description:** Warm queue state: the pending parked request and the last disposition, or nulls.
 
+#### 8. `peer_status`
+**Description:** Fleet peer reachability watch: declared peers, their TCP connect state (up/down/unknown), state duration, and last probe time.
+
+**Example Call:**
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 1,
+  "method": "tools/call",
+  "params": {
+    "name": "peer_status",
+    "arguments": {}
+  }
+}
+```
+
+**Example Result:**
+```json
+{
+  "http_status": 200,
+  "means": "reachable",
+  "peers": [
+    {
+      "name": "ampere",
+      "host": "ampere.fritz.box",
+      "port": 8099,
+      "state": "up",
+      "since": 1692345600.0,
+      "last_probe": 1692345720.0,
+      "consecutive_failures": 0,
+      "last_error": null
+    },
+    {
+      "name": "dirac",
+      "host": "dirac.fritz.box",
+      "port": 22,
+      "state": "down",
+      "since": 1692345480.0,
+      "last_probe": 1692345720.0,
+      "consecutive_failures": 2,
+      "last_error": "Connection refused"
+    }
+  ]
+}
+```
+
+**Remarks:**
+- `means`: Always "reachable" — a TCP connect proves listening; nothing more about serving or health.
+- `state`: One of `up` (first successful connect), `down` (two consecutive failures), or `unknown` (never probed yet).
+- `since`: Epoch timestamp of the last state transition.
+- `consecutive_failures`: Counter toward hysteresis gate; resets to 0 on success.
+- `last_error`: Human-readable reason for last failure, or null if never failed.
+
 ---
 
 ### Action Tools (require `--actuate` + token; surface preflight refusals as structured results)
 
-#### 8. `switch_preview`
+#### 9. `switch_preview`
 **Description:** Preview a turntable switch: fit arithmetic, checks, suggested stops, and the confirm hash for switch_execute.
 
 **Input Schema:**
@@ -183,7 +236,7 @@ Or set the env var in Claude Code's `.mcp.json`:
 
 **Example Call:** `{"target": "alt.service", "stops": ["main.service"]}`
 
-#### 9. `switch_execute`
+#### 10. `switch_execute`
 **Description:** Execute a previewed switch; requires the exact confirm from switch_preview (state changed since preview means re-preview).
 
 **Input Schema:**
@@ -202,7 +255,7 @@ Or set the env var in Claude Code's `.mcp.json`:
 
 **Key:** `confirm` is **required** and **frozen** from the preview result. This enforces the two-step preview-then-execute pattern.
 
-#### 10. `edit_preview`
+#### 11. `edit_preview`
 **Description:** Preview parameter edits to a unit file: planned edits, unified diff, preflight, and the confirm hash for edit_rollout.
 
 **Input Schema:**
@@ -218,7 +271,7 @@ Or set the env var in Claude Code's `.mcp.json`:
 }
 ```
 
-#### 11. `edit_rollout`
+#### 12. `edit_rollout`
 **Description:** Apply previewed edits as a rollout; requires the exact confirm from edit_preview; returns a rollout_id to poll.
 
 **Input Schema:**
@@ -235,7 +288,7 @@ Or set the env var in Claude Code's `.mcp.json`:
 }
 ```
 
-#### 12. `set_boot`
+#### 13. `set_boot`
 **Description:** Enable or disable a unit's on-boot strategy (the checkbox); refuses on enable-collision with claimants listed.
 
 **Input Schema:**
@@ -251,7 +304,7 @@ Or set the env var in Claude Code's `.mcp.json`:
 }
 ```
 
-#### 13. `warm`
+#### 14. `warm`
 **Description:** Request warm-up of an on-demand unit by logical alias or unit name (exactly one); may start a consented switch, park, or refuse with fit arithmetic.
 
 **Input Schema:**
@@ -270,7 +323,7 @@ Or set the env var in Claude Code's `.mcp.json`:
 
 **Note:** `requester` defaults to `mcp-<client name from initialize>`.
 
-#### 14. `warm_cancel`
+#### 15. `warm_cancel`
 **Description:** Cancel the parked warm request, if any.
 
 **Input Schema:**
@@ -282,7 +335,7 @@ Or set the env var in Claude Code's `.mcp.json`:
 }
 ```
 
-#### 15. `operation_rollback`
+#### 16. `operation_rollback`
 **Description:** Roll back a failed operation that is offering restore.
 
 **Input Schema:**
@@ -295,7 +348,7 @@ Or set the env var in Claude Code's `.mcp.json`:
 }
 ```
 
-#### 16. `operation_dismiss`
+#### 17. `operation_dismiss`
 **Description:** Dismiss a failed operation's restore offer, releasing the slot without restoring.
 
 **Input Schema:**

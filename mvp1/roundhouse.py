@@ -1674,7 +1674,8 @@ class Watcher:
                 'unit_file_state': self.self_unit_file_state,
                 'enabled': self.self_unit_file_state == 'enabled'
             },
-            'units': units_list
+            'units': units_list,
+            'peers': getattr(self, 'peer_watch', None) and self.peer_watch.peers or []
         }
 
     def _get_rung(self, unit_name: str) -> Optional[str]:
@@ -2155,6 +2156,8 @@ class RoundhouseRequestHandler(http.server.BaseHTTPRequestHandler):
             self.serve_routing_config_json()
         elif route == '/api/warm':
             self.serve_warm_state()
+        elif route == '/api/peers':
+            self.serve_peers()
         elif route.startswith('/api/rollouts/'):
             rollout_id = urllib.parse.unquote(route[len('/api/rollouts/'):])
             self.serve_rollout(rollout_id)
@@ -2196,6 +2199,7 @@ class RoundhouseRequestHandler(http.server.BaseHTTPRequestHandler):
             route == '/api/routing-config' or
             route == '/api/routing-config.json' or
             route == '/api/warm' or
+            route == '/api/peers' or
             route.startswith('/api/rollouts/') or   # GET-only unless /rollback|/dismiss
             route == '/api/switch/preview' or
             route == '/api/switch'
@@ -2969,6 +2973,21 @@ class RoundhouseRequestHandler(http.server.BaseHTTPRequestHandler):
             deployments.append(dep)
 
         self.send_json({'host': host, 'deployments': deployments})
+
+    def serve_peers(self):
+        """Serve /api/peers (peer reachability status).
+
+        Frozen shape per MVP7-SPEC §7: peers is a list of peer records with
+        name, host, port, state (up/down/unknown), since, last_probe,
+        consecutive_failures, last_error. The 'means' string is frozen as
+        "reachable" — a TCP connect proves something is listening; it proves
+        nothing about serving or health.
+        """
+        snapshot = self.server.take_snapshot()
+        self.send_json({
+            'means': 'reachable',
+            'peers': snapshot.get('peers', [])
+        })
 
     def serve_rollout(self, rollout_id: str):
         """Serve GET /api/rollouts/<id> (§6): the rollout record, or 404.
