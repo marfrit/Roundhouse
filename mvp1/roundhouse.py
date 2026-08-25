@@ -7900,6 +7900,36 @@ def switch_preflight(target: str, stops: List[str], watcher: 'Watcher', units: D
 
     checks.append(port_check)
 
+    # systemd Conflicts= surfacing (MVP10). Starting the target stops every
+    # unit it declares Conflicts= against AND every unit that declares
+    # Conflicts= against the target — the property acts both ways. systemd
+    # performs those stops itself, silently; roundhouse must at least say so.
+    # (openarc-coder vs llama-coder on dirac is the live case: same port, so
+    # the port check above already blocks — but a conflict on a DIFFERENT
+    # port, e.g. llama-agent:8087, would otherwise vanish without a trace.)
+    def _conflict_names(u: Optional['UnitFile']) -> set:
+        return set((u.known.get('conflicts') or '').split()) if u else set()
+
+    target_conflicts = _conflict_names(target_unit)
+    for u in snapshot.get('units', []):
+        uname = u['unit']
+        if uname == target:
+            continue
+        if uname not in target_conflicts and \
+                target not in _conflict_names(units.get(uname)):
+            continue
+        u_rung = u.get('rung', 'OFF')
+        if u_rung not in ACTIVE_RUNGS:
+            continue
+        suffix = ("" if uname in stops
+                  else " — not ticked; systemd performs this stop regardless")
+        notices.append({
+            "check": "conflicts",
+            "unit": uname,
+            "rung": u_rung,
+            "detail": f"systemd Conflicts=: starting {target} will stop {uname} ({u_rung}){suffix}"
+        })
+
     # Suggested stops (F7)
     suggested_stops = []
     if not memory_ok:

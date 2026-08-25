@@ -5666,3 +5666,108 @@ class TestWarmSlotStealPreservesQueue(unittest.TestCase):
         # THE assertion: the parked warm survived the refused claim.
         self.assertIsNotNone(engine.pending_warm)
         self.assertEqual(engine.pending_warm.get('seq'), 7)
+
+
+class TestConflictsSurfacing(unittest.TestCase):
+    """systemd Conflicts= surfacing in switch preflight (MVP10).
+
+    Models the live dirac scenario: openarc-coder.service declares
+    Conflicts=llama-coder.service llama-agent.service llama-qwen38.service.
+    Starting llama-coder stops openarc-coder — systemd does it, silently.
+    """
+
+    def _openarc_unit(self) -> roundhouse.UnitFile:
+        path = Path(__file__).resolve().parents[0] / 'fixtures-extra' / 'openarc-coder.service'
+        return roundhouse.parse_unit(str(path), path.read_bytes())
+
+    def _llama_unit(self, name: str, port: int) -> roundhouse.UnitFile:
+        raw = (f"""[Unit]
+Description=Test {name}
+[Service]
+ExecStart=/usr/bin/llama-server -m /nonexistent/model.gguf --port {port}
+[Install]
+WantedBy=default.target
+""").encode()
+        return roundhouse.parse_unit(f'/tmp/{name}', raw)
+
+    def _watcher_for(self, rows):
+        watcher = MagicMock()
+        watcher.snapshot.return_value = {'units': rows}
+        watcher._cgroup_cache = {}
+        watcher.mem_store = None
+        return watcher
+
+    @staticmethod
+    def _meminfo():
+        return {'MemAvailable': 40 * 1024 * 1024}  # 40 GiB in KiB
+
+    def _conflict_notices(self, result):
+        return [n for n in result.get('notices', [])
+                if isinstance(n, dict) and n.get('check') == 'conflicts']
+
+    def test_switch_to_llama_coder_surfaces_openarc_stop(self):
+        """Reverse direction: the CONFLICTING unit declares, the target is named."""
+        openarc = self._openarc_unit()
+        coder = self._llama_unit('llama-coder.service', 8080)
+        units = {openarc.name: openarc, coder.name: coder}
+        watcher = self._watcher_for([
+            {'unit': coder.name, 'rung': 'OFF', 'retired': False, 'port': 8080, 'mem': {}},
+            {'unit': openarc.name, 'rung': 'READY', 'retired': False, 'port': 8080, 'mem': {}},
+        ])
+
+        result = roundhouse.switch_preflight(coder.name, [], watcher, units, 8099, self._meminfo)
+
+        notices = self._conflict_notices(result)
+        self.assertEqual([n['unit'] for n in notices], [openarc.name])
+        self.assertIn('systemd Conflicts=', notices[0]['detail'])
+        self.assertIn('not ticked', notices[0]['detail'])
+        # Same port: the port check independently blocks — the latent :8080
+        # trap must be a blocker, not only a notice.
+        self.assertFalse(result['port']['ok'])
+        self.assertIn(openarc.name, [b['unit'] for b in result['port']['blockers']])
+
+    def test_switch_to_openarc_surfaces_declared_stops(self):
+        """Forward direction: the TARGET declares Conflicts= against an active unit."""
+        openarc = self._openarc_unit()
+        agent = self._llama_unit('llama-agent.service', 8087)
+        units = {openarc.name: openarc, agent.name: agent}
+        watcher = self._watcher_for([
+            {'unit': openarc.name, 'rung': 'OFF', 'retired': False, 'port': 8080, 'mem': {}},
+            {'unit': agent.name, 'rung': 'READY', 'retired': False, 'port': 8087, 'mem': {}},
+        ])
+
+        result = roundhouse.switch_preflight(openarc.name, [], watcher, units, 8099, self._meminfo)
+
+        notices = self._conflict_notices(result)
+        self.assertEqual([n['unit'] for n in notices], [agent.name])
+        # Different port: without the Conflicts pass this stop would be invisible.
+        self.assertTrue(result['port']['ok'])
+
+    def test_ticked_conflict_loses_warning_suffix(self):
+        openarc = self._openarc_unit()
+        agent = self._llama_unit('llama-agent.service', 8087)
+        units = {openarc.name: openarc, agent.name: agent}
+        watcher = self._watcher_for([
+            {'unit': openarc.name, 'rung': 'OFF', 'retired': False, 'port': 8080, 'mem': {}},
+            {'unit': agent.name, 'rung': 'READY', 'retired': False, 'port': 8087, 'mem': {}},
+        ])
+
+        result = roundhouse.switch_preflight(openarc.name, [agent.name], watcher, units,
+                                             8099, self._meminfo)
+
+        notices = self._conflict_notices(result)
+        self.assertEqual(len(notices), 1)
+        self.assertNotIn('not ticked', notices[0]['detail'])
+
+    def test_inactive_conflict_unit_produces_no_notice(self):
+        openarc = self._openarc_unit()
+        coder = self._llama_unit('llama-coder.service', 8080)
+        units = {openarc.name: openarc, coder.name: coder}
+        watcher = self._watcher_for([
+            {'unit': coder.name, 'rung': 'OFF', 'retired': False, 'port': 8080, 'mem': {}},
+            {'unit': openarc.name, 'rung': 'OFF', 'retired': False, 'port': 8080, 'mem': {}},
+        ])
+
+        result = roundhouse.switch_preflight(coder.name, [], watcher, units, 8099, self._meminfo)
+
+        self.assertEqual(self._conflict_notices(result), [])
