@@ -497,3 +497,67 @@ ExecStart=/usr/bin/test
         unit = roundhouse.parse_unit('/tmp/test.service', raw)
         self.assertFalse(unit.on_demand)
         self.assertIsInstance(unit.on_demand, bool)
+
+
+class TestOpenArcEngine(unittest.TestCase):
+    """OpenArc (OpenVINO) engine recognition — MVP10."""
+
+    def setUp(self):
+        self.fixtures_extra = Path(__file__).resolve().parents[0] / "fixtures-extra"
+
+    def _parse_fixture(self):
+        fpath = str(self.fixtures_extra / "openarc-coder.service")
+        with open(fpath, 'rb') as f:
+            raw = f.read()
+        return roundhouse.parse_unit(fpath, raw)
+
+    def test_classified_as_openarc(self):
+        unit = self._parse_fixture()
+        self.assertIsNotNone(unit.exec_start)
+        self.assertEqual(unit.exec_start.engine.get('kind'), 'openarc')
+        self.assertEqual(unit.exec_start.engine.get('variant'), 'openvino')
+        self.assertEqual(unit.exec_start.engine.get('binary'),
+                         '/home/mfritsche/openarc-venv/bin/openarc')
+
+    def test_port_from_flag(self):
+        unit = self._parse_fixture()
+        profile = roundhouse.extract_param_profile(unit.exec_start.engine_argv)
+        self.assertEqual(profile['port'], 8080)
+        self.assertEqual(profile['port_source'], 'flag')
+
+    def test_alias_from_load_models(self):
+        unit = self._parse_fixture()
+        profile = roundhouse.extract_param_profile(unit.exec_start.engine_argv)
+        self.assertEqual(profile['alias'], 'qwen3.6-coder')
+
+    def test_default_port_8000(self):
+        """Without --port, OpenArc serves on 8000 (not llama.cpp's 8080)."""
+        raw = b"""[Unit]
+Description=Test
+[Service]
+ExecStart=/home/mfritsche/openarc-venv/bin/openarc serve start --load-models m1
+"""
+        unit = roundhouse.parse_unit('/tmp/openarc-test.service', raw)
+        profile = roundhouse.extract_param_profile(unit.exec_start.engine_argv)
+        self.assertEqual(profile['port'], 8000)
+        self.assertEqual(profile['port_source'], 'default')
+
+    def test_non_serve_subcommand_not_classified(self):
+        """`openarc download` is a CLI action, not a server: no engine."""
+        raw = b"""[Unit]
+Description=Test
+[Service]
+ExecStart=/home/mfritsche/openarc-venv/bin/openarc download --model foo
+"""
+        unit = roundhouse.parse_unit('/tmp/openarc-dl.service', raw)
+        self.assertEqual(unit.exec_start.engine, {})
+
+    def test_select_units_picks_up_openarc(self):
+        result = roundhouse.select_units(str(self.fixtures_extra))
+        names = [os.path.basename(p) for p in result]
+        self.assertIn('openarc-coder.service', names)
+
+    def test_conflicts_directive_in_known(self):
+        unit = self._parse_fixture()
+        self.assertEqual(unit.known.get('conflicts'),
+                         'llama-coder.service llama-agent.service llama-qwen38.service')

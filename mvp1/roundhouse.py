@@ -105,9 +105,10 @@ class ExecStart:
     tokens: full argv including wrapper prefix (taskset, nice, etc.)
     wrapper: dict like {"kind":"taskset","cpus":"4-7","tokens":[...]} or None
     engine_argv: tokens from the engine binary onward (after wrapper)
-    engine: {"kind": 'llama-server'|'llamafile', "binary": str, "variant": str}
+    engine: {"kind": 'llama-server'|'llamafile'|'openarc', "binary": str, "variant": str}
       variant: 'rk-llama.cpp' if '/rk-llama.cpp/' in binary else
-               'llama.cpp' for llama-server; 'llamafile' otherwise
+               'llama.cpp' for llama-server; 'llamafile' otherwise;
+               'openvino' for openarc (basename 'openarc', OpenVINO serving)
     """
     directive: Directive
     tokens: List[Token]
@@ -196,7 +197,8 @@ def parse_unit(path: str, raw: bytes) -> UnitFile:
     KNOWN_KEYS = {
         "Description", "Documentation", "After", "Wants",
         "ExecStart", "ExecCondition", "Type", "Restart", "RestartSec",
-        "TimeoutStartSec", "WorkingDirectory", "LimitNOFILE", "WantedBy"
+        "TimeoutStartSec", "WorkingDirectory", "LimitNOFILE", "WantedBy",
+        "Conflicts"
     }
 
     for directive in directives:
@@ -486,6 +488,15 @@ def tokenize_execstart(directive: Directive, raw: bytes) -> ExecStart:
                     'binary': engine_binary,
                     'variant': 'llamafile'
                 }
+            elif engine_basename == 'openarc':
+                # OpenArc (OpenVINO serving). Only the `serve` subcommand runs a
+                # server worth rostering; `openarc download` etc. must not classify.
+                if any(t.text == 'serve' for t in engine_argv[1:]):
+                    engine = {
+                        'kind': 'openarc',
+                        'binary': engine_binary,
+                        'variant': 'openvino'
+                    }
 
     return ExecStart(
         directive=directive,
@@ -671,6 +682,9 @@ KNOWN_FLAG_MAP = {
     '--alias': ('alias', 1, 'str'),
     '--host': ('host_bind', 1, 'str'),
     '--port': ('port', 1, 'int'),
+    # OpenArc: the model name it loads at startup doubles as the serving alias
+    # (same string a consumer passes as "model"). llama-server has no such flag.
+    '--load-models': ('alias', 1, 'str'),
 }
 
 # canonical field name -> type, derived from the one table above.
@@ -829,9 +843,11 @@ def extract_param_profile(engine_argv: List[Token]) -> Dict:
         else:
             i += 1
 
-    # Set default port if not specified
+    # Set default port if not specified. OpenArc serves on 8000 when --port is
+    # absent; the llama.cpp family defaults to 8080.
     if result['port'] is None:
-        result['port'] = 8080
+        binary_base = os.path.basename(engine_argv[0].text) if engine_argv else ''
+        result['port'] = 8000 if binary_base == 'openarc' else 8080
         result['port_source'] = 'default'
 
     return result
@@ -920,7 +936,7 @@ def select_units(unit_dir: str) -> List[str]:
             if unit.exec_start:
                 for tok in unit.exec_start.tokens:
                     base = os.path.basename(tok.text)
-                    if base.startswith('llama-server') or 'llamafile' in base:
+                    if base.startswith('llama-server') or 'llamafile' in base or base == 'openarc':
                         is_ours = True
                         break
         except Exception:
@@ -1637,7 +1653,7 @@ class Watcher:
                 'alias': alias,
                 'on_demand': unit.on_demand,
                 'gate': unit.gate,
-                'model_file': os.path.basename(profile.get('model_path', '')),
+                'model_file': os.path.basename(profile.get('model_path') or ''),
                 'quant_hint': quant,
                 'ctx': profile.get('ctx'),
                 'mem': mem_info,

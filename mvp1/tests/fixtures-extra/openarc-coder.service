@@ -1,0 +1,16 @@
+[Unit]
+Description=Qwen3.6-27B-Coder B5 auf OpenVINO/A770 (OpenArc :8080, int4 AWQ+SE fleetcode, Greedy 10/10)
+After=default.target
+Conflicts=llama-coder.service llama-agent.service llama-qwen38.service
+
+[Service]
+Type=simple
+WorkingDirectory=/home/mfritsche/OpenArc
+ExecStart=/home/mfritsche/openarc-venv/bin/openarc serve start --port 8080 --load-models qwen3.6-coder
+Restart=on-failure
+RestartSec=10
+StartLimitBurst=3
+TimeoutStartSec=600
+
+[Install]
+WantedBy=default.target
