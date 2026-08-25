@@ -65,6 +65,31 @@ mechanics: an ACTIVE openarc unit is a normal stop candidate, appears in
 `suggested_stops`, and an executed switch stops it explicitly instead of
 letting `Conflicts=` do it behind Roundhouse's back.
 
+## Part 4 — llm-proxy notification after unit-changing operations (T4, `3557728`)
+
+The hossenfelder llm-proxy discovers local models with a 30 s per-backend
+cache — stale at the worst moment right after a switch. Its
+`POST /admin/recheck` (HTTP twin of SIGUSR1, idempotent, cheap; llm-proxy
+commit `daa6a67`) clears the caches and schedules an immediate re-check.
+
+`_notify_proxy_recheck` (empty-body POST, 5 s timeout, never raises, third
+entry in the §8.1 outbound allowlist) fires **once per operation** from the
+worker's `finally`, after the terminal phase is set: switch (iff a stop
+landed or the target started), restore (always), rollout and rollback (iff
+the unit was active — inactive-unit rollouts edit bytes only). Warm routes
+through `start_switch` and is covered there. Configurable via
+`--proxy-recheck-url` (default the hossenfelder endpoint; empty disables —
+also the constructor default, so tests stay offline). Log lines:
+`proxy recheck fired (...)` / `proxy recheck skipped (...)`.
+
+Acceptance ran live on dirac with two transient fake-llama-server drill
+units (unit-repo commits `e0e5634`/`bef5f0e`): green — switch done in 4 s,
+hossenfelder logged `HTTP /admin/recheck: cleared caches` at the same
+second; red — endpoint pointed at a dead port via the roundhouse drop-in,
+second switch (with a stop) still `done`, only `proxy recheck skipped:
+Connection refused` logged, nothing at the proxy. Rosters on both hosts
+diffed field-identical before/after the whole drill.
+
 ## Verification (2026-08-25, both hosts)
 
 - Before: dirac fleet_status 7 units, no openarc-coder, :8080 conflict
