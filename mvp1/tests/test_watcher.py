@@ -1028,3 +1028,88 @@ class TestApplySystemctlShowRoundhouse(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class TestOpenArcReadiness(unittest.TestCase):
+    """OpenArc readiness: journal fast-positive + authoritative HTTP probe (MVP10)."""
+
+    def _load_openarc_unit(self) -> roundhouse.UnitFile:
+        fpath = Path(__file__).resolve().parents[0] / "fixtures-extra" / "openarc-coder.service"
+        with open(fpath, 'rb') as f:
+            raw = f.read()
+        return roundhouse.parse_unit(str(fpath), raw)
+
+    def _make_watcher(self):
+        unit = self._load_openarc_unit()
+        watcher = roundhouse.Watcher({unit.name: unit}, "6.12.0", None)
+        watcher._state[unit.name]['active_state'] = 'active'
+        watcher._state[unit.name]['exec_main_start_ts'] = roundhouse.time.time()
+        return unit, watcher
+
+    def test_journal_startup_complete_sets_ready(self):
+        unit, watcher = self._make_watcher()
+        rec = {'_SYSTEMD_USER_UNIT': unit.name,
+               'MESSAGE': '2026-08-24 17:35:35,690 - INFO - Application startup complete.'}
+        watcher.apply_journal_line(rec)
+        self.assertTrue(watcher._state[unit.name]['ready'])
+        self.assertEqual(watcher._compute_rung(unit.name), 'READY')
+
+    def test_journal_request_line_does_not_set_ready(self):
+        """uvicorn access-log lines (incl. our own probe) must not mark ready."""
+        unit, watcher = self._make_watcher()
+        rec = {'_SYSTEMD_USER_UNIT': unit.name,
+               'MESSAGE': 'INFO: 127.0.0.1:47110 - "GET /v1/models HTTP/1.1" 200 OK'}
+        watcher.apply_journal_line(rec)
+        self.assertFalse(watcher._state[unit.name].get('ready'))
+        self.assertEqual(watcher._compute_rung(unit.name), 'LOADING')
+
+    def test_probe_ready_transitions_loading_to_ready(self):
+        unit, watcher = self._make_watcher()
+        self.assertEqual(watcher._compute_rung(unit.name), 'LOADING')
+        events = watcher.apply_probe_ready(unit.name, True)
+        self.assertEqual(watcher._compute_rung(unit.name), 'READY')
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0]['rung'], 'READY')
+
+    def test_probe_unready_drops_ready_back_to_loading(self):
+        """Auto-unload: uvicorn stays active, model gone -> LOADING again."""
+        unit, watcher = self._make_watcher()
+        watcher.apply_probe_ready(unit.name, True)
+        events = watcher.apply_probe_ready(unit.name, False)
+        self.assertEqual(watcher._compute_rung(unit.name), 'LOADING')
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0]['rung'], 'LOADING')
+
+    def test_probe_ignored_when_not_active(self):
+        unit, watcher = self._make_watcher()
+        watcher._state[unit.name]['active_state'] = 'inactive'
+        events = watcher.apply_probe_ready(unit.name, True)
+        self.assertEqual(events, [])
+        self.assertFalse(watcher._state[unit.name].get('ready'))
+
+    def test_probe_helper_verdicts(self):
+        class FakeResp:
+            def __init__(self, status, body):
+                self.status = status
+                self._body = body
+            def read(self):
+                return json.dumps(self._body).encode()
+            def __enter__(self):
+                return self
+            def __exit__(self, *a):
+                return False
+
+        def opener_for(status, body):
+            def opener(url, timeout=None):
+                return FakeResp(status, body)
+            return opener
+
+        def refusing_opener(url, timeout=None):
+            raise ConnectionRefusedError()
+
+        probe = roundhouse._openarc_ready_probe
+        self.assertTrue(probe(8080, opener=opener_for(
+            200, {'object': 'list', 'data': [{'id': 'qwen3.6-coder'}]})))
+        self.assertFalse(probe(8080, opener=opener_for(200, {'object': 'list', 'data': []})))
+        self.assertFalse(probe(8080, opener=opener_for(500, {'data': [{'id': 'x'}]})))
+        self.assertFalse(probe(8080, opener=refusing_opener))

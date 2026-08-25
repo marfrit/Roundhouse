@@ -1106,6 +1106,43 @@ LF_READY = [r"ll?ama server listening at", r"all slots are idle", r"model loaded
 LF_BUSY_START = [r"slot \d+ is processing", r"processing task"]
 LF_BUSY_END = [r"slot \d+ released", r"all slots are idle"]
 
+# OpenArc (uvicorn) patterns. Startup completes only AFTER --load-models has
+# compiled (~2 min for the MoE IR — no compile cache), so this marker is a safe
+# fast-positive. No busy/req-done patterns on purpose: roundhouse's own
+# /v1/models probe would show up in uvicorn's access log and a request-done
+# rule would then re-mark an auto-unloaded model as ready. The probe
+# (apply_probe_ready) is the authority in both directions.
+OA_READY = [r"Application startup complete\."]
+
+# Readiness probe cadence: a LOADING openarc unit is probed every poll tick
+# (3 s); a READY one is re-checked every Nth tick to catch auto-unload without
+# spamming the production server's access log.
+OPENARC_PROBE_TIMEOUT = 2.0
+OPENARC_READY_RECHECK_TICKS = 10
+
+
+def _openarc_ready_probe(port: int, timeout: float = OPENARC_PROBE_TIMEOUT,
+                         opener=None) -> bool:
+    """GET /v1/models on loopback; True iff HTTP 200 with >= 1 model listed.
+
+    OpenArc lists a model only once its compilation finished (~2 min for the
+    MoE IR — the compile cache is forbidden there), so an empty list means
+    still loading, or auto-unloaded after a fault. Every connection error
+    counts as not ready. Besides _probe_peer/_presence_probe (fleet sensing,
+    Section F) this is the one outbound-connect site, and it is read-only.
+    """
+    url = f'http://127.0.0.1:{port}/v1/models'
+    op = opener or urllib.request.urlopen
+    try:
+        with op(url, timeout=timeout) as resp:
+            if getattr(resp, 'status', 200) != 200:
+                return False
+            body = json.loads(resp.read())
+    except Exception:
+        return False
+    data = body.get('data') if isinstance(body, dict) else None
+    return bool(data)
+
 
 def run_ro(argv: List[str], timeout=10) -> str:
     """Run a read-only subprocess (systemctl/journalctl only).
@@ -1457,6 +1494,11 @@ class Watcher:
             busy_start_patterns = LF_BUSY_START
             busy_end_patterns = LF_BUSY_END
             req_done_patterns = []
+        elif engine_kind == 'openarc':
+            ready_patterns = OA_READY
+            busy_start_patterns = []
+            busy_end_patterns = []
+            req_done_patterns = []
         else:
             return events
 
@@ -1502,6 +1544,50 @@ class Watcher:
         # Check for rung change
         new_rung = self._compute_rung(unit_name)
         self._state[unit_name]['_rung'] = new_rung
+        if old_rung != new_rung:
+            events.append(self._make_rung_event(unit_name, new_rung))
+
+        return events
+
+    def apply_probe_ready(self, unit_name: str, ready: bool) -> List[Dict]:
+        """Apply an HTTP readiness probe result (openarc units, MVP10).
+
+        Authoritative in both directions: a listed model makes the unit READY;
+        an empty list or refused connection drops it back to LOADING. The
+        negative direction is the one journal markers cannot see — OpenArc
+        auto-unloads a model that faulted while uvicorn stays up and active.
+
+        Args:
+            unit_name: name of the unit
+            ready: probe verdict from _openarc_ready_probe
+
+        Returns:
+            list of event dicts (rung events only)
+        """
+        events = []
+        if unit_name not in self._state:
+            return events
+
+        state = self._state[unit_name]
+        # Only an active unit has a ready/loading distinction; everything else
+        # is systemd's story (STARTING, OFF, FAILED, ...).
+        if state.get('active_state') != 'active':
+            return events
+
+        old_rung = self._get_rung(unit_name)
+
+        if bool(state.get('ready')) != ready:
+            state['last_marker'] = ('probe: /v1/models lists a model' if ready
+                                    else 'probe: /v1/models empty or unreachable')
+        state['ready'] = ready
+        if not ready:
+            state['busy'] = False
+        if ready and not state.get('ready_at'):
+            state['ready_at'] = self.now()
+        state['sensed_at'] = self.now()
+
+        new_rung = self._compute_rung(unit_name)
+        state['_rung'] = new_rung
         if old_rung != new_rung:
             events.append(self._make_rung_event(unit_name, new_rung))
 
@@ -3663,7 +3749,7 @@ class ThreadingHTTPServer(http.server.ThreadingHTTPServer):
             return snapshot
 
 
-# ===== SECTION F: PEER WATCH + LISTEN LIST (sensing only: the ONE outbound-connect site is _probe_peer for TCP, _fetch_peer is the ONE federated-HTTP site; no data on the wire, no subprocess, no writes, no actuation) =====
+# ===== SECTION F: PEER WATCH + LISTEN LIST (sensing only: the ONE fleet outbound-connect site is _probe_peer for TCP, _fetch_peer is the ONE federated-HTTP site; the one unit-local outbound site is _openarc_ready_probe in Section B — loopback GET, read-only; no data on the wire, no subprocess, no writes, no actuation) =====
 
 # Constants (§4.3, J6)
 PEER_TIMEOUT_SEC = 2.0
@@ -8772,6 +8858,7 @@ def cmd_serve(args):
     last_board = {'board': None}
     systemctl_state = {'down_since': None}
     backoff_journal = 1
+    openarc_tick = {}  # unit -> poll ticks while active (probe cadence, MVP10)
 
     def poll_systemctl():
         """Poll systemctl every 3 seconds."""
@@ -8842,6 +8929,34 @@ def cmd_serve(args):
                     if board != last_board['board']:
                         last_board['board'] = board
                         event_bus.publish('ports', board)
+
+                # OpenArc readiness probe (MVP10). Journal markers cannot see an
+                # auto-unload, and the model shows in /v1/models only after the
+                # ~2 min compile. Collect targets under the lock, probe OUTSIDE
+                # it (network I/O), apply under the lock again.
+                probe_targets = []
+                with watcher_lock:
+                    for unit_name in selected_unit_names:
+                        u = watcher.units.get(unit_name)
+                        if not u or not u.exec_start or \
+                                u.exec_start.engine.get('kind') != 'openarc':
+                            continue
+                        state = watcher._state.get(unit_name, {})
+                        if state.get('active_state') != 'active':
+                            openarc_tick.pop(unit_name, None)
+                            continue
+                        n = openarc_tick.get(unit_name, 0)
+                        openarc_tick[unit_name] = n + 1
+                        if state.get('ready') and n % OPENARC_READY_RECHECK_TICKS != 0:
+                            continue
+                        profile = extract_param_profile(u.exec_start.engine_argv)
+                        probe_targets.append((unit_name, profile.get('port')))
+
+                for unit_name, unit_port in probe_targets:
+                    is_ready = _openarc_ready_probe(unit_port)
+                    with watcher_lock:
+                        for event in watcher.apply_probe_ready(unit_name, is_ready):
+                            event_bus.publish('rung', event)
 
                 # Tick pending warm (outside the lock; method locks internally)
                 if rollout_engine:

@@ -1196,13 +1196,15 @@ class TestWriteGuards(unittest.TestCase):
 
     # ---- MVP8 §8.1: the federated HTTP client is confined and cannot be weakened ----
 
-    FETCH_CALLSITES = {'_fetch_peer'}
+    # _fetch_peer: the federated HTTP client (MVP8). _openarc_ready_probe: the
+    # unit-local readiness probe (MVP10) — loopback GET /v1/models, read-only.
+    FETCH_CALLSITES = {'_fetch_peer', '_openarc_ready_probe'}
     OPENING_ATTRS = {'urlopen', 'build_opener', 'OpenerDirector', 'HTTPSHandler',
                      'HTTPHandler', 'HTTPConnection', 'HTTPSConnection'}
 
     def test_fetch_confined(self):
         """§8.1(a): every connection-opening urllib/http.client symbol sits in
-        FETCH_CALLSITES = {'_fetch_peer'}.
+        FETCH_CALLSITES = {'_fetch_peer', '_openarc_ready_probe'}.
 
         _FleetNoRedirect subclasses HTTPRedirectHandler, which opens nothing and is
         not in the set — the class body is the one place a handler name may appear
