@@ -5771,3 +5771,101 @@ WantedBy=default.target
         result = roundhouse.switch_preflight(coder.name, [], watcher, units, 8099, self._meminfo)
 
         self.assertEqual(self._conflict_notices(result), [])
+
+
+class TestProxyRecheckNotify(_SwitchHarness):
+    """Post-operation llm-proxy poke (MVP10 follow-up): one call per operation,
+    after completion, never failing the operation."""
+
+    def _recording_engine(self, fleet):
+        engine = self._engine(fleet)
+        engine.proxy_recheck_url = 'http://proxy.test:8082/admin/recheck'
+        self.notify_calls = []
+
+        def record(url, reason, timeout=None, opener=None):
+            self.notify_calls.append((url, reason))
+            return True
+        return engine, record
+
+    def test_successful_switch_fires_exactly_once_after_done(self):
+        fleet = self._fleet([self.A, self.B])
+        engine, record = self._recording_engine(fleet)
+
+        with patch.object(roundhouse, '_notify_proxy_recheck', record):
+            rec = self._run_switch(engine, fleet, self.TARGET, [self.A, self.B])
+            self._wait_for(lambda: self.notify_calls, what='proxy notify')
+
+        self.assertEqual(rec['phase'], 'done', rec['detail'])
+        self.assertEqual(len(self.notify_calls), 1, 'one call per operation, not per unit')
+        url, reason = self.notify_calls[0]
+        self.assertEqual(url, 'http://proxy.test:8082/admin/recheck')
+        self.assertIn(self.TARGET, reason)
+
+    def test_stale_confirm_fires_nothing(self):
+        """A switch refused before any stop touched nothing — no poke."""
+        fleet = self._fleet([self.A])
+        engine, record = self._recording_engine(fleet)
+
+        with patch.object(roundhouse, '_notify_proxy_recheck', record), \
+             patch.object(roundhouse, 'run_actuate', self._stub_actuate(fleet)), \
+             patch.object(roundhouse, '_estimate_start_bytes', self._tiny_estimate):
+            rec = engine.start_switch(self.TARGET, [self.A], 'not-the-right-hash')
+            self._wait_terminal(rec)
+            time.sleep(0.1)  # give a wrong late notify the chance to appear
+
+        self.assertEqual(rec['phase'], 'failed')
+        self.assertEqual(self.notify_calls, [])
+
+    def test_notify_failure_does_not_fail_the_switch(self):
+        """Red path: dead endpoint — the switch outcome is untouched."""
+        fleet = self._fleet([self.A])
+        engine = self._engine(fleet)
+        # A port that answers nothing: _notify_proxy_recheck runs for real and
+        # must swallow the connection error.
+        engine.proxy_recheck_url = 'http://127.0.0.1:9/admin/recheck'
+
+        rec = self._run_switch(engine, fleet, self.TARGET, [self.A])
+
+        self.assertEqual(rec['phase'], 'done', rec['detail'])
+
+    def test_empty_url_disables(self):
+        fleet = self._fleet([self.A])
+        engine, record = self._recording_engine(fleet)
+        engine.proxy_recheck_url = ''
+
+        with patch.object(roundhouse, '_notify_proxy_recheck', record):
+            rec = self._run_switch(engine, fleet, self.TARGET, [self.A])
+            time.sleep(0.1)
+
+        self.assertEqual(rec['phase'], 'done', rec['detail'])
+        # The notifier itself gates on the empty URL, so at most a call with
+        # url='' may be recorded here — never one that would hit the network.
+        self.assertEqual([c for c in self.notify_calls if c[0]], [])
+
+    def test_notifier_verdicts_and_silence(self):
+        class FakeResp:
+            def __init__(self, status):
+                self.status = status
+            def read(self):
+                return b''
+            def __enter__(self):
+                return self
+            def __exit__(self, *a):
+                return False
+
+        calls = []
+        def ok_opener(req, timeout=None):
+            calls.append((req.get_method(), req.full_url, timeout))
+            return FakeResp(202)
+        def http_error_opener(req, timeout=None):
+            return FakeResp(500)
+        def dead_opener(req, timeout=None):
+            raise ConnectionRefusedError('dead')
+
+        notify = roundhouse._notify_proxy_recheck
+        self.assertTrue(notify('http://p/admin/recheck', 'test', opener=ok_opener))
+        self.assertEqual(calls, [('POST', 'http://p/admin/recheck',
+                                  roundhouse.PROXY_RECHECK_TIMEOUT)])
+        self.assertFalse(notify('http://p/admin/recheck', 'test', opener=http_error_opener))
+        self.assertFalse(notify('http://p/admin/recheck', 'test', opener=dead_opener))
+        self.assertFalse(notify('', 'test', opener=ok_opener), 'empty URL disables')

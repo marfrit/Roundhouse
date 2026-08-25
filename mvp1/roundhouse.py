@@ -1144,6 +1144,45 @@ def _openarc_ready_probe(port: int, timeout: float = OPENARC_PROBE_TIMEOUT,
     return bool(data)
 
 
+# llm-proxy notification (MVP10 follow-up). After an operation that changed
+# what a serving port offers, the proxy's 30 s discovery cache is stale at the
+# worst possible moment; POSTing its /admin/recheck (the HTTP twin of its
+# SIGUSR1 handler, idempotent and cheap) makes it re-discover immediately.
+DEFAULT_PROXY_RECHECK_URL = 'http://hossenfelder.fritz.box:8082/admin/recheck'
+PROXY_RECHECK_TIMEOUT = 5.0
+
+
+def _notify_proxy_recheck(url: str, reason: str,
+                          timeout: float = PROXY_RECHECK_TIMEOUT,
+                          opener=None) -> bool:
+    """POST the llm-proxy recheck endpoint. Fire-and-forget: NEVER raises.
+
+    An unreachable proxy must never fail or delay the operation that just
+    completed — log one warning line and move on. Returns True iff the proxy
+    acknowledged (2xx). With _fetch_peer and _openarc_ready_probe this is one
+    of the three outbound-connect sites; it sends an empty body and reads
+    nothing back but the status.
+    """
+    if not url:
+        return False
+    op = opener or urllib.request.urlopen
+    req = urllib.request.Request(url, data=b'', method='POST')
+    try:
+        with op(req, timeout=timeout) as resp:
+            status = getattr(resp, 'status', 0)
+        if 200 <= status < 300:
+            print(f"proxy recheck fired ({reason}): POST {url} -> {status}",
+                  file=sys.stderr)
+            return True
+        print(f"proxy recheck skipped ({reason}): POST {url} -> HTTP {status}",
+              file=sys.stderr)
+        return False
+    except Exception as e:
+        print(f"proxy recheck skipped ({reason}): POST {url} failed: {e}",
+              file=sys.stderr)
+        return False
+
+
 def run_ro(argv: List[str], timeout=10) -> str:
     """Run a read-only subprocess (systemctl/journalctl only).
 
@@ -6390,13 +6429,16 @@ class RolloutEngine:
 
     def __init__(self, watcher: 'Watcher', units: Dict[str, UnitFile],
                  unit_dir: str, self_port: int, event_bus: EventBus,
-                 watcher_lock: threading.Lock):
+                 watcher_lock: threading.Lock, proxy_recheck_url: str = ''):
         self.watcher = watcher
         self.units = units
         self.unit_dir = unit_dir
         self.self_port = self_port
         self.event_bus = event_bus
         self.watcher_lock = watcher_lock
+        # Empty string disables (the test default); cmd_serve passes the flag
+        # value, whose default is the live hossenfelder endpoint.
+        self.proxy_recheck_url = proxy_recheck_url
 
         self.current = None
         self.rollouts = {}
@@ -6406,6 +6448,18 @@ class RolloutEngine:
         self.pending_warm = None
         self.last_warm = None
         self.warm_seq = 0
+
+    def _notify_proxy(self, reason: str):
+        """One post-operation llm-proxy poke; never raises, at most 5 s tail.
+
+        Called from a worker's `finally` AFTER the terminal phase is set, so a
+        slow or dead proxy delays nothing the operator can see. One call per
+        operation, not per unit.
+        """
+        try:
+            _notify_proxy_recheck(self.proxy_recheck_url, reason)
+        except Exception:
+            pass  # _notify_proxy_recheck already never raises; belt and braces
 
     def start_rollout(self, unit_name: str, edits: List[Edit], confirm: str) -> Dict:
         """Start a new rollout. Returns the rollout record."""
@@ -6460,6 +6514,7 @@ class RolloutEngine:
         if not rollout:
             return
 
+        touched = False  # did this rollout stop/start the unit? (proxy notify gate)
         try:
             unit = self.units[unit_name]
 
@@ -6516,6 +6571,10 @@ class RolloutEngine:
 
             # Applying phase
             self._update_phase(rollout_id, "applying", "stopping unit")
+            # Every runtime-touching path from here on (stop, restart-on-error,
+            # the starting phase) is behind `was_active`; a rollout over an
+            # inactive unit edits bytes only.
+            touched = was_active
 
             try:
                 if was_active:
@@ -6620,6 +6679,9 @@ class RolloutEngine:
 
         except Exception as e:
             self._fail_rollout(rollout_id, "preflight", "engine_error", detail=str(e))
+        finally:
+            if touched:
+                self._notify_proxy(f"rollout {unit_name}")
 
     def _update_phase(self, rollout_id: str, phase: str, detail: str):
         """Update phase and publish SSE event."""
@@ -7050,6 +7112,14 @@ class RolloutEngine:
 
         except Exception as e:
             self._fail_rollout(switch_id, "failed", "engine_error", detail=str(e))
+        finally:
+            # The proxy cares iff runtime state changed: any stop landed, or the
+            # target was started. Preflight/stale-confirm failures touch nothing.
+            with self.watcher_lock:
+                sw = self.rollouts.get(switch_id) or {}
+                actuated = bool(sw.get('stopped')) or bool(sw.get('target_started'))
+            if actuated:
+                self._notify_proxy(f"switch {target}")
 
     def _confirm_off(self, unit_name: str) -> str:
         """Poll the roster until `unit_name` is confirmed no longer running (F2).
@@ -7176,6 +7246,10 @@ class RolloutEngine:
                 if switch:
                     switch['phase'] = 'restore_failed'
                     switch['updated_at'] = time.time()
+        finally:
+            # A restore stops the target and restarts the displaced units —
+            # runtime state moved either way, even on the partial-failure paths.
+            self._notify_proxy(f"restore after switch {switch_id}")
 
     def rollback(self, rollout_id: str):
         """Start rollback/restore of a failed operation (rollout or switch).
@@ -7315,6 +7389,10 @@ class RolloutEngine:
             with self.watcher_lock:
                 rollout['phase'] = 'rollback_failed'
                 rollout['updated_at'] = time.time()
+        finally:
+            # Mirrors _run_rollout: only an active unit was stopped/started here.
+            if was_active:
+                self._notify_proxy(f"rollback {unit_name}")
 
     def dismiss(self, rollout_id: str):
         """Dismiss a failed rollout's rollback offer, freeing the slot (§6).
@@ -8730,6 +8808,9 @@ def main():
                         help='Fleet peer declaration NAME=URL (http(s)://host[:port]); repeatable, max 4')
     parser.add_argument('--peer-interval', type=int, default=PEER_INTERVAL_SEC,
                         help=f'Peer probe cadence in seconds (default: {PEER_INTERVAL_SEC})')
+    parser.add_argument('--proxy-recheck-url', default=DEFAULT_PROXY_RECHECK_URL,
+                        help='llm-proxy endpoint POSTed after unit-changing operations '
+                             f'(default: {DEFAULT_PROXY_RECHECK_URL}; empty string disables)')
 
     args = parser.parse_args()
 
@@ -9138,7 +9219,8 @@ def cmd_serve(args):
     # Create RolloutEngine if armed (before poll_thread starts — tick_pending_warm needs it)
     rollout_engine = None
     if ACTUATE_ARMED:
-        rollout_engine = RolloutEngine(watcher, units, unit_dir, port, event_bus, watcher_lock)
+        rollout_engine = RolloutEngine(watcher, units, unit_dir, port, event_bus, watcher_lock,
+                                       proxy_recheck_url=args.proxy_recheck_url)
 
     # Start threads
     poll_thread = threading.Thread(target=poll_systemctl, daemon=True)

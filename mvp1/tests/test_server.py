@@ -1198,13 +1198,15 @@ class TestWriteGuards(unittest.TestCase):
 
     # _fetch_peer: the federated HTTP client (MVP8). _openarc_ready_probe: the
     # unit-local readiness probe (MVP10) — loopback GET /v1/models, read-only.
-    FETCH_CALLSITES = {'_fetch_peer', '_openarc_ready_probe'}
+    # _notify_proxy_recheck: the post-operation llm-proxy poke (MVP10 follow-up)
+    # — empty-body POST, reads only the status, never raises.
+    FETCH_CALLSITES = {'_fetch_peer', '_openarc_ready_probe', '_notify_proxy_recheck'}
     OPENING_ATTRS = {'urlopen', 'build_opener', 'OpenerDirector', 'HTTPSHandler',
                      'HTTPHandler', 'HTTPConnection', 'HTTPSConnection'}
 
     def test_fetch_confined(self):
         """§8.1(a): every connection-opening urllib/http.client symbol sits in
-        FETCH_CALLSITES = {'_fetch_peer', '_openarc_ready_probe'}.
+        FETCH_CALLSITES = {'_fetch_peer', '_openarc_ready_probe', '_notify_proxy_recheck'}.
 
         _FleetNoRedirect subclasses HTTPRedirectHandler, which opens nothing and is
         not in the set — the class body is the one place a handler name may appear
