@@ -90,6 +90,49 @@ second switch (with a stop) still `done`, only `proxy recheck skipped:
 Connection refused` logged, nothing at the proxy. Rosters on both hosts
 diffed field-identical before/after the whole drill.
 
+## Part 5 — bosch: ds4 + docker-vLLM, and the third fleet member (T5, `c3bed02`)
+
+The DGX Spark (bosch, GB10, 121 GiB unified memory) ran its models as root
+system units — ds4-server (bespoke DeepSeek V4, :8085), a vLLM NVFP4
+Qwen3.8-27B in docker (:8086, `Conflicts=ds4-server`), llama.cpp Ornith
+(model file since deleted), ollama. Switching between them was hand-work.
+
+New engine kinds: `ds4` (basename ds4-server; `--ctx` in the flag table)
+and `vllm` (variant docker — classified ONLY when the container visibly
+runs vLLM; port = host half of `-p`, alias = first `--served-model-name`,
+ctx = `--max-model-len`, model_path = host side of the `/model` volume).
+`select_units` accepts any classified engine. The readiness probe became
+`_models_ready_probe` over `OPENAI_PROBE_ENGINES = (openarc, vllm, ds4)`;
+vllm shares OpenArc's uvicorn journal fast-positive, ds4 is probe-only.
+
+**Declared memory (`# roundhouse: mem-estimate <N[KMGT]>`):** CUDA/unified
+memory and docker containers hold their bytes OUTSIDE the unit cgroup (ds4:
+~100 GiB real, 769 MB in memory.current), so measured numbers would refuse
+switches that trivially fit. The marker outranks measurement in BOTH
+`_estimate_start_bytes` ("declared") and `_freed_bytes` ("declared
+mem-estimate"). bosch declares ds4=100G, qwen-server=106G.
+
+**Host migration (2026-08-27, user-approved):** ds4-server and qwen-server
+became user units under mfritsche (`~/.config/systemd/user`, git repo,
+commit `4575235`; linger on; `Requires=docker.service` dropped — a user
+unit cannot depend on a system unit; `ExecStopPost=docker rm -f` added).
+Old system units archived as `*.service.disabled` (llama-server too — its
+model file is gone). ollama stays a system service on purpose: own user,
+multi-model daemon, not a switchable stall. Roundhouse installed per the
+deploy procedure, `roundhouse.service` user unit with
+`--bind-optional 192.168.88.164`, federated with dirac and boltzmann
+(peer entries added on both); `roundhouse-bosch` MCP wired into
+noether's `~/.claude.json`.
+
+**Acceptance (live):** switch ds4→qwen-server: preview showed all five
+checks green with `estimate 106G (declared)` vs `freed 100G (declared
+mem-estimate)` plus the Conflicts= notice; executed, vLLM READY in
+375.4 s (weights + FP4-GEMM autotune — the tuning repeats every cold
+start because `--rm` discards the container's `/root/.cache/vllm`;
+mounting a host cache volume is an open follow-up). Proxy recheck fired.
+Then switched back to ds4. dirac/boltzmann rosters: zero structural
+drift after the same-day deploy.
+
 ## Verification (2026-08-25, both hosts)
 
 - Before: dirac fleet_status 7 units, no openarc-coder, :8080 conflict
