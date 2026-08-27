@@ -1495,7 +1495,7 @@ class TestScriptedSession(unittest.TestCase):
             # fall back to its 9 GiB default and the fit check would depend on the build
             # box's free RAM. Memory arithmetic is TestSwitchPreflight's subject.
             patch.object(roundhouse, '_estimate_start_bytes',
-                         lambda unit, profile, store: (64 * 1024 * 1024, 'test-injected')),
+                         lambda unit, profile, store, **kw: (64 * 1024 * 1024, 'test-injected')),
             # A switch touches neither the git gateway nor the file writer; if the MCP
             # layer ever grew its own actuation path, these would fire.
             patch.object(roundhouse, 'run_git', self._forbidden('run_git')),

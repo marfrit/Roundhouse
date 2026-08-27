@@ -138,6 +138,9 @@ class UnitFile:
       gate: dict from parse_gate() or None
       install_wanted_by: decoded WantedBy field or None
       on_demand: True if '# roundhouse: on-demand' or '; roundhouse: on-demand' found in raw
+      mem_estimate: declared '# roundhouse: mem-estimate <N[KMGT]>' in bytes, or None.
+        For engines whose residency the unit cgroup cannot see (CUDA/unified
+        memory, docker-wrapped servers) this is the ONLY truthful fit number.
       known: dict of {field: value} for standard keys
       other_directives: list of Directive not in the known set
     """
@@ -156,8 +159,18 @@ class UnitFile:
     gate: Optional[Dict] = None
     install_wanted_by: Optional[str] = None
     on_demand: bool = False
+    mem_estimate: Optional[int] = None
     known: Dict = field(default_factory=dict)
     other_directives: List[Directive] = field(default_factory=list)
+
+
+def parse_mem_size(text: str) -> Optional[int]:
+    """'100G'/'512M'/'1048576'/'2T' -> bytes (binary suffixes); None on garbage."""
+    m = re.fullmatch(r'(\d+)([KMGT]?)', text.strip(), re.IGNORECASE)
+    if not m:
+        return None
+    shift = {'': 0, 'K': 10, 'M': 20, 'G': 30, 'T': 40}[m.group(2).upper()]
+    return int(m.group(1)) << shift
 
 
 def parse_unit(path: str, raw: bytes) -> UnitFile:
@@ -192,6 +205,12 @@ def parse_unit(path: str, raw: bytes) -> UnitFile:
     # Check for on-demand marker (same substring mechanism as manage/ignore)
     raw_str = raw.decode('utf-8', errors='replace')
     on_demand = ('# roundhouse: on-demand' in raw_str or '; roundhouse: on-demand' in raw_str)
+
+    # Declared memory appetite (same comment-marker mechanism). Binary suffixes.
+    mem_estimate = None
+    m_mem = re.search(r'[#;]\s*roundhouse:\s*mem-estimate\s+(\S+)', raw_str)
+    if m_mem:
+        mem_estimate = parse_mem_size(m_mem.group(1))
 
     # Known directive keys
     KNOWN_KEYS = {
@@ -242,6 +261,7 @@ def parse_unit(path: str, raw: bytes) -> UnitFile:
         gate=gate,
         install_wanted_by=install_wanted_by,
         on_demand=on_demand,
+        mem_estimate=mem_estimate,
         known=known,
         other_directives=other_directives
     )
@@ -497,6 +517,32 @@ def tokenize_execstart(directive: Directive, raw: bytes) -> ExecStart:
                         'binary': engine_binary,
                         'variant': 'openvino'
                     }
+            elif engine_basename == 'ds4-server':
+                # antirez/ds4 — the bespoke DeepSeek V4 server on bosch.
+                engine = {
+                    'kind': 'ds4',
+                    'binary': engine_binary,
+                    'variant': 'ds4'
+                }
+            elif engine_basename == 'docker':
+                # A docker-wrapped engine. Deliberately narrow: only a container
+                # that visibly runs vLLM classifies — an arbitrary docker unit
+                # must never enter the roster just for using docker.
+                is_vllm = False
+                for j, t in enumerate(engine_argv[1:], start=1):
+                    if t.text.startswith('vllm/vllm-openai'):
+                        is_vllm = True
+                        break
+                    if t.text == '--entrypoint' and j + 1 < len(engine_argv) \
+                            and engine_argv[j + 1].text == 'vllm':
+                        is_vllm = True
+                        break
+                if is_vllm:
+                    engine = {
+                        'kind': 'vllm',
+                        'binary': engine_binary,
+                        'variant': 'docker'
+                    }
 
     return ExecStart(
         directive=directive,
@@ -685,6 +731,11 @@ KNOWN_FLAG_MAP = {
     # OpenArc: the model name it loads at startup doubles as the serving alias
     # (same string a consumer passes as "model"). llama-server has no such flag.
     '--load-models': ('alias', 1, 'str'),
+    # ds4-server context flag (llama.cpp uses -c/--ctx-size, no clash)
+    '--ctx': ('ctx', 1, 'int'),
+    # vLLM: serving alias and context length (first name wins when several are given)
+    '--served-model-name': ('alias', 1, 'str'),
+    '--max-model-len': ('ctx', 1, 'int'),
 }
 
 # canonical field name -> type, derived from the one table above.
@@ -843,11 +894,34 @@ def extract_param_profile(engine_argv: List[Token]) -> Dict:
         else:
             i += 1
 
-    # Set default port if not specified. OpenArc serves on 8000 when --port is
-    # absent; the llama.cpp family defaults to 8080.
+    binary_base = os.path.basename(engine_argv[0].text) if engine_argv else ''
+
+    # Docker-wrapped engine (vLLM): the serving port is the HOST half of the
+    # first -p mapping, not a --port flag, and the model is the host side of
+    # the volume mounted at /model. Both live in docker's argv, which the
+    # generic table above rightly treats as unknown flags.
+    if binary_base == 'docker':
+        for i, tok in enumerate(engine_argv):
+            if tok.text == '-p' and i + 1 < len(engine_argv):
+                host_part = engine_argv[i + 1].text.split(':')[0]
+                try:
+                    result['port'] = int(host_part)
+                    result['port_source'] = 'flag'
+                except ValueError:
+                    pass
+                break
+        if result['model_path'] is None:
+            for i, tok in enumerate(engine_argv):
+                if tok.text == '-v' and i + 1 < len(engine_argv):
+                    parts = engine_argv[i + 1].text.split(':')
+                    if len(parts) >= 2 and parts[1].startswith('/model'):
+                        result['model_path'] = parts[0]
+                        break
+
+    # Set default port if not specified. OpenArc and vLLM serve on 8000 when
+    # unmapped; the llama.cpp family defaults to 8080.
     if result['port'] is None:
-        binary_base = os.path.basename(engine_argv[0].text) if engine_argv else ''
-        result['port'] = 8000 if binary_base == 'openarc' else 8080
+        result['port'] = 8000 if binary_base in ('openarc', 'docker') else 8080
         result['port_source'] = 'default'
 
     return result
@@ -934,11 +1008,16 @@ def select_units(unit_dir: str) -> List[str]:
         try:
             unit = parse_unit(fpath, raw)
             if unit.exec_start:
+                # A classified engine is managed by definition (openarc, ds4,
+                # docker-wrapped vllm — their basenames carry no marker string).
+                if unit.exec_start.engine:
+                    is_ours = True
                 for tok in unit.exec_start.tokens:
+                    if is_ours:
+                        break
                     base = os.path.basename(tok.text)
                     if base.startswith('llama-server') or 'llamafile' in base or base == 'openarc':
                         is_ours = True
-                        break
         except Exception:
             is_ours = False
 
@@ -1120,8 +1199,13 @@ OA_READY = [r"Application startup complete\."]
 OPENARC_PROBE_TIMEOUT = 2.0
 OPENARC_READY_RECHECK_TICKS = 10
 
+# Engine kinds whose readiness is probed via GET /v1/models (OpenAI-style
+# catalogs that list a model only once it is actually servable). vllm shares
+# OpenArc's uvicorn journal fast-positive; ds4 is probe-only.
+OPENAI_PROBE_ENGINES = ('openarc', 'vllm', 'ds4')
 
-def _openarc_ready_probe(port: int, timeout: float = OPENARC_PROBE_TIMEOUT,
+
+def _models_ready_probe(port: int, timeout: float = OPENARC_PROBE_TIMEOUT,
                          opener=None) -> bool:
     """GET /v1/models on loopback; True iff HTTP 200 with >= 1 model listed.
 
@@ -1159,7 +1243,7 @@ def _notify_proxy_recheck(url: str, reason: str,
 
     An unreachable proxy must never fail or delay the operation that just
     completed — log one warning line and move on. Returns True iff the proxy
-    acknowledged (2xx). With _fetch_peer and _openarc_ready_probe this is one
+    acknowledged (2xx). With _fetch_peer and _models_ready_probe this is one
     of the three outbound-connect sites; it sends an empty body and reads
     nothing back but the status.
     """
@@ -1533,8 +1617,15 @@ class Watcher:
             busy_start_patterns = LF_BUSY_START
             busy_end_patterns = LF_BUSY_END
             req_done_patterns = []
-        elif engine_kind == 'openarc':
+        elif engine_kind in ('openarc', 'vllm'):
+            # vllm (uvicorn) logs the same startup-complete marker as OpenArc.
             ready_patterns = OA_READY
+            busy_start_patterns = []
+            busy_end_patterns = []
+            req_done_patterns = []
+        elif engine_kind == 'ds4':
+            # No stable ready marker in ds4's log; the /v1/models probe decides.
+            ready_patterns = []
             busy_start_patterns = []
             busy_end_patterns = []
             req_done_patterns = []
@@ -1598,7 +1689,7 @@ class Watcher:
 
         Args:
             unit_name: name of the unit
-            ready: probe verdict from _openarc_ready_probe
+            ready: probe verdict from _models_ready_probe
 
         Returns:
             list of event dicts (rung events only)
@@ -1782,6 +1873,7 @@ class Watcher:
                 'quant_hint': quant,
                 'ctx': profile.get('ctx'),
                 'mem': mem_info,
+                'mem_estimate': unit.mem_estimate,
                 'port_conflict': None,  # filled in below, once every claim is known
                 'strategy_note': strategy_note(enabled, rung, unit.retired)
             }
@@ -3788,7 +3880,7 @@ class ThreadingHTTPServer(http.server.ThreadingHTTPServer):
             return snapshot
 
 
-# ===== SECTION F: PEER WATCH + LISTEN LIST (sensing only: the ONE fleet outbound-connect site is _probe_peer for TCP, _fetch_peer is the ONE federated-HTTP site; the one unit-local outbound site is _openarc_ready_probe in Section B — loopback GET, read-only; no data on the wire, no subprocess, no writes, no actuation) =====
+# ===== SECTION F: PEER WATCH + LISTEN LIST (sensing only: the ONE fleet outbound-connect site is _probe_peer for TCP, _fetch_peer is the ONE federated-HTTP site; the one unit-local outbound site is _models_ready_probe in Section B — loopback GET, read-only; no data on the wire, no subprocess, no writes, no actuation) =====
 
 # Constants (§4.3, J6)
 PEER_TIMEOUT_SEC = 2.0
@@ -6334,7 +6426,8 @@ def preflight_memory(unit: UnitFile, edits: List[Edit], watcher: 'Watcher',
 
     # Estimate memory using extracted helper
     store = getattr(watcher, 'mem_store', None)
-    estimate_bytes, estimate_source = _estimate_start_bytes(unit.name, new_profile, store)
+    estimate_bytes, estimate_source = _estimate_start_bytes(
+        unit.name, new_profile, store, mem_estimate=unit.mem_estimate)
 
     # Read MemAvailable
     mem_available = None
@@ -7635,14 +7728,23 @@ def compute_switch_confirm(target: str, stops: List[str], fingerprint: Dict[str,
     return hashlib.sha256(canonical_json.encode()).hexdigest()
 
 
-def _estimate_start_bytes(unit_name: str, profile: Dict, mem_store) -> tuple:
+def _estimate_start_bytes(unit_name: str, profile: Dict, mem_store,
+                          mem_estimate: Optional[int] = None) -> tuple:
     """Estimate memory needed to start a unit (bytes, source_label).
 
-    Order: exact measured (unit, file_id, ctx) -> "measured"
+    Order: declared '# roundhouse: mem-estimate' marker -> "declared"
+           exact measured (unit, file_id, ctx) -> "measured"
            newest measured (unit, file_id, any ctx) -> "measured at ctx <c>; target ctx unproven"
            formula int(size*1.10 + 1.5 GiB) -> "formula"
            9 GiB default -> "default"
+
+    The marker outranks measurement on purpose: for CUDA/unified-memory and
+    docker-wrapped engines the cgroup-measured peak is a fraction of the real
+    appetite, and a confidently wrong number is worse than an operator's one.
     """
+    if mem_estimate:
+        return (mem_estimate, "declared")
+
     model_path = profile.get('model_path')
     ctx = profile.get('ctx')
 
@@ -7678,6 +7780,14 @@ def _freed_bytes(unit_name: str, unit_row: Dict, cgroup_cache: Dict) -> tuple:
     rung = unit_row.get('rung')
     if rung not in ACTIVE_RUNGS:
         return (0, 'none (unit not active)')
+
+    # Declared appetite first: a CUDA/unified-memory or docker-wrapped engine
+    # holds its memory OUTSIDE the unit cgroup, so memory.current would report
+    # a few hundred MB for a 100 GiB model and the fit arithmetic would refuse
+    # switches that trivially fit.
+    declared = unit_row.get('mem_estimate')
+    if declared:
+        return (declared, 'declared mem-estimate')
 
     # Check cgroup
     cgroup = cgroup_cache.get(unit_name) or {}
@@ -7876,7 +7986,8 @@ def switch_preflight(target: str, stops: List[str], watcher: 'Watcher', units: D
     if target_unit.exec_start:
         target_profile = extract_param_profile(target_unit.exec_start.engine_argv)
 
-    estimate_bytes, estimate_source = _estimate_start_bytes(target, target_profile, mem_store)
+    estimate_bytes, estimate_source = _estimate_start_bytes(
+        target, target_profile, mem_store, mem_estimate=target_unit.mem_estimate)
 
     # Read MemAvailable
     mem_available = None
@@ -8709,7 +8820,8 @@ def warm_plan(target: str, snapshot: Dict, units: Dict[str, 'UnitFile'],
         profile = extract_param_profile(units[target].exec_start.engine_argv)
 
     # Estimate memory needed
-    estimate, estimate_source = _estimate_start_bytes(target, profile, mem_store)
+    estimate, estimate_source = _estimate_start_bytes(
+        target, profile, mem_store, mem_estimate=units[target].mem_estimate)
 
     # Get available memory
     mem_snapshot = snapshot.get('mem', {})
@@ -9050,7 +9162,7 @@ def cmd_serve(args):
                     for unit_name in selected_unit_names:
                         u = watcher.units.get(unit_name)
                         if not u or not u.exec_start or \
-                                u.exec_start.engine.get('kind') != 'openarc':
+                                u.exec_start.engine.get('kind') not in OPENAI_PROBE_ENGINES:
                             continue
                         state = watcher._state.get(unit_name, {})
                         if state.get('active_state') != 'active':
@@ -9064,7 +9176,7 @@ def cmd_serve(args):
                         probe_targets.append((unit_name, profile.get('port')))
 
                 for unit_name, unit_port in probe_targets:
-                    is_ready = _openarc_ready_probe(unit_port)
+                    is_ready = _models_ready_probe(unit_port)
                     with watcher_lock:
                         for event in watcher.apply_probe_ready(unit_name, is_ready):
                             event_bus.publish('rung', event)

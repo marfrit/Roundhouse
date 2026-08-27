@@ -2372,7 +2372,7 @@ class _SwitchHarness(unittest.TestCase):
             target, stops, roundhouse.fleet_fingerprint(fleet.snapshot()))
 
     @staticmethod
-    def _tiny_estimate(unit_name, profile, mem_store):
+    def _tiny_estimate(unit_name, profile, mem_store, mem_estimate=None):
         """The fixtures name model files that do not exist here, so the estimator falls
         back to its 9 GiB default and the worker's re-run preflight would fail on any
         build box with less free RAM than that. Memory arithmetic is TestSwitchPreflight's

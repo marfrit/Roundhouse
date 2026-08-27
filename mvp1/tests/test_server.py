@@ -1196,17 +1196,17 @@ class TestWriteGuards(unittest.TestCase):
 
     # ---- MVP8 §8.1: the federated HTTP client is confined and cannot be weakened ----
 
-    # _fetch_peer: the federated HTTP client (MVP8). _openarc_ready_probe: the
+    # _fetch_peer: the federated HTTP client (MVP8). _models_ready_probe: the
     # unit-local readiness probe (MVP10) — loopback GET /v1/models, read-only.
     # _notify_proxy_recheck: the post-operation llm-proxy poke (MVP10 follow-up)
     # — empty-body POST, reads only the status, never raises.
-    FETCH_CALLSITES = {'_fetch_peer', '_openarc_ready_probe', '_notify_proxy_recheck'}
+    FETCH_CALLSITES = {'_fetch_peer', '_models_ready_probe', '_notify_proxy_recheck'}
     OPENING_ATTRS = {'urlopen', 'build_opener', 'OpenerDirector', 'HTTPSHandler',
                      'HTTPHandler', 'HTTPConnection', 'HTTPSConnection'}
 
     def test_fetch_confined(self):
         """§8.1(a): every connection-opening urllib/http.client symbol sits in
-        FETCH_CALLSITES = {'_fetch_peer', '_openarc_ready_probe', '_notify_proxy_recheck'}.
+        FETCH_CALLSITES = {'_fetch_peer', '_models_ready_probe', '_notify_proxy_recheck'}.
 
         _FleetNoRedirect subclasses HTTPRedirectHandler, which opens nothing and is
         not in the set — the class body is the one place a handler name may appear
@@ -2608,7 +2608,7 @@ class _HazardHarness(unittest.TestCase):
         arithmetic, the port check, the retired check and the git check all stay real.
         """
         return patch.object(roundhouse, '_estimate_start_bytes',
-                            lambda unit, profile, store: (200 * 1024 ** 2, 'measured peak row'))
+                            lambda unit, profile, store, **kw: (200 * 1024 ** 2, 'measured peak row'))
 
     def assert_local_host(self, body):
         """(b): the 2xx body names the host that acted."""

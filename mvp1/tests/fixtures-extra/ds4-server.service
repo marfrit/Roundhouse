@@ -1,0 +1,18 @@
+[Unit]
+Description=DS4 - DeepSeek V4 Flash (IQ2XXS) mit 640K Kontext
+After=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/mfritsche/src-repo/ds4
+# roundhouse: mem-estimate 100G
+ExecStart=/home/mfritsche/src-repo/ds4/ds4-server --cuda -m /home/mfritsche/src-repo/ds4/gguf/DeepSeek-V4-Flash-IQ2XXS-chat-v2-imatrix-0731.gguf \
+    --ctx 655360 \
+    --host 0.0.0.0 --port 8085 --cors \
+    --prefill-chunk 2048
+Restart=on-failure
+RestartSec=30
+TimeoutStartSec=900
+
+[Install]
+WantedBy=default.target

@@ -521,7 +521,7 @@ class TestWatcher(unittest.TestCase):
                 'unit', 'description', 'retired', 'rung', 'roster', 'since', 'start_ts_mono',
                 'detail', 'badges', 'stale', 'sensed_at', 'enabled', 'active_state',
                 'sub_state', 'n_restarts', 'port', 'port_source', 'alias', 'on_demand', 'gate',
-                'model_file', 'quant_hint', 'ctx', 'mem', 'port_conflict', 'strategy_note'
+                'model_file', 'quant_hint', 'ctx', 'mem', 'mem_estimate', 'port_conflict', 'strategy_note'
             }
             self.assertEqual(set(unit_dict.keys()), required_unit_keys)
 
@@ -1107,7 +1107,7 @@ class TestOpenArcReadiness(unittest.TestCase):
         def refusing_opener(url, timeout=None):
             raise ConnectionRefusedError()
 
-        probe = roundhouse._openarc_ready_probe
+        probe = roundhouse._models_ready_probe
         self.assertTrue(probe(8080, opener=opener_for(
             200, {'object': 'list', 'data': [{'id': 'qwen3.6-coder'}]})))
         self.assertFalse(probe(8080, opener=opener_for(200, {'object': 'list', 'data': []})))

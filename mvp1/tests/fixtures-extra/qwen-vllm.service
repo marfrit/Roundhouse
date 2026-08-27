@@ -1,0 +1,24 @@
+[Unit]
+Description=vLLM Qwen3.8-27B NVFP4 auf :8086
+After=network-online.target docker.service
+Conflicts=ds4-server.service
+
+[Service]
+Type=simple
+# roundhouse: mem-estimate 106G
+ExecStartPre=-/usr/bin/docker rm -f qwen38
+ExecStart=/usr/bin/docker run --rm --name qwen38 --gpus all -p 8086:8000 \
+  -v /home/mfritsche/models/nvfp4/qwen38-nvfp4:/model:ro \
+  --entrypoint vllm \
+  vllm/vllm-openai@sha256:61fc8a896b0a4fbbbdc063bc4b0dbc25ce98e02b5050c24aeb7830ac02039b14 \
+  serve /model \
+  --served-model-name qwen38 qwen3.8 \
+  --max-model-len 262144 \
+  --gpu-memory-utilization 0.85
+ExecStopPost=-/usr/bin/docker rm -f qwen38
+Restart=on-failure
+RestartSec=15
+TimeoutStartSec=900
+
+[Install]
+WantedBy=default.target

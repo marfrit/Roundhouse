@@ -561,3 +561,76 @@ ExecStart=/home/mfritsche/openarc-venv/bin/openarc download --model foo
         unit = self._parse_fixture()
         self.assertEqual(unit.known.get('conflicts'),
                          'llama-coder.service llama-agent.service llama-qwen38.service')
+
+
+class TestBoschEngines(unittest.TestCase):
+    """ds4-server and docker-wrapped vLLM recognition + mem-estimate marker (MVP10)."""
+
+    def setUp(self):
+        self.fixtures_extra = Path(__file__).resolve().parents[0] / "fixtures-extra"
+
+    def _parse(self, name):
+        fpath = str(self.fixtures_extra / name)
+        with open(fpath, 'rb') as f:
+            return roundhouse.parse_unit(fpath, f.read())
+
+    def test_ds4_classification_and_profile(self):
+        unit = self._parse('ds4-server.service')
+        self.assertEqual(unit.exec_start.engine.get('kind'), 'ds4')
+        self.assertEqual(unit.exec_start.engine.get('variant'), 'ds4')
+        profile = roundhouse.extract_param_profile(unit.exec_start.engine_argv)
+        self.assertEqual(profile['port'], 8085)
+        self.assertEqual(profile['port_source'], 'flag')
+        self.assertEqual(profile['ctx'], 655360)
+        self.assertTrue(profile['model_path'].endswith('.gguf'))
+
+    def test_vllm_docker_classification_and_profile(self):
+        unit = self._parse('qwen-vllm.service')
+        self.assertEqual(unit.exec_start.engine.get('kind'), 'vllm')
+        self.assertEqual(unit.exec_start.engine.get('variant'), 'docker')
+        profile = roundhouse.extract_param_profile(unit.exec_start.engine_argv)
+        self.assertEqual(profile['port'], 8086, 'host half of -p 8086:8000')
+        self.assertEqual(profile['port_source'], 'flag')
+        self.assertEqual(profile['alias'], 'qwen38', 'first --served-model-name value')
+        self.assertEqual(profile['ctx'], 262144)
+        self.assertEqual(profile['model_path'], '/home/mfritsche/models/nvfp4/qwen38-nvfp4')
+
+    def test_plain_docker_unit_not_classified(self):
+        raw = b"""[Unit]
+Description=Some container
+[Service]
+ExecStart=/usr/bin/docker run --rm -p 8086:8000 nginx:latest
+"""
+        unit = roundhouse.parse_unit('/tmp/nginx.service', raw)
+        self.assertEqual(unit.exec_start.engine, {})
+
+    def test_mem_estimate_marker(self):
+        self.assertEqual(self._parse('ds4-server.service').mem_estimate, 100 << 30)
+        self.assertEqual(self._parse('qwen-vllm.service').mem_estimate, 106 << 30)
+        self.assertIsNone(self._parse('openarc-coder.service').mem_estimate)
+
+    def test_parse_mem_size(self):
+        self.assertEqual(roundhouse.parse_mem_size('100G'), 100 << 30)
+        self.assertEqual(roundhouse.parse_mem_size('30g'), 30 << 30)
+        self.assertEqual(roundhouse.parse_mem_size('512M'), 512 << 20)
+        self.assertEqual(roundhouse.parse_mem_size('1048576'), 1048576)
+        self.assertIsNone(roundhouse.parse_mem_size('12GB'))
+        self.assertIsNone(roundhouse.parse_mem_size('viel'))
+
+    def test_select_units_picks_up_both(self):
+        result = roundhouse.select_units(str(self.fixtures_extra))
+        names = [os.path.basename(p) for p in result]
+        self.assertIn('ds4-server.service', names)
+        self.assertIn('qwen-vllm.service', names)
+
+    def test_estimate_prefers_declared_marker(self):
+        est, src = roundhouse._estimate_start_bytes('x.service', {}, None,
+                                                    mem_estimate=100 << 30)
+        self.assertEqual((est, src), (100 << 30, 'declared'))
+
+    def test_freed_bytes_prefers_declared_marker(self):
+        row = {'rung': 'READY', 'mem_estimate': 106 << 30, 'mem': {}}
+        freed, src = roundhouse._freed_bytes('q.service', row,
+                                             {'q.service': {'current': 800 << 20}})
+        self.assertEqual(freed, 106 << 30)
+        self.assertEqual(src, 'declared mem-estimate')
