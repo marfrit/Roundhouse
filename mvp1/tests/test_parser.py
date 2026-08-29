@@ -607,7 +607,7 @@ class TestArcintEngine(unittest.TestCase):
 
     def test_conflicts_and_mem_estimate_are_read(self):
         unit = self._parse('arcint.service')
-        self.assertEqual(unit.mem_estimate, 14 << 30)
+        self.assertEqual(unit.mem_estimate, 8 << 30, "measured peak 7.80 GiB, rounded up")
         self.assertIn('openarc-coder.service', unit.known.get('conflicts', ''))
 
 

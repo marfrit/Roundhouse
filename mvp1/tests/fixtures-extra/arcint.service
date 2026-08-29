@@ -1,12 +1,40 @@
-# arcint on dirac — successor to openarc-coder on GPU.0 (Arc Pro B60).
-# roundhouse: mem-estimate 14G
+# arcint auf dirac — Nachfolger von openarc-coder auf GPU.0 (Arc Pro B60),
+# gleiches IR /models/ov/qwen36-coder-b5-ov, gleicher Port :8080.
+#
+# Abweichungen vom Paket-Template /usr/share/arcint/arcint.service, jede
+# begruendet:
+#  1. ExecStart=/usr/bin/arcint statt %h/.local/bin/arcint. Das .deb
+#     installiert nach /usr/bin; das Template beschreibt den Quell-Build
+#     (cmake --install --prefix ~/.local) und startet auf einem reinen
+#     Paket-Host nicht.
+#  2. Keine EnvironmentFile-Indirektion. Roundhouse liest Port, Alias und
+#     Kontext aus dem ExecStart; ${ARCINT_PORT} waere fuer das Port-Board
+#     unsichtbar und fuer edit_rollout nicht editierbar.
+#  3. --host 0.0.0.0 --port 8080 statt 127.0.0.1:8081: arcint uebernimmt die
+#     Adresse von openarc-coder, damit der llm-proxy dirac.fritz.box:8080
+#     unveraendert findet.
+#  4. --model-id explizit. arcint hat keinen Alias-Schalter; --model-id nennt
+#     den Allowlist-Eintrag, den es zusichert, und genau diese kanonische ID
+#     meldet /v1/models. Damit ist der Roster-Alias das, was ein Client
+#     senden muss. (Sobald arcint --served-model-name kann, wird daraus ein
+#     Ein-Flag-Edit zurueck auf qwen3.6-coder.)
+#  5. After=default.target wie die Nachbar-Units; graphical-session.target
+#     gibt es in diesem CT nicht.
 [Unit]
-Description=arcint — Qwen3.6-27B-A3B-Coder B5 on OpenVINO, GPU.0, :8080
+Description=arcint — Qwen3.6-27B-A3B-Coder B5 auf OpenVINO, GPU.0 (Arc Pro B60), :8080
 Documentation=https://git.reauktion.de/marfrit/arcint
 After=default.target
+# Gleicher Port und gleiche Karte wie openarc-coder: die drei schliessen
+# einander aus. llama-agent laeuft auf der A770 und ist NICHT betroffen.
 Conflicts=openarc-coder.service llama-coder.service llama-qwen38.service
 
 [Service]
+# Gemessen nach dem ersten Start (nicht geraten): Peak 7.80 GiB im
+# Unit-cgroup bei n_ctx 262144, Load 51.8 s. Aufgerundet auf 8G.
+# Die 22.71 GiB Reservierung aus dem Boot-Log sind KARTEN-Speicher (GPU.0)
+# und stehen bewusst nicht hier: Roundhouse rechnet in Host-RAM. Die
+# Exklusivitaet auf der Karte erzwingt Conflicts=, nicht die Arithmetik.
+# roundhouse: mem-estimate 8G
 Type=simple
 ExecStart=/usr/bin/arcint \
     --model /models/ov/qwen36-coder-b5-ov \
@@ -18,9 +46,19 @@ ExecStart=/usr/bin/arcint \
     --prefix-cache-mib 8192 \
     --cache-dir /home/mfritsche/.cache/arcint \
     --queue-timeout 30
+# Die Karte haelt die Gewichte fuer die Prozesslebensdauer; ein Restart ist
+# ein voller Reload (Minuten). Nicht thrashen.
 Restart=on-failure
 RestartSec=30
+# Kalter Blob-Cache = Minuten Graph-Compile, bevor der Port antwortet.
 TimeoutStartSec=20min
+TimeoutStopSec=60s
+StandardOutput=journal
+StandardError=journal
+NoNewPrivileges=true
+PrivateTmp=false
+ProtectHome=read-only
+ReadWritePaths=%h/.cache/arcint
 
 [Install]
 WantedBy=default.target
