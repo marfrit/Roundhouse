@@ -814,6 +814,11 @@ def extract_param_profile(engine_argv: List[Token]) -> Dict:
     result['raw_argv'] = [tok.text for tok in engine_argv]
 
     i = 1  # Skip the binary
+    # --served-model-name outranks --model-id for the alias REGARDLESS of order:
+    # the served name is what a client sends, while --model-id only asserts which
+    # artifact the engine accepts. Both map to 'alias', and plain last-wins would
+    # make the roster alias depend on flag order in the unit.
+    alias_from_served_name = False
     while i < len(engine_argv):
         token = engine_argv[i]
         text = token.text
@@ -849,6 +854,16 @@ def extract_param_profile(engine_argv: List[Token]) -> Dict:
                             parsed_value = value_text
 
                         # Store in result
+                        if field_name == 'alias':
+                            if text == '--served-model-name':
+                                alias_from_served_name = True
+                            elif alias_from_served_name:
+                                # A second alias source (--model-id) must not
+                                # overwrite the served name, nor its spans: an
+                                # edit to 'alias' has to land on the flag that
+                                # actually names the endpoint.
+                                i += 2
+                                continue
                         if '.' in field_name:
                             # Nested field like 'sampling.temp'
                             parts = field_name.split('.')

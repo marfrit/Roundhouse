@@ -592,6 +592,27 @@ class TestArcintEngine(unittest.TestCase):
         profile = roundhouse.extract_param_profile(unit.exec_start.engine_argv)
         self.assertEqual(profile['alias'], 'qwen3.6-27b-a3b-coder')
 
+    def test_served_model_name_outranks_model_id_either_order(self):
+        # Both flags map to 'alias'. Plain last-wins would make the roster alias
+        # depend on flag order in the unit; the served name must always win, and
+        # the edit span must land on the flag that names the endpoint.
+        for argv in ("--model-id qwen3.6-27b-a3b-coder --served-model-name qwen3.6-coder",
+                     "--served-model-name qwen3.6-coder --model-id qwen3.6-27b-a3b-coder"):
+            raw = ("[Service]\nExecStart=/usr/bin/arcint --model /models/ov/x "
+                   + argv + " --port 8080\n").encode()
+            unit = roundhouse.parse_unit('/tmp/arcint.service', raw)
+            profile = roundhouse.extract_param_profile(unit.exec_start.engine_argv)
+            self.assertEqual(profile['alias'], 'qwen3.6-coder', argv)
+            flag_span = profile['spans']['alias']['flag']
+            self.assertEqual(raw[flag_span[0]:flag_span[1]], b'--served-model-name', argv)
+
+    def test_model_id_alone_is_still_the_alias(self):
+        raw = (b"[Service]\nExecStart=/usr/bin/arcint --model /models/ov/x "
+               b"--model-id qwen3.6-27b-a3b-coder --port 8080\n")
+        unit = roundhouse.parse_unit('/tmp/arcint.service', raw)
+        profile = roundhouse.extract_param_profile(unit.exec_start.engine_argv)
+        self.assertEqual(profile['alias'], 'qwen3.6-27b-a3b-coder')
+
     def test_default_port_is_arcints_own(self):
         raw = b"[Service]\nExecStart=/usr/bin/arcint --model /models/ov/x\n"
         unit = roundhouse.parse_unit('/tmp/arcint.service', raw)
