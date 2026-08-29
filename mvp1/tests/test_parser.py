@@ -563,6 +563,54 @@ ExecStart=/home/mfritsche/openarc-venv/bin/openarc download --model foo
                          'llama-coder.service llama-agent.service llama-qwen38.service')
 
 
+class TestArcintEngine(unittest.TestCase):
+    """arcint recognition, alias from --model-id, ctx from --n-ctx (dirac swap)."""
+
+    def setUp(self):
+        self.fixtures_extra = Path(__file__).resolve().parents[0] / "fixtures-extra"
+
+    def _parse(self, name):
+        fpath = str(self.fixtures_extra / name)
+        with open(fpath, 'rb') as f:
+            return roundhouse.parse_unit(fpath, f.read())
+
+    def test_classification_and_profile(self):
+        unit = self._parse('arcint.service')
+        self.assertEqual(unit.exec_start.engine.get('kind'), 'arcint')
+        self.assertEqual(unit.exec_start.engine.get('variant'), 'openvino')
+        profile = roundhouse.extract_param_profile(unit.exec_start.engine_argv)
+        self.assertEqual(profile['port'], 8080)
+        self.assertEqual(profile['port_source'], 'flag')
+        self.assertEqual(profile['ctx'], 262144, '--n-ctx is arcint\'s context flag')
+        self.assertEqual(profile['model_path'], '/models/ov/qwen36-coder-b5-ov')
+
+    def test_alias_is_the_served_model_id(self):
+        # arcint has NO alias flag. --model-id names the allowlist entry it
+        # asserts, and that canonical id is exactly what /v1/models reports,
+        # so the roster alias cannot drift from what a client must send.
+        unit = self._parse('arcint.service')
+        profile = roundhouse.extract_param_profile(unit.exec_start.engine_argv)
+        self.assertEqual(profile['alias'], 'qwen3.6-27b-a3b-coder')
+
+    def test_default_port_is_arcints_own(self):
+        raw = b"[Service]\nExecStart=/usr/bin/arcint --model /models/ov/x\n"
+        unit = roundhouse.parse_unit('/tmp/arcint.service', raw)
+        profile = roundhouse.extract_param_profile(unit.exec_start.engine_argv)
+        self.assertEqual(profile['port'], 8090, "arcint's own default, not 8080")
+        self.assertEqual(profile['port_source'], 'default')
+
+    def test_selected_and_probe_gated(self):
+        names = [os.path.basename(p) for p in
+                 roundhouse.select_units(str(self.fixtures_extra))]
+        self.assertIn('arcint.service', names)
+        self.assertIn('arcint', roundhouse.OPENAI_PROBE_ENGINES)
+
+    def test_conflicts_and_mem_estimate_are_read(self):
+        unit = self._parse('arcint.service')
+        self.assertEqual(unit.mem_estimate, 14 << 30)
+        self.assertIn('openarc-coder.service', unit.known.get('conflicts', ''))
+
+
 class TestBoschEngines(unittest.TestCase):
     """ds4-server and docker-wrapped vLLM recognition + mem-estimate marker (MVP10)."""
 

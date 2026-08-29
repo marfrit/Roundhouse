@@ -1,0 +1,26 @@
+# arcint on dirac — successor to openarc-coder on GPU.0 (Arc Pro B60).
+# roundhouse: mem-estimate 14G
+[Unit]
+Description=arcint — Qwen3.6-27B-A3B-Coder B5 on OpenVINO, GPU.0, :8080
+Documentation=https://git.reauktion.de/marfrit/arcint
+After=default.target
+Conflicts=openarc-coder.service llama-coder.service llama-qwen38.service
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/arcint \
+    --model /models/ov/qwen36-coder-b5-ov \
+    --model-id qwen3.6-27b-a3b-coder \
+    --device GPU.0 \
+    --host 0.0.0.0 \
+    --port 8080 \
+    --n-ctx 262144 \
+    --prefix-cache-mib 8192 \
+    --cache-dir /home/mfritsche/.cache/arcint \
+    --queue-timeout 30
+Restart=on-failure
+RestartSec=30
+TimeoutStartSec=20min
+
+[Install]
+WantedBy=default.target

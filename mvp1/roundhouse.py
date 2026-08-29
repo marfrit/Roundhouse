@@ -517,6 +517,14 @@ def tokenize_execstart(directive: Directive, raw: bytes) -> ExecStart:
                         'binary': engine_binary,
                         'variant': 'openvino'
                     }
+            elif engine_basename == 'arcint':
+                # arcint (github.com/marfrit/arcint) — OpenVINO serving for
+                # Intel Arc, the successor pipeline to OpenArc on the same IR.
+                engine = {
+                    'kind': 'arcint',
+                    'binary': engine_binary,
+                    'variant': 'openvino'
+                }
             elif engine_basename == 'ds4-server':
                 # antirez/ds4 — the bespoke DeepSeek V4 server on bosch.
                 engine = {
@@ -736,6 +744,10 @@ KNOWN_FLAG_MAP = {
     # vLLM: serving alias and context length (first name wins when several are given)
     '--served-model-name': ('alias', 1, 'str'),
     '--max-model-len': ('ctx', 1, 'int'),
+    # arcint has no alias flag: --model-id names the allowlist entry it asserts,
+    # and that canonical id IS the string /v1/models reports, so it is the alias.
+    '--model-id': ('alias', 1, 'str'),
+    '--n-ctx': ('ctx', 1, 'int'),
 }
 
 # canonical field name -> type, derived from the one table above.
@@ -921,7 +933,12 @@ def extract_param_profile(engine_argv: List[Token]) -> Dict:
     # Set default port if not specified. OpenArc and vLLM serve on 8000 when
     # unmapped; the llama.cpp family defaults to 8080.
     if result['port'] is None:
-        result['port'] = 8000 if binary_base in ('openarc', 'docker') else 8080
+        if binary_base in ('openarc', 'docker'):
+            result['port'] = 8000
+        elif binary_base == 'arcint':
+            result['port'] = 8090
+        else:
+            result['port'] = 8080
         result['port_source'] = 'default'
 
     return result
@@ -1201,8 +1218,8 @@ OPENARC_READY_RECHECK_TICKS = 10
 
 # Engine kinds whose readiness is probed via GET /v1/models (OpenAI-style
 # catalogs that list a model only once it is actually servable). vllm shares
-# OpenArc's uvicorn journal fast-positive; ds4 is probe-only.
-OPENAI_PROBE_ENGINES = ('openarc', 'vllm', 'ds4')
+# OpenArc's uvicorn journal fast-positive; ds4 and arcint are probe-only.
+OPENAI_PROBE_ENGINES = ('openarc', 'vllm', 'ds4', 'arcint')
 
 
 def _models_ready_probe(port: int, timeout: float = OPENARC_PROBE_TIMEOUT,
@@ -1623,8 +1640,10 @@ class Watcher:
             busy_start_patterns = []
             busy_end_patterns = []
             req_done_patterns = []
-        elif engine_kind == 'ds4':
-            # No stable ready marker in ds4's log; the /v1/models probe decides.
+        elif engine_kind in ('ds4', 'arcint'):
+            # No ready marker trusted here; the /v1/models probe decides. arcint
+            # prints 'http: listening' before the paged executor has its
+            # reservation, so the line is not a readiness statement.
             ready_patterns = []
             busy_start_patterns = []
             busy_end_patterns = []
