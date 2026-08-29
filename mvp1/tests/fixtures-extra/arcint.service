@@ -16,8 +16,11 @@
 #  4. --model-id explizit. arcint hat keinen Alias-Schalter; --model-id nennt
 #     den Allowlist-Eintrag, den es zusichert, und genau diese kanonische ID
 #     meldet /v1/models. Damit ist der Roster-Alias das, was ein Client
-#     senden muss. (Sobald arcint --served-model-name kann, wird daraus ein
-#     Ein-Flag-Edit zurueck auf qwen3.6-coder.)
+#     senden muss. Seit arcint 0.2.1 (c7f84e6) gibt es zusaetzlich
+#     --served-model-name: das benennt den Endpunkt, --model-id sichert
+#     weiterhin das Artefakt zu. Der Alias ist damit wieder qwen3.6-coder,
+#     wie unter openarc-coder. Roundhouse laesst --served-model-name das
+#     --model-id ueberstimmen, unabhaengig von der Flag-Reihenfolge.
 #  5. After=default.target wie die Nachbar-Units; graphical-session.target
 #     gibt es in diesem CT nicht.
 [Unit]
@@ -39,6 +42,7 @@ Type=simple
 ExecStart=/usr/bin/arcint \
     --model /models/ov/qwen36-coder-b5-ov \
     --model-id qwen3.6-27b-a3b-coder \
+    --served-model-name qwen3.6-coder \
     --device GPU.0 \
     --host 0.0.0.0 \
     --port 8080 \

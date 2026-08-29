@@ -584,13 +584,13 @@ class TestArcintEngine(unittest.TestCase):
         self.assertEqual(profile['ctx'], 262144, '--n-ctx is arcint\'s context flag')
         self.assertEqual(profile['model_path'], '/models/ov/qwen36-coder-b5-ov')
 
-    def test_alias_is_the_served_model_id(self):
-        # arcint has NO alias flag. --model-id names the allowlist entry it
-        # asserts, and that canonical id is exactly what /v1/models reports,
-        # so the roster alias cannot drift from what a client must send.
+    def test_alias_is_the_served_name(self):
+        # The deployed unit carries both alias sources: --model-id asserts the
+        # artifact, --served-model-name (arcint 0.2.1) names the endpoint. The
+        # roster must show what a client sends, not the allowlist id.
         unit = self._parse('arcint.service')
         profile = roundhouse.extract_param_profile(unit.exec_start.engine_argv)
-        self.assertEqual(profile['alias'], 'qwen3.6-27b-a3b-coder')
+        self.assertEqual(profile['alias'], 'qwen3.6-coder')
 
     def test_served_model_name_outranks_model_id_either_order(self):
         # Both flags map to 'alias'. Plain last-wins would make the roster alias

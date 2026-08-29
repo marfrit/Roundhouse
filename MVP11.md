@@ -153,3 +153,44 @@ files in their unit repos (boltzmann: `classifier.service`,
 `default.target.wants/`, `roundhouse.service.d/`; bosch:
 `default.target.wants/`), the same hygiene defect fixed on dirac in Part 0,
 left for a deliberate decision rather than fixed in passing.
+
+## Part 5 — arcint 0.2.1 closes both gaps (T2, same day)
+
+The engineering ask went out and came back the same day: **arcint 0.2.1-2**
+(`c7f84e6`) on packages.reauktion.de ships `--served-model-name` *and* a
+populated `/v1/models` entry. Verified against the 0.2.1 stub before
+touching production, straight from the prompt's acceptance list:
+
+```
+--stub --served-model-name qwen3.6-coder --n-ctx 40960
+  -> {"id":"qwen3.6-coder","canonical_id":"qwen3.6-27b-a3b-coder",
+      "n_ctx":40960,"n_ctx_train":262144,"quant":"q4","lanes":1}
+  /props model.id -> qwen3.6-coder
+--stub, no flag        -> id qwen3.6-27b-a3b-coder   (regression guard held)
+--model-id qwen3.6-coder -> still refused as not-in-allowlist
+```
+
+`n_ctx` is the *served* value and `n_ctx_train` the artifact's — the
+distinction the proxy's key order depends on. `canonical_id`, `quant` and
+`lanes` came along unasked and reach clients through the same path.
+
+**A precedence rule was needed** (`MVP11 T2`). The unit now carries both
+alias sources, and both map to `alias`; plain last-wins made the roster
+alias depend on flag order — measured both ways round. `--served-model-name`
+now outranks `--model-id` regardless of order and keeps the alias span, so
+an edit to `alias` lands on the flag that names the endpoint rather than on
+the allowlist assertion. `--model-id` alone is unchanged. 930 tests green.
+
+The production switch ran through Roundhouse (preflight all-green, fit
+`8G declared`): served in ~50 s, build `0.2.1 c7f84e6`, and
+`dirac.fritz.box:8080/v1/models` now reports **`qwen3.6-coder`** with
+`n_ctx 262144`. Proxy recheck fired 202.
+
+Which settles Part 4's open item without any override at all: the proxy
+publishes `[local] qwen3.6-coder` with `ctx: 262144` and
+`properties.context_window 262144`, read straight from the backend. The
+`local-ctx.json` entry stays removed — it is not merely unnecessary now,
+it would have been a live 32768 cap on exactly this id.
+
+Net effect for consumers: the alias and the port both survived the swap
+after all, one package late.
