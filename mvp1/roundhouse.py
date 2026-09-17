@@ -525,6 +525,18 @@ def tokenize_execstart(directive: Directive, raw: bytes) -> ExecStart:
                     'binary': engine_binary,
                     'variant': 'openvino'
                 }
+            elif engine_basename == 'dsv41-exl3-serve':
+                # DeepSeek-V4.1-Flash EXL3 on a two-Spark pair: vLLM under
+                # tensor parallelism across two hosts. The unit cannot point at
+                # docker directly -- the recipe's script brings up the worker
+                # over the CX7 link, sets the NCCL environment and checks the
+                # weight sync first -- so the wrapper carries a distinctive
+                # name and declares --port / --served-model-name for the roster.
+                engine = {
+                    'kind': 'dsv41-exl3',
+                    'binary': engine_binary,
+                    'variant': 'vllm-exl3-tp2'
+                }
             elif engine_basename == 'ds4-server':
                 # antirez/ds4 — the bespoke DeepSeek V4 server on bosch.
                 engine = {
