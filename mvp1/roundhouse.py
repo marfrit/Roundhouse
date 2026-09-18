@@ -1245,8 +1245,11 @@ OPENARC_READY_RECHECK_TICKS = 10
 
 # Engine kinds whose readiness is probed via GET /v1/models (OpenAI-style
 # catalogs that list a model only once it is actually servable). vllm shares
-# OpenArc's uvicorn journal fast-positive; ds4 and arcint are probe-only.
-OPENAI_PROBE_ENGINES = ('openarc', 'vllm', 'ds4', 'arcint')
+# OpenArc's uvicorn journal fast-positive; ds4, arcint and dsv41-exl3 are
+# probe-only. dsv41-exl3 wraps vLLM but start.sh keeps the container's stdout,
+# so the uvicorn marker never reaches this unit's journal -- without the probe
+# the unit sits at LOADING forever while its API answers.
+OPENAI_PROBE_ENGINES = ('openarc', 'vllm', 'ds4', 'arcint', 'dsv41-exl3')
 
 
 def _models_ready_probe(port: int, timeout: float = OPENARC_PROBE_TIMEOUT,
@@ -1667,10 +1670,12 @@ class Watcher:
             busy_start_patterns = []
             busy_end_patterns = []
             req_done_patterns = []
-        elif engine_kind in ('ds4', 'arcint'):
+        elif engine_kind in ('ds4', 'arcint', 'dsv41-exl3'):
             # No ready marker trusted here; the /v1/models probe decides. arcint
             # prints 'http: listening' before the paged executor has its
-            # reservation, so the line is not a readiness statement.
+            # reservation, so the line is not a readiness statement. dsv41-exl3
+            # has no marker at all in this journal -- vLLM runs inside a docker
+            # container whose log start.sh does not forward.
             ready_patterns = []
             busy_start_patterns = []
             busy_end_patterns = []
