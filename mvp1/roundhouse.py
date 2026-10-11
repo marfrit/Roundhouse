@@ -21,7 +21,7 @@ import sqlite3
 import ipaddress
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Optional, List, Dict, Any
+from typing import Optional, List, Dict, Any, Tuple
 from datetime import datetime, timezone
 import socket
 import time
@@ -5690,6 +5690,52 @@ def run_git(args: List[str], unit_dir: str, timeout: float = 30, bootstrap: bool
         # git binary absent from PATH (E11): a gateway-level refusal, never a traceback.
         raise ActuationError("git not found on PATH")
 
+# A boot claim is a symlink under <target>.wants/ (or .requires/, .upholds/) that
+# `systemctl --user enable|disable` creates or removes. The enablement toggle changes it with
+# zero git operations by design (MVP4 §3). Hosts whose unit-dir repo happens to track those
+# links saw every toggle leave the tree "dirty" and the next start refuse --actuate — a
+# restart loop the toggle itself armed (observed on dirac 2026-09-16). So the clean-tree
+# check looks at unit configuration only: a change counts as a boot-claim link only if its
+# path is <x>.wants|requires|upholds/<y> at the unit-dir root AND git records it as a
+# symlink (mode 120000) — a regular file dropped into a .wants/ dir is still config.
+_ENABLEMENT_LINK_RE = re.compile(r'[^/]+\.(?:wants|requires|upholds)/[^/]+')
+_SYMLINK_MODE = '120000'
+
+
+def split_enablement_links(porcelain_v2: str) -> Tuple[List[str], List[str]]:
+    """Split `git status --porcelain=v2` output into (config changes, boot-claim link
+    changes), each rendered as "XY path". Rename/copy rows are always config."""
+    config, links = [], []
+    for line in porcelain_v2.splitlines():
+        if not line.strip() or line.startswith('#'):
+            continue
+        kind = line[0]
+        if kind == '1':
+            # 1 XY sub mH mI mW hH hI path
+            parts = line.split(' ', 8)
+            if len(parts) < 9:
+                config.append(line)
+                continue
+            xy, modes, path = parts[1], parts[3:6], parts[8]
+            shown = f"{xy.replace('.', ' ')} {path}"
+            unquoted = path.strip('"')
+            present = [m for m in modes if m != '000000']
+            if (_ENABLEMENT_LINK_RE.fullmatch(unquoted) and present
+                    and all(m == _SYMLINK_MODE for m in present)):
+                links.append(shown)
+            else:
+                config.append(shown)
+        elif kind == '2':
+            # 2 XY sub mH mI mW hH hI Xscore path<TAB>origPath
+            parts = line.split(' ', 9)
+            xy = parts[1] if len(parts) > 1 else '??'
+            path = parts[9].replace('\t', ' <- ') if len(parts) > 9 else line
+            config.append(f"{xy.replace('.', ' ')} {path}")
+        else:
+            config.append(line)                        # unmerged ('u') or anything unexpected
+    return config, links
+
+
 def git_startup_check(unit_dir: str, unit_names: Optional[List[str]] = None):
     """Check git is available and repo is valid. Raises ActuationError on failure."""
     # Check git --version (bootstrap mode)
@@ -5714,11 +5760,20 @@ def git_startup_check(unit_dir: str, unit_names: Optional[List[str]] = None):
         sys.exit(2)
 
     # Check worktree clean
-    result = run_git(["status", "--porcelain", "--untracked-files=no"], unit_dir, bootstrap=True)
-    if result.stdout.strip():
+    result = run_git(["status", "--porcelain=v2", "--untracked-files=no"], unit_dir, bootstrap=True)
+    config_changes, link_changes = split_enablement_links(result.stdout)
+    if link_changes and not config_changes:
+        print(f"note: boot-claim links differ from git in {unit_dir} ({len(link_changes)} "
+              f"symlinks under *.wants/, *.requires/ or *.upholds/). That is enablement state, "
+              f"which the boot toggle changes without git by design; it does not block --actuate. "
+              f"To stop git tracking it: git -C {unit_dir} rm -r --cached --ignore-unmatch -- "
+              f"'*.wants/*' '*.requires/*' '*.upholds/*', add '*.wants/', '*.requires/' and "
+              f"'*.upholds/' to .gitignore, and commit.", file=sys.stderr)
+    if config_changes:
+        changes = "\n  ".join(config_changes)
         print(f"""--actuate refused: the unit-dir git worktree has uncommitted changes to tracked files
 (a previous rollout may have died mid-apply):
-  {result.stdout.strip()}
+  {changes}
 Inspect:   git -C {unit_dir} diff
 Resolve:   commit the change, or discard it with
            git -C {unit_dir} restore -- <file>

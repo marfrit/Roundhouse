@@ -5869,3 +5869,112 @@ class TestProxyRecheckNotify(_SwitchHarness):
         self.assertFalse(notify('http://p/admin/recheck', 'test', opener=http_error_opener))
         self.assertFalse(notify('http://p/admin/recheck', 'test', opener=dead_opener))
         self.assertFalse(notify('', 'test', opener=ok_opener), 'empty URL disables')
+
+
+class TestStartupCheckIgnoresBootClaimLinks(unittest.TestCase):
+    """A boot toggle must not disarm the next start (dirac loop, 2026-09-16).
+
+    The toggle runs `systemctl --user enable|disable` with zero git operations (MVP4 §3),
+    so on a host whose unit-dir repo tracks <target>.wants/ links, every toggle leaves
+    those links changed against git. The startup clean-tree check refuses --actuate only
+    for unit configuration, never for boot-claim links."""
+
+    UNIT = '[Unit]\nDescription=t\n[Service]\nExecStart=/bin/true\n[Install]\nWantedBy=default.target\n'
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.unit_dir = os.path.join(self.tmp, 'units')
+        os.makedirs(os.path.join(self.unit_dir, 'default.target.wants'))
+        with open(os.path.join(self.unit_dir, 'a.service'), 'w') as f:
+            f.write(self.UNIT)
+        with open(os.path.join(self.unit_dir, '.gitignore'), 'w') as f:
+            f.write('*.bak*\n*.roundhouse-tmp\n')
+        self.link = os.path.join(self.unit_dir, 'default.target.wants', 'a.service')
+        os.symlink('../a.service', self.link)
+        self.env = dict(os.environ, GIT_AUTHOR_NAME='t', GIT_AUTHOR_EMAIL='t@t',
+                        GIT_COMMITTER_NAME='t', GIT_COMMITTER_EMAIL='t@t')
+        for args in (['init', '-q'], ['add', '-A'], ['commit', '-qm', 'base']):
+            subprocess.run(['git', '-C', self.unit_dir] + args, check=True, env=self.env)
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _check(self):
+        import contextlib, io
+        err = io.StringIO()
+        code = None
+        with contextlib.redirect_stderr(err):
+            try:
+                roundhouse.git_startup_check(self.unit_dir, ['a.service'])
+            except SystemExit as e:
+                code = e.code
+        return code, err.getvalue()
+
+    def test_disabled_link_alone_does_not_refuse(self):
+        os.remove(self.link)                      # what `systemctl --user disable` does
+        code, err = self._check()
+        self.assertIsNone(code, err)
+        self.assertIn('note: boot-claim links differ', err)
+        self.assertNotIn('--actuate refused', err)
+
+    def test_config_change_still_refuses_and_lists_only_config(self):
+        os.remove(self.link)
+        with open(os.path.join(self.unit_dir, 'a.service'), 'a') as f:
+            f.write('# hand edit\n')
+        code, err = self._check()
+        self.assertEqual(code, 2, err)
+        self.assertIn('uncommitted changes to tracked files', err)
+        self.assertIn('a.service', err)
+        self.assertNotIn('default.target.wants/a.service', err.split('--actuate refused')[1])
+
+    def test_clean_tree_is_silent(self):
+        code, err = self._check()
+        self.assertIsNone(code, err)
+        self.assertNotIn('boot-claim', err)
+
+    def test_split_classifies_by_path_and_symlink_mode(self):
+        L = 120000; F = 100644; Z = '000000'
+        out = '\n'.join([
+            f'1 .D N... {L} {L} {Z} aaa aaa default.target.wants/a.service',      # disable
+            f'1 .M N... {F} {F} {F} aaa aaa a.service',                             # config edit
+            f'1 A. N... {Z} {L} {L} aaa aaa multi-user.target.requires/b.service',  # staged link
+            f'1 .M N... {F} {F} {F} aaa aaa default.target.wants/regular.service',  # file, not link
+            f'1 .D N... {L} {L} {Z} aaa aaa sub/x.target.wants/a.service',          # not at root
+            f'1 .D N... {L} {L} {Z} aaa aaa x.target.upholds/c.service',            # UpheldBy=
+            f'2 R. N... {L} {L} {L} aaa aaa R100 a.service\tdefault.target.wants/a.service',
+            '# branch.oid abc', ''])
+        config, links = roundhouse.split_enablement_links(out)
+        self.assertEqual(links, [' D default.target.wants/a.service',
+                                 'A  multi-user.target.requires/b.service',
+                                 ' D x.target.upholds/c.service'])
+        self.assertEqual(config, [' M a.service',
+                                  ' M default.target.wants/regular.service',
+                                  ' D sub/x.target.wants/a.service',
+                                  'R  a.service <- default.target.wants/a.service'])
+
+    def test_regular_file_in_wants_dir_still_refuses(self):
+        p = os.path.join(self.unit_dir, 'default.target.wants', 'b.service')
+        with open(p, 'w') as f:
+            f.write(self.UNIT)
+        subprocess.run(['git', '-C', self.unit_dir, 'add', '--', 'default.target.wants/b.service'],
+                       check=True, env=self.env)
+        subprocess.run(['git', '-C', self.unit_dir, 'commit', '-qm', 'file in wants'], check=True, env=self.env)
+        with open(p, 'a') as f:
+            f.write('# hand edit\n')
+        code, err = self._check()
+        self.assertEqual(code, 2, err)
+        self.assertIn('default.target.wants/b.service', err)
+
+    def test_printed_recipe_actually_untracks_the_links(self):
+        os.remove(self.link)
+        code, err = self._check()
+        self.assertIsNone(code, err)
+        m = re.search(r"(git -C \S+ rm -r --cached --ignore-unmatch -- '\*\.wants/\*' '\*\.requires/\*' '\*\.upholds/\*')", err)
+        self.assertIsNotNone(m, err)
+        import shlex
+        r = subprocess.run(shlex.split(m.group(1)), capture_output=True, text=True, env=self.env)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        tracked = subprocess.run(['git', '-C', self.unit_dir, 'ls-files'], capture_output=True,
+                                 text=True, check=True).stdout
+        self.assertNotIn('.wants/', tracked)
+        self.assertIn('a.service', tracked)
