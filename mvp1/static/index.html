@@ -8,22 +8,26 @@
         :root {
             --bg: #0d1117;
             --fg: #c9d1d9;
-            --neutral: #6e7681;
+            --neutral: #8b949e;
             --red: #f85149;
             --amber: #d29922;
             --green: #3fb950;
             --border: #30363d;
+            --surface: #161b22;
+            --mono: ui-monospace, "JetBrains Mono", "DejaVu Sans Mono", Menlo, Consolas, monospace;
+            --pane-w: min(560px, 42vw);
         }
 
         @media (prefers-color-scheme: dark) {
             :root:not([data-theme="light"]) {
                 --bg: #0d1117;
                 --fg: #c9d1d9;
-                --neutral: #6e7681;
+                --neutral: #8b949e;
                 --red: #f85149;
                 --amber: #d29922;
                 --green: #3fb950;
                 --border: #30363d;
+                --surface: #161b22;
             }
         }
 
@@ -35,30 +39,49 @@
                 --red: #cb2431;
                 --amber: #bf8700;
                 --green: #28a745;
-                --border: #e1e4e8;
+                --border: #d0d7de;
+                --surface: #f6f8fa;
             }
         }
 
         body {
             background-color: var(--bg);
             color: var(--fg);
-            font-family: 'Courier New', monospace;
+            font-family: var(--mono);
+            font-size: 14px;
             margin: 0;
             padding: 16px;
             line-height: 1.5;
         }
 
+        /* MVP12: the pane is a fixed side column above 700 px; at >= 1000 px the page
+           makes room for it so the row that opened it stays in view. */
+        @media (min-width: 1000px) {
+            body:has(#detail-pane.active) {
+                padding-right: calc(var(--pane-w) + 32px);
+            }
+        }
+
         .header {
-            margin-bottom: 2em;
+            margin-bottom: 0.75em;
             border-bottom: 1px solid var(--border);
-            padding-bottom: 1em;
+            padding-bottom: 0.5em;
         }
 
         .header-line {
             display: flex;
+            flex-wrap: wrap;
             justify-content: space-between;
             align-items: center;
+            gap: 0.5em 1em;
             margin-bottom: 0.5em;
+        }
+
+        .header-tools {
+            display: flex;
+            flex-wrap: wrap;
+            align-items: center;
+            gap: 0.5em 1em;
         }
 
         .header-title {
@@ -74,9 +97,10 @@
         .gauge-bar {
             display: inline-flex;
             width: 100px;
-            height: 1em;
-            background: var(--border);
+            height: 0.8em;
+            background: var(--surface);
             border: 1px solid var(--border);
+            border-radius: 2px;
             overflow: hidden;
         }
 
@@ -99,33 +123,62 @@
         }
 
         .section {
-            margin-bottom: 2em;
+            margin-bottom: 1.25em;
         }
 
         .section-heading {
             font-weight: bold;
-            margin-bottom: 0.5em;
+            margin-bottom: 0.25em;
             color: var(--fg);
+            font-size: 0.85em;
+            letter-spacing: 0.04em;
+        }
+
+        .section-heading .heading-note {
+            font-weight: normal;
+            color: var(--neutral);
+            letter-spacing: 0;
         }
 
         .unit-row {
-            padding: 0.25em 0;
+            padding: 0.3em 0.5em;
             cursor: pointer;
             border: 1px solid transparent;
+            border-radius: 3px;
             display: flex;
             justify-content: space-between;
             align-items: center;
+            gap: 1em;
+            max-width: 1100px;
         }
 
         .unit-row:hover {
-            background-color: var(--border);
+            background-color: var(--surface);
+            border-color: var(--border);
+        }
+
+        .unit-row.selected {
+            background-color: var(--surface);
+            border-color: var(--neutral);
         }
 
         .unit-row-left {
             flex: 1;
             display: flex;
-            gap: 1em;
-            align-items: center;
+            flex-wrap: wrap;
+            column-gap: 0.75em;
+            align-items: baseline;
+            min-width: 0;
+        }
+
+        .unit-file {
+            color: var(--neutral);
+            font-size: 0.85em;
+        }
+
+        .rung-word {
+            font-size: 0.8em;
+            color: var(--neutral);
         }
 
         .rung-glyph {
@@ -149,7 +202,16 @@
 
         .unit-details {
             color: var(--neutral);
-            font-size: 0.9em;
+            font-size: 0.85em;
+        }
+
+        .enable-toggle {
+            display: flex;
+            align-items: center;
+            gap: 0.25em;
+            color: var(--neutral);
+            font-size: 0.85em;
+            white-space: nowrap;
         }
 
         .badge {
@@ -178,19 +240,45 @@
         }
 
         .port-board {
+            margin: 0 0 1.25em;
+            max-width: 1100px;
+        }
+
+        .port-board-head {
+            font-weight: bold;
+            font-size: 0.85em;
+            letter-spacing: 0.04em;
+            margin-bottom: 0.25em;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+
+        #port-board-cells {
             display: flex;
             flex-wrap: wrap;
-            gap: 1em;
-            margin: 1em 0;
-            padding: 0.5em;
-            background: var(--border);
-            border-radius: 3px;
+            gap: 0.4em;
         }
 
         .port-cell {
-            padding: 0.25em 0.5em;
+            padding: 0.1em 0.5em;
             border: 1px solid var(--border);
-            border-radius: 2px;
+            border-radius: 3px;
+            font-size: 0.85em;
+            color: var(--neutral);
+        }
+
+        .port-cell.claimed {
+            color: var(--fg);
+        }
+
+        .port-cell.open {
+            flex-basis: 100%;
+        }
+
+        .port-expansion {
+            font-weight: normal;
+            margin-top: 0.25em;
         }
 
         .port-cell.active {
@@ -211,20 +299,64 @@
         }
 
         .port-cell.self {
-            background: var(--green);
-            color: var(--bg);
+            border-style: dashed;
+            color: var(--fg);
         }
 
         .detail-pane {
             display: none;
-            margin-top: 2em;
-            padding: 1em;
-            background: var(--border);
-            border-left: 2px solid var(--amber);
+            padding: 0 1em 1em;
+            background: var(--surface);
+            border: 1px solid var(--border);
+            border-radius: 4px;
         }
 
         .detail-pane.active {
             display: block;
+        }
+
+        @media (min-width: 701px) {
+            .detail-pane.active {
+                position: fixed;
+                top: 16px;
+                right: 16px;
+                bottom: 16px;
+                width: var(--pane-w);
+                min-width: 320px;
+                box-sizing: border-box;
+                overflow-y: auto;
+                z-index: 20;
+                box-shadow: 0 4px 24px rgba(0, 0, 0, 0.25);
+            }
+        }
+
+        .pane-bar {
+            position: sticky;
+            top: 0;
+            z-index: 1;
+            display: flex;
+            justify-content: flex-end;
+            padding: 0.5em 0;
+            background: var(--surface);
+        }
+
+        .detail-title {
+            display: flex;
+            flex-wrap: wrap;
+            justify-content: space-between;
+            align-items: center;
+            gap: 0.5em;
+        }
+
+        .detail-title h3 {
+            margin: 0;
+            overflow-wrap: anywhere;
+        }
+
+        .detail-pane h4 {
+            font-size: 0.85em;
+            letter-spacing: 0.04em;
+            margin: 1.25em 0 0.25em;
         }
 
         .detail-table {
@@ -235,20 +367,25 @@
 
         .detail-table th {
             text-align: left;
-            padding: 0.5em;
+            padding: 0.35em 0.5em 0.35em 0;
             border-bottom: 1px solid var(--border);
             color: var(--neutral);
             font-weight: normal;
+            width: 9em;
+            vertical-align: top;
         }
 
         .detail-table td {
-            padding: 0.5em;
+            padding: 0.35em 0;
             border-bottom: 1px solid var(--border);
+            overflow-wrap: anywhere;
         }
 
         .operator-notes {
             white-space: pre;
             overflow-x: auto;
+            max-width: 100%;
+            box-sizing: border-box;
             background: var(--bg);
             padding: 0.5em;
             border-radius: 2px;
@@ -258,11 +395,11 @@
         .off-section-toggle {
             cursor: pointer;
             user-select: none;
+            font-weight: normal;
         }
 
         .off-section-list {
             display: none;
-            margin-left: 1em;
         }
 
         .off-section-list.expanded {
@@ -283,31 +420,31 @@
         }
 
         .conflict-armed {
-            color: var(--amber);
-            font-weight: bold;
+            box-shadow: inset 3px 0 0 var(--amber);
         }
 
         .mode-badge {
             display: inline-block;
             font-size: 0.8em;
-            margin-left: 1em;
-            padding: 0.25em 0.5em;
-            border-radius: 2px;
+            margin-left: 0.75em;
+            padding: 0 0.4em;
+            border: 1px solid var(--neutral);
+            border-radius: 3px;
+            color: var(--fg);
         }
 
         .mode-badge.read-only {
-            background: var(--neutral);
-            color: var(--bg);
+            color: var(--neutral);
         }
 
         .mode-badge.actuate {
-            background: var(--amber);
+            background: var(--fg);
+            border-color: var(--fg);
             color: var(--bg);
         }
 
         .token-input-container {
             display: none;
-            margin-left: 1em;
             align-items: center;
             gap: 0.5em;
         }
@@ -318,11 +455,11 @@
 
         #token {
             padding: 0.25em 0.5em;
-            background: var(--border);
+            background: var(--surface);
             color: var(--fg);
             border: 1px solid var(--border);
             border-radius: 2px;
-            font-family: monospace;
+            font-family: var(--mono);
             font-size: 0.9em;
         }
 
@@ -447,6 +584,10 @@
             }
         }
 
+        .detail-pane .edit-form-two-column {
+            grid-template-columns: 1fr;
+        }
+
         .edit-form-left {
             display: flex;
             flex-direction: column;
@@ -470,7 +611,7 @@
             color: var(--fg);
             border: 1px solid var(--border);
             border-radius: 2px;
-            font-family: monospace;
+            font-family: var(--mono);
             font-size: 0.9em;
         }
 
@@ -514,7 +655,7 @@
             color: var(--fg);
             cursor: pointer;
             border-radius: 2px;
-            font-family: monospace;
+            font-family: var(--mono);
             font-size: 0.9em;
         }
 
@@ -620,7 +761,7 @@
             color: var(--fg);
             text-decoration: underline;
             cursor: pointer;
-            font-family: monospace;
+            font-family: var(--mono);
             font-size: 0.9em;
         }
 
@@ -772,26 +913,38 @@
                 max-width: 100%;
             }
 
+            .operator-notes {
+                white-space: pre-wrap;
+                overflow-wrap: anywhere;
+            }
+
             .phase-chip:not(.current) .chip-label {
                 display: none;
             }
         }
 
         .listener-strip, .peer-strip {
-            margin-bottom: 1.5em;
-            padding: 0.75em;
-            background: var(--border);
-            border: 1px solid var(--border);
-            border-radius: 3px;
+            margin-bottom: 0.25em;
             display: flex;
-            gap: 1em;
-            align-items: center;
+            gap: 0 0.75em;
+            align-items: baseline;
             flex-wrap: wrap;
+            font-size: 0.85em;
+            color: var(--neutral);
+        }
+
+        .peer-strip {
+            margin-bottom: 1em;
         }
 
         .peer-strip-title {
-            font-weight: bold;
-            min-width: 80px;
+            color: var(--neutral);
+        }
+
+        #listener-items, #peer-items {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 0 1em;
         }
 
         /* Neutral by contract (§5.4): a peer that is down is information, not an
@@ -802,9 +955,6 @@
             display: flex;
             align-items: center;
             gap: 0.5em;
-            padding: 0.25em 0.5em;
-            border-radius: 2px;
-            min-height: 24px;
             color: var(--fg);
         }
 
@@ -814,8 +964,7 @@
         }
 
         .peer-name {
-            font-family: 'Courier New', monospace;
-            font-size: 0.9em;
+            font-family: var(--mono);
         }
 
         /* Listener cells: address and state (§5.4, L4). Neutral by contract: bound = normal text,
@@ -824,11 +973,7 @@
             display: flex;
             align-items: center;
             gap: 0.5em;
-            padding: 0.25em 0.5em;
-            border-radius: 2px;
-            min-height: 24px;
             color: var(--fg);
-            font-size: 0.9em;
         }
 
         .listener-cell.absent,
@@ -841,37 +986,56 @@
            operator must never mistake a peer's unit for one this page can act on.
            No buttons, no handlers: the frozen 44 px touch-target set is untouched. */
         .fleet-section {
-            margin-top: 2em;
-            padding-top: 1em;
+            margin-top: 1.5em;
+            padding-top: 0.75em;
             border-top: 2px dashed var(--border);
             color: var(--neutral);
+            max-width: 1100px;
         }
 
         .fleet-section-heading {
             font-weight: bold;
+            font-size: 0.85em;
+            letter-spacing: 0.04em;
             margin-bottom: 0.5em;
         }
 
+        #fleet-peers {
+            display: grid;
+            grid-template-columns: repeat(auto-fill, minmax(260px, 1fr));
+            gap: 0.75em 1.5em;
+        }
+
+        .fleet-peer {
+            min-width: 0;
+        }
+
         .fleet-peer-heading {
-            font-family: 'Courier New', monospace;
+            font-family: var(--mono);
             font-size: 0.9em;
-            margin-top: 0.75em;
+            font-weight: bold;
         }
 
         .fleet-unit-row {
-            font-family: 'Courier New', monospace;
-            font-size: 0.9em;
-            padding: 0.15em 0 0.15em 1.5em;
+            font-family: var(--mono);
+            font-size: 0.85em;
+            padding: 0.1em 0 0.1em 1em;
+            overflow-wrap: anywhere;
+        }
+
+        .fleet-rest {
+            font-size: 0.8em;
+            padding-left: 1em;
         }
     </style>
 </head>
 <body>
     <div class="header">
         <div class="header-line">
-            <span class="header-title">ROUNDHOUSE · <span id="hostname">?</span> · <span class="kernel-wrap">kernel <span id="kernel">?</span></span>
+            <span class="header-title">ROUNDHOUSE · <span id="hostname">?</span><span class="kernel-wrap"> · kernel <span id="kernel">?</span></span>
                 <span class="mode-badge" id="mode-badge"></span>
             </span>
-            <div style="display: flex; align-items: center;">
+            <div class="header-tools">
                 <div class="token-input-container" id="token-container">
                     <label for="token">token:</label>
                     <input type="password" id="token" placeholder="~/.config/roundhouse/token">
@@ -915,38 +1079,34 @@
         <div id="active-list"></div>
     </div>
 
-    <div class="section standby" id="standby-section" style="display: none;">
-        <div class="section-heading">STANDBY — kernel-gated, normal on this kernel</div>
-        <div id="standby-list"></div>
-    </div>
-
-    <div class="section" id="off-section">
-        <div class="section-heading off-section-toggle">
-            OFF · turntable (<span id="off-count">0</span>) [<span id="off-toggle">show</span>]
-        </div>
-        <div class="off-section-list" id="off-list"></div>
-    </div>
-
-    <div class="section" id="failed-section" style="display: none;">
+    <div class="section failed" id="failed-section" style="display: none;">
         <div class="section-heading">FAILED</div>
         <div id="failed-list"></div>
     </div>
 
+    <div class="section standby" id="standby-section" style="display: none;">
+        <div class="section-heading">STANDBY <span class="heading-note">— kernel-gated, normal on this kernel</span></div>
+        <div id="standby-list"></div>
+    </div>
+
+    <div class="section" id="off-section">
+        <div class="section-heading">
+            OFF <span class="heading-note">· turntable (<span id="off-count">0</span>)</span>
+            <button class="link-button off-section-toggle" id="off-toggle">show</button>
+        </div>
+        <div class="off-section-list" id="off-list"></div>
+    </div>
+
     <div class="section retired" id="retired-section" style="display: none;">
         <div class="section-heading">
-            RETIRED (<span id="retired-count">0</span>)
-            [<span id="retired-toggle" class="off-section-toggle">show</span>]
+            RETIRED <span class="heading-note">(<span id="retired-count">0</span>)</span>
+            <button class="link-button off-section-toggle" id="retired-toggle">show</button>
         </div>
         <div class="off-section-list" id="retired-list"></div>
     </div>
 
-    <div class="fleet-section" id="fleet-section" style="display: none;">
-        <div class="fleet-section-heading">fleet (read-only)</div>
-        <div id="fleet-peers"></div>
-    </div>
-
     <div class="port-board">
-        <div style="font-weight: bold; width: 100%; margin-bottom: 0.5em; display: flex; justify-content: space-between; align-items: center;">
+        <div class="port-board-head">
             <span>PORT BOARD</span>
             <button class="port-board-toggle" id="port-board-toggle" onclick="togglePortBoard()">[show]</button>
         </div>
@@ -955,10 +1115,17 @@
         </div>
     </div>
 
+    <div class="fleet-section" id="fleet-section" style="display: none;">
+        <div class="fleet-section-heading">fleet (read-only)</div>
+        <div id="fleet-peers"></div>
+    </div>
+
     <div id="toast" style="display: none;"></div>
 
     <div class="detail-pane" id="detail-pane">
-        <button onclick="closeDetail()" style="float: right; background: var(--border); border: none; color: var(--fg); cursor: pointer; padding: 0.25em 0.5em; border: 1px solid var(--border);">Close</button>
+        <div class="pane-bar">
+            <button class="pane-close" onclick="closeDetail()">close ✕</button>
+        </div>
         <div id="detail-content"></div>
         <div class="edit-form-container" id="edit-form-container"></div>
     </div>
@@ -1035,6 +1202,7 @@
         let pendingSwitchData = null;
         let pendingSwitchTarget = null;
         let pendingSwitchStops = [];
+        let selectedUnit = null;  // unit whose detail pane is open (row highlight)
 
         const eventSource = new EventSource('/api/events');
 
@@ -1062,6 +1230,7 @@
                 Object.assign(unit, data);
                 render();
             }
+            refreshOpenPane(data.unit);
         });
 
         eventSource.addEventListener('ports', (e) => {
@@ -1094,6 +1263,7 @@
                 u.strategy_note = d.strategy_note;
                 renderUnits();
             }
+            refreshOpenPane(d.unit);
         });
 
         eventSource.addEventListener('peer', (e) => {
@@ -1266,6 +1436,8 @@
                 section.style.display = 'block';
 
                 for (const peer of blocks) {
+                    const block = document.createElement('div');
+                    block.className = 'fleet-peer';
                     const heading = document.createElement('div');
                     heading.className = 'fleet-peer-heading';
                     let text = peer.name + ' (' + (peer.state || 'unknown');
@@ -1276,15 +1448,32 @@
                         }
                     }
                     heading.textContent = text + ')';
-                    container.appendChild(heading);
+                    block.appendChild(heading);
 
+                    // MVP12: list what the peer runs; OFF and RETIRED units are counted,
+                    // not listed — this section stays text-only (MVP8 §6.4), so there is
+                    // no toggle to reveal them; the peer's own page has the full list.
                     const units = (fleet.units || []).filter(u => u.source === peer.name);
+                    let offCount = 0, retiredCount = 0;
                     for (const unit of units) {
+                        if (unit.retired || unit.rung === 'RETIRED') { retiredCount++; continue; }
+                        if (unit.rung === 'OFF') { offCount++; continue; }
                         const row = document.createElement('div');
                         row.className = 'fleet-unit-row';
-                        row.textContent = unit.unit + ' · ' + (unit.rung || '?');
-                        container.appendChild(row);
+                        row.textContent = unit.unit.replace(/\.service$/, '') + ' · ' + (unit.rung || '?');
+                        block.appendChild(row);
                     }
+                    const rest = [];
+                    if (units.length > 0 && offCount + retiredCount === units.length) rest.push('nothing running');
+                    if (offCount) rest.push(offCount + ' off');
+                    if (retiredCount) rest.push(retiredCount + ' retired');
+                    if (rest.length) {
+                        const restRow = document.createElement('div');
+                        restRow.className = 'fleet-rest';
+                        restRow.textContent = rest.join(' · ');
+                        block.appendChild(restRow);
+                    }
+                    container.appendChild(block);
                 }
             }).catch(() => {
                 // A failed roster fetch leaves the last rendering in place; the peer
@@ -1340,6 +1529,9 @@
                 } else if (unit.port_conflict && unit.port_conflict.class === 'armed') {
                     row.classList.add('conflict-armed');
                 }
+                if (unit.unit === selectedUnit) {
+                    row.classList.add('selected');
+                }
                 row.onclick = () => fetchUnitDetail(unit.unit);
 
                 const leftDiv = document.createElement('div');
@@ -1361,37 +1553,43 @@
                 }
                 leftDiv.appendChild(glyph);
 
+                // MVP12: the row is named once — by its alias (what clients ask for), else by
+                // the unit — and shows the unit name beside it only when the two differ, so
+                // the list can be matched to the pane title. The section heading already
+                // states the rung; only the transitional ones are spelled out.
+                const fileName = unit.unit.replace(/\.service$/, '');
                 const nameSpan = document.createElement('span');
                 nameSpan.className = 'unit-name';
-                nameSpan.textContent = unit.rung + ' ' + unit.alias;
+                nameSpan.textContent = unit.alias || fileName;
                 leftDiv.appendChild(nameSpan);
 
-                const detailSpan = document.createElement('span');
-                detailSpan.className = 'unit-details';
-                let detail = '';
-                if (unit.port) {
-                    detail += ':' + unit.port + ' ';
+                if (['LOADING', 'STARTING', 'BUSY'].includes(unit.rung)) {
+                    const rungWord = document.createElement('span');
+                    rungWord.className = 'rung-word';
+                    rungWord.textContent = unit.rung;
+                    leftDiv.appendChild(rungWord);
                 }
-                if (unit.alias) {
-                    detail += 'alias ' + unit.alias + ' ';
+
+                if (unit.alias && unit.alias !== fileName) {
+                    const fileSpan = document.createElement('span');
+                    fileSpan.className = 'unit-file';
+                    fileSpan.textContent = fileName;
+                    leftDiv.appendChild(fileSpan);
                 }
-                if (unit.quant_hint) {
-                    detail += unit.quant_hint + ' ';
-                }
-                if (unit.ctx) {
-                    detail += '· ctx ' + unit.ctx + ' ';
-                }
+
+                const parts = [];
+                if (unit.port) parts.push(':' + unit.port);
+                if (unit.quant_hint) parts.push(unit.quant_hint);
+                if (unit.ctx) parts.push('ctx ' + unit.ctx);
                 if (unit.mem && unit.mem.bytes) {
                     const gb = (unit.mem.bytes / 1e9).toFixed(1);
-                    detail += '· peak ' + gb + ' GiB (' + (unit.mem.source || 'unknown') + ')';
+                    parts.push('peak ' + gb + ' GiB (' + (unit.mem.source || 'unknown') + ')');
                 }
-                if (unit.strategy_note) {
-                    detail += ' · ' + unit.strategy_note;
-                }
-                if (unit.on_demand) {
-                    detail += ' · on-demand';
-                }
-                detailSpan.textContent = detail;
+                if (unit.strategy_note) parts.push(unit.strategy_note);
+                if (unit.on_demand) parts.push('on-demand');
+                const detailSpan = document.createElement('span');
+                detailSpan.className = 'unit-details';
+                detailSpan.textContent = parts.join(' · ');
                 leftDiv.appendChild(detailSpan);
 
                 if (unit.port_conflict && unit.port_conflict.class === 'armed') {
@@ -1530,6 +1728,9 @@
                 if (claims.length === 0) {
                     cell.textContent = port + selfTag + ' ✓';
                 } else if (claims.length === 1) {
+                    if (['STARTING', 'LOADING', 'READY', 'BUSY'].includes(claims[0].rung)) {
+                        cell.classList.add('claimed');
+                    }
                     cell.textContent = port + selfTag + ' ✓';
                 } else {
                     // Determine class
@@ -1564,6 +1765,7 @@
                     cell.style.cursor = 'pointer';
                     cell.addEventListener('click', () => {
                         expansion.style.display = expansion.style.display === 'none' ? 'block' : 'none';
+                        cell.classList.toggle('open', expansion.style.display === 'block');
                     });
                 }
 
@@ -1571,7 +1773,19 @@
             }
         }
 
+        function refreshOpenPane(unitName) {
+            if (unitName !== selectedUnit) return;
+            if (!document.getElementById('detail-pane').classList.contains('active')) return;
+            if (document.getElementById('edit-form-container').classList.contains('active')) return;
+            fetch('/api/units/' + encodeURIComponent(unitName))
+                .then(r => r.json())
+                .then(data => { if (unitName === selectedUnit) showDetail(data); })
+                .catch(e => console.error('Error refreshing unit detail:', e));
+        }
+
         function fetchUnitDetail(unitName) {
+            selectedUnit = unitName;
+            renderUnits();
             fetch('/api/units/' + encodeURIComponent(unitName))
                 .then(r => r.json())
                 .then(data => showDetail(data))
@@ -1597,13 +1811,10 @@
 
             // Title with edit button
             const titleDiv = document.createElement('div');
-            titleDiv.style.display = 'flex';
-            titleDiv.style.justifyContent = 'space-between';
-            titleDiv.style.alignItems = 'center';
+            titleDiv.className = 'detail-title';
 
             const title = document.createElement('h3');
             title.textContent = unit.unit;
-            title.style.margin = '0';
             titleDiv.appendChild(title);
 
             const mode = state.mode || 'read-only';
@@ -1787,10 +1998,29 @@
             pane.classList.add('active');
         }
 
-        function closeDetail() {
-            document.getElementById('detail-pane').classList.remove('active');
+        // The scroll lock (phone) is shared by the pane and both modals: release it only
+        // when none of them is still open.
+        function releaseOverlay() {
+            if (document.querySelector('#detail-pane.active, .modal.active')) return;
             document.body.classList.remove('overlay-open');
         }
+
+        function closeDetail() {
+            document.getElementById('detail-pane').classList.remove('active');
+            releaseOverlay();
+            selectedUnit = null;
+            renderUnits();
+        }
+
+        // Escape closes the pane — unless a modal sits on top of it; that one goes first
+        // through its own cancel button.
+        document.addEventListener('keydown', (e) => {
+            if (e.key !== 'Escape') return;
+            if (document.querySelector('.modal.active')) return;
+            if (e.target.closest && e.target.closest('input, textarea, select')) return;
+            if (document.getElementById('edit-form-container').classList.contains('active')) return;
+            if (document.getElementById('detail-pane').classList.contains('active')) closeDetail();
+        });
 
         function showDegradedBanner(msg) {
             const banner = document.getElementById('degraded-banner');
@@ -2112,7 +2342,7 @@
 
         function closeDiffModal() {
             document.getElementById('diff-modal').classList.remove('active');
-            document.body.classList.remove('overlay-open');
+            releaseOverlay();
         }
 
         function applyRollout() {
@@ -2426,7 +2656,7 @@
 
         function closeSwitchModal() {
             document.getElementById('switch-modal').classList.remove('active');
-            document.body.classList.remove('overlay-open');
+            releaseOverlay();
         }
 
         function updateSwitchTicks() {

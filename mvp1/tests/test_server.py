@@ -3955,5 +3955,107 @@ class TestFleetCandidatesDoNotDisturbTheServer(_LiveServeHarness):
         self.assertIn('qwen3.6-coding', result.stderr)
 
 
+class TestMvp12LayoutStatic(unittest.TestCase):
+    """MVP12: statics that pin the layout fixes. They prove the rules and markup exist;
+    computed layout (pane position, phone width, page height) is proven by the curie rig
+    recorded in MVP12.md, not here."""
+
+    @classmethod
+    def setUpClass(cls):
+        import re as _re
+        cls.html = (Path(__file__).parent.parent / 'static' / 'index.html').read_text()
+        cls.css = cls.html[cls.html.index('<style>'):cls.html.index('</style>')]
+        cls.rules = [(m.group(1).strip(), m.group(2))
+                     for m in _re.finditer(r'([^{}]+)\{([^{}]*)\}', cls.css)]
+
+    def _media_block(self, query):
+        start = self.css.index(query)
+        open_at = self.css.index('{', start) + 1
+        depth, i = 1, open_at
+        while depth:
+            depth += {'{': 1, '}': -1}.get(self.css[i], 0)
+            i += 1
+        return self.css[open_at:i - 1]
+
+    def test_pane_is_fixed_above_the_phone_breakpoint(self):
+        """The pane must not land in-flow below the page (it opened 2235 px down)."""
+        block = self._media_block('@media (min-width: 701px)')
+        self.assertIn('.detail-pane.active', block)
+        self.assertIn('position: fixed', block)
+
+    def test_page_makes_room_keyed_on_the_pane_not_the_shared_overlay_class(self):
+        """overlay-open is shared with both modals; closing a modal must not take the
+        pane's room away while the pane stays open."""
+        block = self._media_block('@media (min-width: 1000px)')
+        self.assertIn('body:has(#detail-pane.active)', block)
+        self.assertNotIn('overlay-open', block)
+
+    def test_modals_release_the_lock_only_when_nothing_else_is_open(self):
+        for fn in ('function closeDiffModal', 'function closeSwitchModal', 'function closeDetail'):
+            body = self.html[self.html.index(fn):self.html.index('}', self.html.index(fn))]
+            self.assertIn('releaseOverlay()', body, fn)
+        release = self.html[self.html.index('function releaseOverlay'):]
+        release = release[:release.index('\n        }')]
+        self.assertIn('#detail-pane.active, .modal.active', release)
+
+    def test_close_control_is_not_floated_under_the_title(self):
+        pane = self.html[self.html.index('<div class="detail-pane"'):]
+        pane = pane[:pane.index('<div id="detail-content">')]
+        self.assertIn('class="pane-bar"', pane)
+        self.assertIn('closeDetail()', pane)
+        self.assertNotIn('float', pane)
+
+    def test_header_line_wraps(self):
+        body = dict(self.rules)['.header-line']
+        self.assertIn('flex-wrap: wrap', body)
+
+    def test_no_courier_new(self):
+        self.assertNotIn('Courier New', self.html)
+        self.assertIn('--mono:', self.css)
+
+    def test_mode_badge_uses_no_alarm_colour(self):
+        for selector, body in self.rules:
+            if 'mode-badge' in selector:
+                for token in ('var(--amber)', 'var(--red)', 'var(--green)'):
+                    self.assertNotIn(token, body, selector)
+
+    def test_amber_only_means_attention(self):
+        """Amber = attention (conflict, notice, degraded). Never a mode, a fact, or the
+        pane's frame. Rule-by-rule allowlist, like the red one."""
+        allowed = ('degraded-banner', 'badge.conflict', 'port-cell.armed', 'conflict-armed',
+                   '#toast', 'unknown-tag', 'gate-notice', 'preflight-item.notice', 'suggested-tag')
+        for selector, body in self.rules:
+            if ':root' in selector:
+                continue
+            if 'var(--amber)' in body:
+                self.assertTrue(any(a in selector for a in allowed),
+                                f'var(--amber) in {selector!r}, outside the allowlist')
+
+    def test_section_order_local_first(self):
+        order = [self.html.index(m) for m in (
+            'id="active-section"', 'id="failed-section"', 'id="standby-section"',
+            'id="off-section"', 'id="retired-section"', '<div class="port-board"',
+            'id="fleet-section"')]
+        self.assertEqual(order, sorted(order))
+
+    def test_fleet_counts_off_and_retired_instead_of_listing_them(self):
+        start = self.html.index('function renderFleetSection')
+        renderer = self.html[start:self.html.index('\n        function ', start + 10)]
+        self.assertIn("unit.rung === 'OFF'", renderer)
+        self.assertIn("unit.rung === 'RETIRED'", renderer)
+        self.assertIn("' off'", renderer)
+        self.assertIn("' retired'", renderer)
+
+    def test_row_names_the_unit_once(self):
+        start = self.html.index('function renderUnitList')
+        renderer = self.html[start:self.html.index('\n        function ', start + 10)]
+        self.assertNotIn("'alias '", renderer)
+        self.assertNotIn("unit.rung + ' ' + unit.alias", renderer)
+
+    def test_edit_form_is_one_column_inside_the_pane(self):
+        body = dict(self.rules).get('.detail-pane .edit-form-two-column', '')
+        self.assertIn('grid-template-columns: 1fr', body)
+
+
 if __name__ == '__main__':
     unittest.main()
