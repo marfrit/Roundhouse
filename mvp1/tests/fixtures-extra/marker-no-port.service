@@ -1,0 +1,7 @@
+[Unit]
+Description=A managed helper that declares no port
+# roundhouse: manage
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 /opt/helper/serve.py --alias helper

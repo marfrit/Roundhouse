@@ -1,0 +1,15 @@
+[Unit]
+Description=Bladerunner micro-harness (bladerunner-mneme) auf :8094 — Lernmodell + mneme/Websuche
+After=network-online.target bladerunner-serve.service
+Requires=bladerunner-serve.service
+# roundhouse: manage
+# Kein llama-server, darum die Markierung oben: roundhouse fuehrt die Unit dann im Roster.
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 /home/mfritsche/bladerunner/bin/br_harness.py \
+    --alias bladerunner-mneme --port 8094 --upstream http://127.0.0.1:8093 --ctx 32768
+Restart=on-failure
+
+[Install]
+WantedBy=default.target

@@ -371,6 +371,56 @@ class TestBuildDeployment(unittest.TestCase):
         self.assertTrue(dep['deployment_id'].startswith('boltzmann/'))
 
 
+class TestUnclassifiedManagedUnitIsProbed(unittest.TestCase):
+    """A '# roundhouse: manage' unit with no engine Roundhouse knows (bladerunner's
+    python harness on bosch) was active and never ready: LOADING forever. Its
+    readiness now comes from GET /v1/models like the OpenAI-style engines."""
+
+    def setUp(self):
+        self.path = Path(__file__).resolve().parents[0] / "fixtures-extra" / "bladerunner-mneme.service"
+        self.unit = roundhouse.parse_unit(str(self.path), self.path.read_bytes())
+
+    def test_selected_by_marker_and_unclassified(self):
+        names = [os.path.basename(p) for p in roundhouse.select_units(str(self.path.parent))]
+        self.assertIn('bladerunner-mneme.service', names)
+        self.assertEqual(self.unit.exec_start.engine, {})
+
+    def test_probe_gated_with_a_port(self):
+        self.assertTrue(roundhouse.probes_models(self.unit.exec_start.engine))
+        profile = roundhouse.extract_param_profile(self.unit.exec_start.engine_argv)
+        self.assertEqual(roundhouse.probe_port(self.unit.exec_start.engine, profile), 8094)
+
+    def test_no_declared_port_means_no_probe(self):
+        """extract_param_profile defaults to 8080 — another engine's port on this fleet.
+        An unclassified unit must not go READY on somebody else's answer."""
+        path = self.path.parent / 'marker-no-port.service'
+        unit = roundhouse.parse_unit(str(path), path.read_bytes())
+        self.assertEqual(unit.exec_start.engine, {})
+        profile = roundhouse.extract_param_profile(unit.exec_start.engine_argv)
+        self.assertEqual(profile['port_source'], 'default', 'precondition: the profile invents a port')
+        self.assertIsNone(roundhouse.probe_port(unit.exec_start.engine, profile))
+
+    def test_classified_engines_keep_their_default_port(self):
+        raw = b"[Service]\nExecStart=/usr/bin/arcint --model /models/ov/x\n"
+        unit = roundhouse.parse_unit('/tmp/arcint.service', raw)
+        profile = roundhouse.extract_param_profile(unit.exec_start.engine_argv)
+        self.assertEqual(roundhouse.probe_port(unit.exec_start.engine, profile), 8090)
+
+    def test_journal_driven_engines_stay_off_the_probe(self):
+        """llama-server and llamafile keep their journal markers (BUSY needs them)."""
+        self.assertFalse(roundhouse.probes_models({'kind': 'llama-server'}))
+        self.assertFalse(roundhouse.probes_models({'kind': 'llamafile'}))
+        for kind in roundhouse.OPENAI_PROBE_ENGINES:
+            self.assertTrue(roundhouse.probes_models({'kind': kind}), kind)
+
+    def test_the_poll_loop_asks_the_helper(self):
+        src = (Path(__file__).resolve().parents[1] / 'roundhouse.py').read_text()
+        loop = src[src.index('probe_targets = []'):src.index('for unit_name, unit_port in probe_targets')]
+        self.assertIn('probes_models(u.exec_start.engine)', loop)
+        self.assertIn('probe_port(', loop)
+        self.assertNotIn('not in OPENAI_PROBE_ENGINES', loop)
+
+
 if __name__ == '__main__':
     unittest.main()
 

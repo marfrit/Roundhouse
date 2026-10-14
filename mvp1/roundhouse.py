@@ -1252,6 +1252,39 @@ OPENARC_READY_RECHECK_TICKS = 10
 OPENAI_PROBE_ENGINES = ('openarc', 'vllm', 'ds4', 'arcint', 'dsv41-exl3')
 
 
+def probes_models(engine: Dict) -> bool:
+    """Is this unit's readiness decided by the GET /v1/models probe?
+
+    Yes for the OpenAI-style engines above, and for a managed unit Roundhouse
+    cannot classify (engine == {}): such a unit enters the roster only through
+    '# roundhouse: manage' (or a llama-server token behind a shell), and with no
+    journal markers and no probe it is active but never ready -- LOADING forever
+    (MVP11 part 1). A process that lists a model on /v1/models is READY; one that
+    does not answer stays LOADING, which is then the truth about it.
+
+    Also lands here: a llama-server behind an `env`/`ionice` wrapper or `sh -c`
+    (the wrapper parser classifies only taskset/nice). It is probed, which beats
+    LOADING forever, but shows no BUSY -- that needs the journal markers.
+    """
+    kind = engine.get('kind')
+    return kind is None or kind in OPENAI_PROBE_ENGINES
+
+
+def probe_port(engine: Dict, profile: Dict) -> Optional[int]:
+    """The port to probe for this unit, or None to leave it unprobed.
+
+    extract_param_profile always fills a port: a classified engine's own default
+    is right for it, but an unclassified unit without an explicit --port would get
+    8080 -- another engine's production port on this fleet -- and go READY on
+    somebody else's answer. So for kind None only a port from a flag counts.
+    """
+    if not probes_models(engine):
+        return None
+    if engine.get('kind') is None and profile.get('port_source') != 'flag':
+        return None
+    return profile.get('port')
+
+
 def _models_ready_probe(port: int, timeout: float = OPENARC_PROBE_TIMEOUT,
                          opener=None) -> bool:
     """GET /v1/models on loopback; True iff HTTP 200 with >= 1 model listed.
@@ -9268,7 +9301,7 @@ def cmd_serve(args):
                     for unit_name in selected_unit_names:
                         u = watcher.units.get(unit_name)
                         if not u or not u.exec_start or \
-                                u.exec_start.engine.get('kind') not in OPENAI_PROBE_ENGINES:
+                                not probes_models(u.exec_start.engine):
                             continue
                         state = watcher._state.get(unit_name, {})
                         if state.get('active_state') != 'active':
@@ -9278,8 +9311,11 @@ def cmd_serve(args):
                         openarc_tick[unit_name] = n + 1
                         if state.get('ready') and n % OPENARC_READY_RECHECK_TICKS != 0:
                             continue
-                        profile = extract_param_profile(u.exec_start.engine_argv)
-                        probe_targets.append((unit_name, profile.get('port')))
+                        port = probe_port(u.exec_start.engine,
+                                          extract_param_profile(u.exec_start.engine_argv))
+                        if port is None:
+                            continue
+                        probe_targets.append((unit_name, port))
 
                 for unit_name, unit_port in probe_targets:
                     is_ready = _models_ready_probe(unit_port)
