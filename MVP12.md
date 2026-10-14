@@ -83,9 +83,10 @@ Readings:
 What changes (CSS + rendering in `index.html` only):
 
 1. **Detail pane as a side panel (> 700 px):** `position: fixed` right column,
-   `width: min(560px, 42vw)`, own scroll. At ≥ 1000 px `body.overlay-open` gets a
-   matching right padding so the list stays visible beside it; 701–999 px it
-   overlays. The phone full-screen rule (≤ 700 px) stays. The close button moves
+   `width: clamp(320px, 42vw, 560px)`, own scroll; the page gets a matching right
+   padding so the list stays visible beside it. (First drafted as "room only from
+   1000 px, overlay below"; the code review showed the overlay covers every boot
+   toggle at 768 px, so the room now starts at 701 px.) The phone full-screen rule (≤ 700 px) stays. The close button moves
    into a sticky bar at the top of the pane instead of floating under the title
    row; Escape closes the pane.
 2. **Header wraps:** `flex-wrap` on the header line; on phones the token field
@@ -124,7 +125,7 @@ proven by the rig, not by those tests — they prove the rules exist.
 
 1. **`overlay-open` is shared by the pane and both modals** — closing a modal
    stripped the pane's room (and, on phones, the scroll lock) while the pane stayed
-   open. The ≥ 1000 px room is now keyed on `body:has(#detail-pane.active)`; the
+   open. The room is now keyed on `body:has(#detail-pane.active)`; the
    three close functions go through `releaseOverlay()`, which drops the lock only
    when neither the pane nor a modal is still open.
 2. **A4 as first written could not pass** — amber also marks notices and the
@@ -170,3 +171,31 @@ units) for both pages; `rhmeasure2.js`:
 Light and dark are identical in geometry; read-only mode (no token field) measured
 too — same verdicts. A1–A5 met. `tests/test_server.py` 201 OK, the new
 `TestMvp12LayoutStatic` (12 tests) fails 12/12 against the 0.11.0 page — it can go red.
+
+## Part 6 — code review (Fable, b5fbe82) and the follow-up
+
+Nothing blocking; frozen 44 px block md5-identical; 12/12 new tests red against
+0.11.0 confirmed independently. Folded in:
+
+- **M1** a serving unit flips BUSY↔READY per request, so an open pane would
+  re-fetch twice per inference and late answers could paint out of order —
+  refreshes are coalesced (250 ms) and sequenced (`paneSeq`); an answer paints only
+  if it is the newest, the pane still shows that unit and no edit form opened
+  meanwhile.
+- **L1** clicking row B before row A's detail arrived let A paint under B's
+  highlight — `fetchUnitDetail` uses the same sequence.
+- **L2** 701–999 px: the overlay covered every boot toggle — the room now starts
+  at 701 px with one clamped `--pane-w` token for pane and padding. Measured at
+  768×1024 (below): row and toggle visible beside the pane.
+- **L3** the amber test now also scans inline `'var(--amber)'` in the script and
+  allows it only at the switch preview's attention lines (fit verdict, hint,
+  notices); the overlay-lock test no longer slices at the first `}`.
+
+| 768×1024 light | baseline | MVP12 |
+|---|---|---|
+| document height | 2379 | 1024 (= viewport) |
+| pane top after click | 2379 (off screen) | 16 |
+| clicked row + boot toggle visible beside pane | — | yes |
+| fleet + port board | 1386 | 278 |
+
+Full suite: `mvp1/tests` 949 OK, root `tests` 16 OK.

@@ -3986,14 +3986,17 @@ class TestMvp12LayoutStatic(unittest.TestCase):
     def test_page_makes_room_keyed_on_the_pane_not_the_shared_overlay_class(self):
         """overlay-open is shared with both modals; closing a modal must not take the
         pane's room away while the pane stays open."""
-        block = self._media_block('@media (min-width: 1000px)')
+        block = self._media_block('@media (min-width: 701px)')
         self.assertIn('body:has(#detail-pane.active)', block)
+        self.assertIn('padding-right: calc(var(--pane-w)', block)
         self.assertNotIn('overlay-open', block)
 
     def test_modals_release_the_lock_only_when_nothing_else_is_open(self):
         for fn in ('function closeDiffModal', 'function closeSwitchModal', 'function closeDetail'):
-            body = self.html[self.html.index(fn):self.html.index('}', self.html.index(fn))]
+            start = self.html.index(fn)
+            body = self.html[start:self.html.index('\n        }', start)]
             self.assertIn('releaseOverlay()', body, fn)
+            self.assertNotIn(".remove('overlay-open')", body, fn)
         release = self.html[self.html.index('function releaseOverlay'):]
         release = release[:release.index('\n        }')]
         self.assertIn('#detail-pane.active, .modal.active', release)
@@ -4030,6 +4033,24 @@ class TestMvp12LayoutStatic(unittest.TestCase):
             if 'var(--amber)' in body:
                 self.assertTrue(any(a in selector for a in allowed),
                                 f'var(--amber) in {selector!r}, outside the allowlist')
+        # Script side: inline amber only in the switch preview's attention lines
+        # (memory-fit verdict, its hint, notices). The line before each use names it.
+        script = self.html[self.html.index('<script>'):]
+        lines = script.split('\n')
+        for i, line in enumerate(lines):
+            if "'var(--amber)'" in line:
+                context = ' '.join(lines[max(0, i - 1):i + 1])
+                self.assertTrue(any(k in context for k in ('fit', 'hint', 'notice')),
+                                f'inline amber outside the attention sites: {line.strip()}')
+
+    def test_pane_refresh_is_coalesced_and_sequenced(self):
+        start = self.html.index('function refreshOpenPane')
+        body = self.html[start:self.html.index('\n        }', start)]
+        self.assertIn('setTimeout', body)
+        self.assertIn('paneMayRepaint', body)
+        detail = self.html[self.html.index('function fetchUnitDetail'):]
+        detail = detail[:detail.index('\n        }')]
+        self.assertIn('seq === paneSeq', detail)
 
     def test_section_order_local_first(self):
         order = [self.html.index(m) for m in (

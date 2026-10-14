@@ -15,7 +15,7 @@
             --border: #30363d;
             --surface: #161b22;
             --mono: ui-monospace, "JetBrains Mono", "DejaVu Sans Mono", Menlo, Consolas, monospace;
-            --pane-w: min(560px, 42vw);
+            --pane-w: clamp(320px, 42vw, 560px);
         }
 
         @media (prefers-color-scheme: dark) {
@@ -54,13 +54,6 @@
             line-height: 1.5;
         }
 
-        /* MVP12: the pane is a fixed side column above 700 px; at >= 1000 px the page
-           makes room for it so the row that opened it stays in view. */
-        @media (min-width: 1000px) {
-            body:has(#detail-pane.active) {
-                padding-right: calc(var(--pane-w) + 32px);
-            }
-        }
 
         .header {
             margin-bottom: 0.75em;
@@ -315,14 +308,21 @@
             display: block;
         }
 
+        /* MVP12: above the phone breakpoint the pane is a fixed side column and the page
+           makes room for it, so the row that opened it — and its boot toggle — stay in
+           view. The room is keyed on the pane itself, not on overlay-open, which the
+           modals share. */
         @media (min-width: 701px) {
+            body:has(#detail-pane.active) {
+                padding-right: calc(var(--pane-w) + 32px);
+            }
+
             .detail-pane.active {
                 position: fixed;
                 top: 16px;
                 right: 16px;
                 bottom: 16px;
                 width: var(--pane-w);
-                min-width: 320px;
                 box-sizing: border-box;
                 overflow-y: auto;
                 z-index: 20;
@@ -1773,22 +1773,40 @@
             }
         }
 
+        // A serving unit flips BUSY<->READY on every request, so refreshes are coalesced
+        // (one fetch per quiet 250 ms) and sequenced: only the newest answer may paint,
+        // and only while the pane still shows that unit and no edit form has opened.
+        let paneSeq = 0;
+        let paneRefreshTimer = null;
+
+        function paneMayRepaint(unitName, seq) {
+            return seq === paneSeq && unitName === selectedUnit &&
+                document.getElementById('detail-pane').classList.contains('active') &&
+                !document.getElementById('edit-form-container').classList.contains('active');
+        }
+
         function refreshOpenPane(unitName) {
             if (unitName !== selectedUnit) return;
             if (!document.getElementById('detail-pane').classList.contains('active')) return;
             if (document.getElementById('edit-form-container').classList.contains('active')) return;
-            fetch('/api/units/' + encodeURIComponent(unitName))
-                .then(r => r.json())
-                .then(data => { if (unitName === selectedUnit) showDetail(data); })
-                .catch(e => console.error('Error refreshing unit detail:', e));
+            clearTimeout(paneRefreshTimer);
+            paneRefreshTimer = setTimeout(() => {
+                const seq = ++paneSeq;
+                fetch('/api/units/' + encodeURIComponent(unitName))
+                    .then(r => r.json())
+                    .then(data => { if (paneMayRepaint(unitName, seq)) showDetail(data); })
+                    .catch(e => console.error('Error refreshing unit detail:', e));
+            }, 250);
         }
 
         function fetchUnitDetail(unitName) {
             selectedUnit = unitName;
+            clearTimeout(paneRefreshTimer);
+            const seq = ++paneSeq;
             renderUnits();
             fetch('/api/units/' + encodeURIComponent(unitName))
                 .then(r => r.json())
-                .then(data => showDetail(data))
+                .then(data => { if (seq === paneSeq && unitName === selectedUnit) showDetail(data); })
                 .catch(e => console.error('Error fetching unit detail:', e));
         }
 
@@ -2009,6 +2027,8 @@
             document.getElementById('detail-pane').classList.remove('active');
             releaseOverlay();
             selectedUnit = null;
+            clearTimeout(paneRefreshTimer);
+            paneSeq++;
             renderUnits();
         }
 
