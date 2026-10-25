@@ -523,6 +523,33 @@ class TestAliasDirective(unittest.TestCase):
         self.assertEqual(roundhouse.unit_alias(unit, profile), 'stt.service')
         self.assertTrue(any('invalid alias' in w for w in unit.warnings), unit.warnings)
 
+    def test_text_in_a_description_value_is_not_a_directive(self):
+        """systemd has no inline comments: the marker text on a directive line is
+        data, not a directive."""
+        raw = (b"[Unit]\nDescription=transcription # roundhouse: alias sneaky\n"
+               b"[Service]\nExecStart=/opt/fixture/bin/arcint-whisper "
+               b"--model /opt/fixture/m.bin --port 8096\n")
+        unit = roundhouse.parse_unit('/tmp/stt.service', raw)
+        self.assertIsNone(unit.alias_directive)
+        profile = roundhouse.extract_param_profile(unit.exec_start.engine_argv)
+        self.assertEqual(roundhouse.unit_alias(unit, profile), 'stt.service')
+
+    def test_text_in_an_execstart_argument_is_not_a_directive(self):
+        """The marker text inside a quoted argument is an argument value."""
+        raw = (b"[Service]\nExecStart=/opt/fixture/bin/arcint-whisper "
+               b"--model /opt/fixture/m.bin --prompt \"say ; roundhouse: alias sneaky ok\" "
+               b"--port 8096\n")
+        unit = roundhouse.parse_unit('/tmp/stt.service', raw)
+        self.assertIsNone(unit.alias_directive)
+        profile = roundhouse.extract_param_profile(unit.exec_start.engine_argv)
+        self.assertEqual(roundhouse.unit_alias(unit, profile), 'stt.service')
+
+    def test_indented_comment_line_still_sets_the_alias(self):
+        unit = self._whisper('    # roundhouse: alias stt-base')
+        self.assertEqual(unit.alias_directive, 'stt-base')
+        profile = roundhouse.extract_param_profile(unit.exec_start.engine_argv)
+        self.assertEqual(roundhouse.unit_alias(unit, profile), 'stt-base')
+
 
 if __name__ == '__main__':
     unittest.main()

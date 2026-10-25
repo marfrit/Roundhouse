@@ -225,9 +225,13 @@ def parse_unit(path: str, raw: bytes) -> UnitFile:
 
     # Declared alias for an engine that has no alias flag. Validated with the
     # same charset as a spliced alias value, so the directive cannot name a
-    # string the flag form could never carry.
+    # string the flag form could never carry. Anchored to a COMMENT LINE: systemd
+    # has no inline comments, so the text inside a Description= or ExecStart=
+    # value is data, not a directive. Only the line's first non-blank character
+    # may be '#' or ';' (re.MULTILINE; a comment line may be indented).
     alias_directive = None
-    m_alias = re.search(r'[#;]\s*roundhouse:\s*alias\s+(\S+)', raw_str)
+    m_alias = re.search(r'^[ \t]*[#;][ \t]*roundhouse:[ \t]*alias[ \t]+(\S+)',
+                        raw_str, re.MULTILINE)
     if m_alias:
         name = m_alias.group(1)
         if UNQUOTED_VALUE_RE.fullmatch(name):
