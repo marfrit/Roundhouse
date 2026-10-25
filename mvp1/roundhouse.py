@@ -141,6 +141,10 @@ class UnitFile:
       mem_estimate: declared '# roundhouse: mem-estimate <N[KMGT]>' in bytes, or None.
         For engines whose residency the unit cgroup cannot see (CUDA/unified
         memory, docker-wrapped servers) this is the ONLY truthful fit number.
+      alias_directive: declared '# roundhouse: alias <name>' (also ';' form) for an
+        engine with no alias flag, or None. A flag alias outranks it (see
+        unit_alias()); the flag source is the one source of truth.
+      warnings: also carries 'alias directive ignored ...' when both exist.
       known: dict of {field: value} for standard keys
       other_directives: list of Directive not in the known set
     """
@@ -160,8 +164,15 @@ class UnitFile:
     install_wanted_by: Optional[str] = None
     on_demand: bool = False
     mem_estimate: Optional[int] = None
+    alias_directive: Optional[str] = None
     known: Dict = field(default_factory=dict)
     other_directives: List[Directive] = field(default_factory=list)
+
+
+# The charset an unquoted ExecStart value may carry (plan_edits §3.2.3).
+# Shared with the alias directive so a directive alias accepts exactly the names
+# a spliced flag alias accepts; `fullmatch` + `+` keeps it non-empty.
+UNQUOTED_VALUE_RE = re.compile(r'[A-Za-z0-9._:/=,+\-]+')
 
 
 def parse_mem_size(text: str) -> Optional[int]:
@@ -212,6 +223,19 @@ def parse_unit(path: str, raw: bytes) -> UnitFile:
     if m_mem:
         mem_estimate = parse_mem_size(m_mem.group(1))
 
+    # Declared alias for an engine that has no alias flag. Validated with the
+    # same charset as a spliced alias value, so the directive cannot name a
+    # string the flag form could never carry.
+    alias_directive = None
+    m_alias = re.search(r'[#;]\s*roundhouse:\s*alias\s+(\S+)', raw_str)
+    if m_alias:
+        name = m_alias.group(1)
+        if UNQUOTED_VALUE_RE.fullmatch(name):
+            alias_directive = name
+        else:
+            warnings.append(f"invalid alias directive ignored: '{name}' "
+                            "is not a valid alias name")
+
     # Known directive keys
     KNOWN_KEYS = {
         "Description", "Documentation", "After", "Wants",
@@ -242,6 +266,14 @@ def parse_unit(path: str, raw: bytes) -> UnitFile:
         else:
             other_directives.append(directive)
 
+    # A directive alias never overrides an engine's own alias flag: flag wins.
+    # One source of truth, and a warning so the ignored line is visible.
+    if alias_directive and exec_start:
+        flag_alias = extract_param_profile(exec_start.engine_argv).get('alias')
+        if flag_alias:
+            warnings.append(f"alias directive ignored: engine flag names "
+                            f"the alias ('{flag_alias}')")
+
     # Parse gate from ExecCondition or ConditionKernelVersion
     gate = parse_gate_impl(directives)
 
@@ -262,6 +294,7 @@ def parse_unit(path: str, raw: bytes) -> UnitFile:
         install_wanted_by=install_wanted_by,
         on_demand=on_demand,
         mem_estimate=mem_estimate,
+        alias_directive=alias_directive,
         known=known,
         other_directives=other_directives
     )
@@ -524,6 +557,15 @@ def tokenize_execstart(directive: Directive, raw: bytes) -> ExecStart:
                     'kind': 'arcint',
                     'binary': engine_binary,
                     'variant': 'openvino'
+                }
+            elif engine_basename in ('arcint-whisper', 'whisper-server'):
+                # whisper.cpp's server, shipped upstream as `whisper-server` and
+                # renamed `arcint-whisper` by the Arc package. It is STT, not an
+                # OpenAI catalog: --host/--port yes, no alias flag, no /v1/models.
+                engine = {
+                    'kind': 'whisper',
+                    'binary': engine_binary,
+                    'variant': 'whisper.cpp'
                 }
             elif engine_basename == 'dsv41-exl3-serve':
                 # DeepSeek-V4.1-Flash EXL3 on a two-Spark pair: vLLM under
@@ -958,7 +1000,9 @@ def extract_param_profile(engine_argv: List[Token]) -> Dict:
                         break
 
     # Set default port if not specified. OpenArc and vLLM serve on 8000 when
-    # unmapped; the llama.cpp family defaults to 8080.
+    # unmapped; the llama.cpp family defaults to 8080. whisper.cpp's server also
+    # defaults to 8080 (its own default, not inherited by accident), so it takes
+    # the same else-branch as the llama.cpp family.
     if result['port'] is None:
         if binary_base in ('openarc', 'docker'):
             result['port'] = 8000
@@ -969,6 +1013,17 @@ def extract_param_profile(engine_argv: List[Token]) -> Dict:
         result['port_source'] = 'default'
 
     return result
+
+
+def unit_alias(unit: UnitFile, profile: Dict) -> str:
+    """The roster alias of a unit; precedence flag > directive > unit name.
+
+    An engine's own flag is what names the served endpoint, so it wins over the
+    directive (parse_unit warns when both are present). The directive exists for
+    engines with no alias flag at all (whisper). Neither present: the unit name,
+    as before.
+    """
+    return profile.get('alias') or unit.alias_directive or unit.name
 
 
 def parse_gate(unit: UnitFile) -> Optional[Dict]:
@@ -1251,11 +1306,18 @@ OPENARC_READY_RECHECK_TICKS = 10
 # the unit sits at LOADING forever while its API answers.
 OPENAI_PROBE_ENGINES = ('openarc', 'vllm', 'ds4', 'arcint', 'dsv41-exl3')
 
+# Engine kinds with no /v1/models: whisper.cpp's server answers only
+# POST /v1/audio/transcriptions, GET /health (503 while loading) and GET /props.
+# Readiness is GET /health; the SAME probe cadence and back-off as the OpenAI
+# probe, not a second scheduler.
+HEALTH_PROBE_ENGINES = ('whisper',)
+
 
 def probes_models(engine: Dict) -> bool:
-    """Is this unit's readiness decided by the GET /v1/models probe?
+    """Is this unit's readiness decided by a loopback HTTP probe?
 
-    Yes for the OpenAI-style engines above, and for a managed unit Roundhouse
+    Yes for the OpenAI-style engines above (GET /v1/models), for whisper
+    (GET /health instead — see _ready_probe), and for a managed unit Roundhouse
     cannot classify (engine == {}): such a unit enters the roster only through
     '# roundhouse: manage' (or a llama-server token behind a shell), and with no
     journal markers and no probe it is active but never ready -- LOADING forever
@@ -1267,7 +1329,8 @@ def probes_models(engine: Dict) -> bool:
     LOADING forever, but shows no BUSY -- that needs the journal markers.
     """
     kind = engine.get('kind')
-    return kind is None or kind in OPENAI_PROBE_ENGINES
+    return (kind is None or kind in OPENAI_PROBE_ENGINES
+            or kind in HEALTH_PROBE_ENGINES)
 
 
 def probe_port(engine: Dict, profile: Dict) -> Optional[int]:
@@ -1308,10 +1371,6 @@ def _models_ready_probe(port: int, timeout: float = OPENARC_PROBE_TIMEOUT,
     return bool(data)
 
 
-# llm-proxy notification (MVP10 follow-up). After an operation that changed
-# what a serving port offers, the proxy's 30 s discovery cache is stale at the
-# worst possible moment; POSTing its /admin/recheck (the HTTP twin of its
-# SIGUSR1 handler, idempotent and cheap) makes it re-discover immediately.
 DEFAULT_PROXY_RECHECK_URL = 'http://hossenfelder.fritz.box:8082/admin/recheck'
 PROXY_RECHECK_TIMEOUT = 5.0
 
@@ -1704,11 +1763,11 @@ class Watcher:
             busy_end_patterns = []
             req_done_patterns = []
         elif engine_kind in ('ds4', 'arcint', 'dsv41-exl3'):
-            # No ready marker trusted here; the /v1/models probe decides. arcint
-            # prints 'http: listening' before the paged executor has its
-            # reservation, so the line is not a readiness statement. dsv41-exl3
-            # has no marker at all in this journal -- vLLM runs inside a docker
-            # container whose log start.sh does not forward.
+            # No ready marker trusted here; the /v1/models probe decides. arcint prints
+            # 'http: listening' before the paged executor has its reservation,
+            # so the line is not a readiness statement. dsv41-exl3 has no marker
+            # at all in this journal -- vLLM runs inside a docker container whose
+            # log start.sh does not forward.
             ready_patterns = []
             busy_start_patterns = []
             busy_end_patterns = []
@@ -6059,7 +6118,7 @@ def plan_edits(unit: UnitFile, changes: Dict[str, str]) -> List[Edit]:
             # Unquoted: must match alphanumeric + safe chars. `fullmatch` + `+` (§3.2.3):
             # non-empty, and no `$`-before-trailing-newline hole (a value ending in \n
             # would otherwise pass and split the token).
-            if not re.fullmatch(r'[A-Za-z0-9._:/=,+\-]+', new_value):
+            if not UNQUOTED_VALUE_RE.fullmatch(new_value):
                 raise EditError("invalid_value", f"unquoted value contains invalid chars: {new_value}")
         elif quote == "'":
             # Single-quoted: no ' or \ or newline

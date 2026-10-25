@@ -421,6 +421,109 @@ class TestUnclassifiedManagedUnitIsProbed(unittest.TestCase):
         self.assertNotIn('not in OPENAI_PROBE_ENGINES', loop)
 
 
+class TestWhisperEngine(unittest.TestCase):
+    """whisper.cpp's server (upstream `whisper-server`, renamed `arcint-whisper`
+    by the Arc package): a kind with --port/--host but no alias flag and no
+    /v1/models. Readiness is GET /health (see TestWhisperReadiness)."""
+
+    def setUp(self):
+        self.fixtures_extra = Path(__file__).resolve().parents[0] / "fixtures-extra"
+
+    def _parse(self, raw, name='/tmp/stt.service'):
+        return roundhouse.parse_unit(name, raw)
+
+    def test_arcint_whisper_basename(self):
+        unit = self._parse(b"[Service]\nExecStart=/opt/fixture/bin/arcint-whisper "
+                           b"--model /opt/fixture/models/ggml-base.en.bin --port 8096\n")
+        self.assertEqual(unit.exec_start.engine.get('kind'), 'whisper')
+        self.assertEqual(unit.exec_start.engine.get('variant'), 'whisper.cpp')
+
+    def test_upstream_whisper_server_basename(self):
+        unit = self._parse(b"[Service]\nExecStart=/opt/fixture/bin/whisper-server "
+                           b"--model /opt/fixture/models/ggml-base.en.bin\n")
+        self.assertEqual(unit.exec_start.engine.get('kind'), 'whisper')
+
+    def test_port_from_flag(self):
+        unit = self._parse(b"[Service]\nExecStart=/opt/fixture/bin/arcint-whisper "
+                           b"--model /opt/fixture/m.bin --host 127.0.0.1 --port 8096\n")
+        profile = roundhouse.extract_param_profile(unit.exec_start.engine_argv)
+        self.assertEqual(profile['port'], 8096)
+        self.assertEqual(profile['port_source'], 'flag')
+        self.assertEqual(profile['host_bind'], '127.0.0.1')
+
+    def test_default_port_is_whisper_cpps_own(self):
+        unit = self._parse(b"[Service]\nExecStart=/usr/bin/whisper-server "
+                           b"--model /opt/fixture/models/ggml-base.en.bin\n")
+        profile = roundhouse.extract_param_profile(unit.exec_start.engine_argv)
+        self.assertEqual(profile['port'], 8080, 'whisper.cpp serves on 8080 when --port is absent')
+        self.assertEqual(profile['port_source'], 'default')
+
+    def test_probed_like_the_other_classified_engines(self):
+        """A classified whisper unit is probed (via /health) on its own default,
+        the same way arcint is probed on its own default."""
+        unit = self._parse(b"[Service]\nExecStart=/usr/bin/whisper-server "
+                           b"--model /opt/fixture/models/ggml-base.en.bin\n")
+        profile = roundhouse.extract_param_profile(unit.exec_start.engine_argv)
+        self.assertTrue(roundhouse.probes_models(unit.exec_start.engine))
+        self.assertEqual(roundhouse.probe_port(unit.exec_start.engine, profile), 8080)
+
+    def test_fixture_is_selected(self):
+        names = [os.path.basename(p) for p in
+                 roundhouse.select_units(str(self.fixtures_extra))]
+        self.assertIn('whisper-transcribe.service', names)
+
+
+class TestAliasDirective(unittest.TestCase):
+    """`# roundhouse: alias <name>` (also `;`) names a unit whose engine has no
+    alias flag. A flag alias wins over the directive; an invalid name is refused."""
+
+    def _parse(self, directive, exec_start):
+        raw = ("[Service]\n" + directive + "\nExecStart=" + exec_start + "\n").encode()
+        return roundhouse.parse_unit('/tmp/stt.service', raw)
+
+    def _whisper(self, directive='# roundhouse: alias stt-base'):
+        return self._parse(directive, '/opt/fixture/bin/arcint-whisper '
+                           '--model /opt/fixture/m.bin --port 8096')
+
+    def test_hash_form_sets_the_alias(self):
+        unit = self._whisper('# roundhouse: alias stt-base')
+        self.assertEqual(unit.alias_directive, 'stt-base')
+        profile = roundhouse.extract_param_profile(unit.exec_start.engine_argv)
+        self.assertEqual(profile['alias'], None, 'precondition: the engine has no alias flag')
+        self.assertEqual(roundhouse.unit_alias(unit, profile), 'stt-base')
+        self.assertEqual(unit.warnings, [])
+
+    def test_semicolon_form_sets_the_alias(self):
+        unit = self._whisper('; roundhouse: alias stt-base')
+        self.assertEqual(unit.alias_directive, 'stt-base')
+        profile = roundhouse.extract_param_profile(unit.exec_start.engine_argv)
+        self.assertEqual(roundhouse.unit_alias(unit, profile), 'stt-base')
+
+    def test_directive_absent_falls_back_to_the_unit_name(self):
+        unit = self._parse('[Service]', '/usr/bin/whisper-server --model /opt/fixture/m.bin')
+        self.assertIsNone(unit.alias_directive)
+        profile = roundhouse.extract_param_profile(unit.exec_start.engine_argv)
+        self.assertEqual(roundhouse.unit_alias(unit, profile), 'stt.service')
+
+    def test_flag_beats_the_directive_with_a_warning(self):
+        unit = self._parse('# roundhouse: alias from-directive',
+                           '/usr/bin/llama-server --model /opt/fixture/m.gguf '
+                           '--alias from-flag --port 8080')
+        self.assertEqual(unit.alias_directive, 'from-directive', 'read, but not used')
+        profile = roundhouse.extract_param_profile(unit.exec_start.engine_argv)
+        self.assertEqual(roundhouse.unit_alias(unit, profile), 'from-flag',
+                         'one source of truth: the flag')
+        self.assertTrue(any('alias directive ignored' in w for w in unit.warnings),
+                        unit.warnings)
+
+    def test_invalid_name_is_rejected(self):
+        unit = self._whisper("# roundhouse: alias 'stt base'")
+        self.assertIsNone(unit.alias_directive)
+        profile = roundhouse.extract_param_profile(unit.exec_start.engine_argv)
+        self.assertEqual(roundhouse.unit_alias(unit, profile), 'stt.service')
+        self.assertTrue(any('invalid alias' in w for w in unit.warnings), unit.warnings)
+
+
 if __name__ == '__main__':
     unittest.main()
 

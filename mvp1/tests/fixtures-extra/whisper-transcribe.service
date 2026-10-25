@@ -1,0 +1,15 @@
+[Unit]
+Description=Synthetic speech-to-text worker (fixture, not a real host)
+# roundhouse: alias stt-base
+
+[Service]
+Type=simple
+ExecStart=/opt/fixture/bin/arcint-whisper \
+    --model /opt/fixture/models/ggml-base.en.bin \
+    --host 127.0.0.1 \
+    --port 8096
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target
