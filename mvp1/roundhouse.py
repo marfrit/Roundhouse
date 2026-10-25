@@ -1349,8 +1349,11 @@ def probe_port(engine: Dict, profile: Dict) -> Optional[int]:
 
 
 def _models_ready_probe(port: int, timeout: float = OPENARC_PROBE_TIMEOUT,
-                         opener=None) -> bool:
-    """GET /v1/models on loopback; True iff HTTP 200 with >= 1 model listed.
+                         opener=None, path: str = '/v1/models',
+                         catalog: bool = True) -> bool:
+    """GET a loopback readiness path. With catalog=True (/v1/models) True iff
+    HTTP 200 AND >= 1 model listed; with catalog=False (/health) True iff HTTP
+    200 alone (whisper.cpp answers 503 while the model is still loading).
 
     OpenArc lists a model only once its compilation finished (~2 min for the
     MoE IR — the compile cache is forbidden there), so an empty list means
@@ -1358,12 +1361,14 @@ def _models_ready_probe(port: int, timeout: float = OPENARC_PROBE_TIMEOUT,
     counts as not ready. Besides _probe_peer/_presence_probe (fleet sensing,
     Section F) this is the one outbound-connect site, and it is read-only.
     """
-    url = f'http://127.0.0.1:{port}/v1/models'
+    url = f'http://127.0.0.1:{port}{path}'
     op = opener or urllib.request.urlopen
     try:
         with op(url, timeout=timeout) as resp:
             if getattr(resp, 'status', 200) != 200:
                 return False
+            if not catalog:
+                return True
             body = json.loads(resp.read())
     except Exception:
         return False
@@ -1371,6 +1376,27 @@ def _models_ready_probe(port: int, timeout: float = OPENARC_PROBE_TIMEOUT,
     return bool(data)
 
 
+def _health_ready_probe(port: int, timeout: float = OPENARC_PROBE_TIMEOUT,
+                        opener=None) -> bool:
+    """GET /health on loopback; True iff HTTP 200. whisper.cpp answers 503
+    while loading; non-200 and unreachable are not ready."""
+    return _models_ready_probe(port, timeout=timeout, opener=opener,
+                               path='/health', catalog=False)
+
+
+def _ready_probe(engine: Dict, port: int,
+                 timeout: float = OPENARC_PROBE_TIMEOUT, opener=None) -> bool:
+    """The one readiness entry point the poll loop calls: the engine kind
+    picks the path. whisper -> /health, everyone else -> /v1/models."""
+    if engine.get('kind') in HEALTH_PROBE_ENGINES:
+        return _health_ready_probe(port, timeout=timeout, opener=opener)
+    return _models_ready_probe(port, timeout=timeout, opener=opener)
+
+
+# llm-proxy notification (MVP10 follow-up). After an operation that changed
+# what a serving port offers, the proxy's 30 s discovery cache is stale at the
+# worst possible moment; POSTing its /admin/recheck (the HTTP twin of its
+# SIGUSR1 handler, idempotent and cheap) makes it re-discover immediately.
 DEFAULT_PROXY_RECHECK_URL = 'http://hossenfelder.fritz.box:8082/admin/recheck'
 PROXY_RECHECK_TIMEOUT = 5.0
 
@@ -1762,8 +1788,9 @@ class Watcher:
             busy_start_patterns = []
             busy_end_patterns = []
             req_done_patterns = []
-        elif engine_kind in ('ds4', 'arcint', 'dsv41-exl3'):
-            # No ready marker trusted here; the /v1/models probe decides. arcint prints
+        elif engine_kind in ('ds4', 'arcint', 'dsv41-exl3', 'whisper'):
+            # No ready marker trusted here; the HTTP probe decides (/v1/models
+            # for ds4/arcint/dsv41-exl3, /health for whisper). arcint prints
             # 'http: listening' before the paged executor has its reservation,
             # so the line is not a readiness statement. dsv41-exl3 has no marker
             # at all in this journal -- vLLM runs inside a docker container whose
@@ -1987,7 +2014,7 @@ class Watcher:
 
             port = profile.get('port', 8080)
             port_source = profile.get('port_source', 'default')
-            alias = profile.get('alias', unit_name)
+            alias = unit_alias(unit, profile)
             quant = quant_hint(profile.get('model_path', ''))
 
             enabled = self._state[unit_name].get('unit_file_state') == 'enabled'
@@ -2010,6 +2037,8 @@ class Watcher:
                 'port': port,
                 'port_source': port_source,
                 'alias': alias,
+                'engine_kind': (unit.exec_start.engine.get('kind')
+                                if unit.exec_start else None),
                 'on_demand': unit.on_demand,
                 'gate': unit.gate,
                 'model_file': os.path.basename(profile.get('model_path') or ''),
@@ -4035,7 +4064,7 @@ FLEET_PEER_MAX = 4
 FETCH_TIMEOUT_SEC = 4.0
 FETCH_MAX_BYTES = 4 * 1024 * 1024
 FLEET_PATHS = ('/api/units', '/api/routing-config.json')
-FLEET_UNIT_KEEP = ('unit', 'rung', 'port', 'alias', 'enabled', 'on_demand', 'retired', 'strategy_note', 'badges', 'port_conflict')
+FLEET_UNIT_KEEP = ('unit', 'rung', 'port', 'alias', 'engine_kind', 'enabled', 'on_demand', 'retired', 'strategy_note', 'badges', 'port_conflict')
 
 # The contract's Part 2.5 statement, made machine-visible on /api/peers (§5.1). Frozen.
 PEER_MEANS = ('reachable, not healthy: a TCP connect proves something is listening '
@@ -9178,7 +9207,7 @@ def cmd_scan(args):
                 port = profile.get('port', 8080)
                 port_claims.setdefault(port, []).append({
                     'unit': unit.name,
-                    'alias': profile.get('alias') or unit.name,
+                    'alias': unit_alias(unit, profile),
                     # A static scan cannot see enable state; treat every non-retired unit
                     # as a live claimant so nothing is quietly downgraded to 'latent'.
                     'enabled': not unit.retired,
@@ -9351,10 +9380,10 @@ def cmd_serve(args):
                         last_board['board'] = board
                         event_bus.publish('ports', board)
 
-                # OpenArc readiness probe (MVP10). Journal markers cannot see an
-                # auto-unload, and the model shows in /v1/models only after the
-                # ~2 min compile. Collect targets under the lock, probe OUTSIDE
-                # it (network I/O), apply under the lock again.
+                # Readiness probe (MVP10): journal markers cannot see an auto-unload,
+                # and an OpenAI model shows in /v1/models only after the ~2 min compile.
+                # whisper has no /v1/models: GET /health. Collect targets under the
+                # lock, probe OUTSIDE it (network I/O), apply under the lock again.
                 probe_targets = []
                 with watcher_lock:
                     for unit_name in selected_unit_names:
@@ -9377,7 +9406,9 @@ def cmd_serve(args):
                         probe_targets.append((unit_name, port))
 
                 for unit_name, unit_port in probe_targets:
-                    is_ready = _models_ready_probe(unit_port)
+                    u = watcher.units.get(unit_name)
+                    engine = u.exec_start.engine if u and u.exec_start else {}
+                    is_ready = _ready_probe(engine, unit_port)
                     with watcher_lock:
                         for event in watcher.apply_probe_ready(unit_name, is_ready):
                             event_bus.publish('rung', event)

@@ -177,6 +177,9 @@ class UnitFile:
     exec_condition: Directive | None
     gate: dict | None                  # see 2.6
     install_wanted_by: str | None
+    on_demand: bool                   # '# roundhouse: on-demand' marker present
+    mem_estimate: int | None          # '# roundhouse: mem-estimate <N[KMGT]>' in bytes
+    alias_directive: str | None       # '# roundhouse: alias <name>' (flag alias wins)
     known: dict                        # Restart, RestartSec, TimeoutStartSec, Type,
                                        # WorkingDirectory, LimitNOFILE, After, Wants, Documentation
     other_directives: list[Directive]  # everything not in the known set — PRESERVED

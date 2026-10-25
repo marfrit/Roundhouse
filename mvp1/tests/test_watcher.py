@@ -520,7 +520,7 @@ class TestWatcher(unittest.TestCase):
             required_unit_keys = {
                 'unit', 'description', 'retired', 'rung', 'roster', 'since', 'start_ts_mono',
                 'detail', 'badges', 'stale', 'sensed_at', 'enabled', 'active_state',
-                'sub_state', 'n_restarts', 'port', 'port_source', 'alias', 'on_demand', 'gate',
+                'sub_state', 'n_restarts', 'port', 'port_source', 'alias', 'engine_kind', 'on_demand', 'gate',
                 'model_file', 'quant_hint', 'ctx', 'mem', 'mem_estimate', 'port_conflict', 'strategy_note'
             }
             self.assertEqual(set(unit_dict.keys()), required_unit_keys)
@@ -1113,3 +1113,90 @@ class TestOpenArcReadiness(unittest.TestCase):
         self.assertFalse(probe(8080, opener=opener_for(200, {'object': 'list', 'data': []})))
         self.assertFalse(probe(8080, opener=opener_for(500, {'data': [{'id': 'x'}]})))
         self.assertFalse(probe(8080, opener=refusing_opener))
+
+
+class TestWhisperReadiness(unittest.TestCase):
+    """whisper.cpp has no /v1/models: readiness is GET /health on loopback.
+    200 -> READY; 503 while loading -> not ready; unreachable -> not ready.
+    Same probe cadence (the one poll loop), not a second scheduler."""
+
+    def setUp(self):
+        self.fixtures_extra = Path(__file__).resolve().parents[0] / "fixtures-extra"
+
+    class FakeResp:
+        def __init__(self, status, body=None):
+            self.status = status
+            self._body = body or {'status': 'ok'}
+        def read(self):
+            return json.dumps(self._body).encode()
+        def __enter__(self):
+            return self
+        def __exit__(self, *a):
+            return False
+
+    def _opener(self, status, seen, body=None):
+        def opener(url, timeout=None):
+            seen.append(url)
+            return self.FakeResp(status, body)
+        return opener
+
+    def _refusing(self, url, timeout=None):
+        raise ConnectionRefusedError()
+
+    def test_200_is_ready(self):
+        seen = []
+        self.assertTrue(roundhouse._health_ready_probe(
+            8096, opener=self._opener(200, seen)))
+        self.assertEqual(seen, ['http://127.0.0.1:8096/health'])
+
+    def test_503_is_not_ready(self):
+        self.assertFalse(roundhouse._health_ready_probe(
+            8096, opener=self._opener(503, [])))
+
+    def test_unreachable_is_not_ready(self):
+        self.assertFalse(roundhouse._health_ready_probe(8096, opener=self._refusing))
+
+    def test_dispatch_picks_the_path_per_engine_kind(self):
+        """One probe call site in the poll loop; the engine kind picks the path."""
+        seen = []
+        self.assertTrue(roundhouse._ready_probe(
+            {'kind': 'whisper'}, 8096, opener=self._opener(200, seen)))
+        self.assertEqual(seen, ['http://127.0.0.1:8096/health'])
+        seen = []
+        self.assertTrue(roundhouse._ready_probe(
+            {'kind': 'openarc'}, 8090,
+            opener=self._opener(200, seen, {'data': [{'id': 'some-model'}]})))
+        self.assertEqual(seen, ['http://127.0.0.1:8090/v1/models'])
+
+
+class TestWhisperRoster(unittest.TestCase):
+    """The roster entry of a whisper unit: kind, directive alias, port, state."""
+
+    def setUp(self):
+        self.fixtures_extra = Path(__file__).resolve().parents[0] / "fixtures-extra"
+
+    def _load(self, name):
+        fpath = self.fixtures_extra / name
+        return roundhouse.parse_unit(str(fpath), fpath.read_bytes())
+
+    def test_entry_shows_kind_alias_port_state(self):
+        unit = self._load('whisper-transcribe.service')
+        watcher = roundhouse.Watcher({unit.name: unit}, '6.12.0', None)
+        watcher._state[unit.name]['active_state'] = 'inactive'
+        row = next(r for r in watcher.snapshot()['units']
+                   if r['unit'] == 'whisper-transcribe.service')
+        self.assertEqual(row['engine_kind'], 'whisper')
+        self.assertEqual(row['alias'], 'stt-base')
+        self.assertEqual(row['port'], 8096)
+        self.assertEqual(row['port_source'], 'flag')
+        self.assertEqual(row['rung'], 'OFF')
+        self.assertEqual(row['roster'], 'configured')
+
+    def test_no_directive_and_no_alias_flag_stays_out_of_selection(self):
+        """Not a whisper unit and no marker: selection is unchanged."""
+        import tempfile
+        with tempfile.TemporaryDirectory() as d:
+            p = Path(d) / 'plain-helper.service'
+            p.write_bytes(b"[Service]\nExecStart=/usr/bin/python3 /opt/helper/serve.py --port 9000\n")
+            names = [os.path.basename(q) for q in roundhouse.select_units(d)]
+        self.assertEqual(names, [])

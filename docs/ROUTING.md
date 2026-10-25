@@ -279,6 +279,49 @@ Both of these are recognized (same substring mechanism as roundhouse's manage/ig
 
 The marker can appear on any line, any position (though convention places it near the [Service] section for readability).
 
+### Marking a Unit's Alias
+
+An engine with no alias flag of its own (whisper.cpp's `whisper-server`, and the
+`arcint-whisper` package that renames it) cannot name its endpoint from
+`ExecStart`, so the roster would fall back to the unit name. Declare the alias as
+a comment directive:
+
+```ini
+[Unit]
+Description=Speech to text, base.en
+
+[Service]
+# roundhouse: alias stt-base
+Type=simple
+ExecStart=/usr/local/bin/whisper-server --model /var/lib/models/ggml-base.en.bin --port 8096
+```
+
+Both comment characters are recognized, like `on-demand`:
+
+```ini
+# roundhouse: alias stt-base
+; roundhouse: alias stt-base
+```
+
+The name is validated with the same charset a spliced alias value must pass
+(`A-Za-z0-9._:/=,+\-`); an invalid name is refused with a parse warning and the
+alias falls back to the unit name.
+
+**Precedence:** if the engine also declares an alias through its own flag
+(`--alias`, `--load-models`, `--served-model-name`, `--model-id`, or vLLM's
+`-p`-wrapped equivalent), the flag wins and Roundhouse records a warning that the
+directive is ignored — one source of truth for what a client must send.
+
+### The other unit directives
+
+| Directive | Effect |
+|---|---|
+| `# roundhouse: manage` | Select this unit for the roster even if its `ExecStart` names no engine Roundhouse knows |
+| `# roundhouse: ignore` | Never select this unit |
+| `# roundhouse: on-demand` | Consent to autonomous warm-up/stop (see above) |
+| `# roundhouse: mem-estimate <N[KMGT]>` | Declared memory appetite, for engines whose residency the unit cgroup cannot see |
+| `# roundhouse: alias <name>` | Roster alias for an engine with no alias flag |
+
 ## 7. Operational Notes
 
 ### Queue Semantics
